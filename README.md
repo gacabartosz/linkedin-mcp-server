@@ -1,27 +1,29 @@
 # linkedin-mcp-server
 
-The most complete LinkedIn MCP server. Create posts, schedule content, generate AI images, manage comments.
-
-**The only LinkedIn MCP with write operations.**
+A full-featured LinkedIn MCP server for Claude. Post content, schedule publications, generate AI images, manage comments and reactions — all from your AI assistant.
 
 [![npm version](https://badge.fury.io/js/linkedin-mcp-server.svg)](https://www.npmjs.com/package/linkedin-mcp-server)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-## Why This Exists
+## What It Does
 
-Every existing LinkedIn MCP server is **read-only**. None of them can post, comment, schedule, or upload media. This one can.
+Connect your LinkedIn account to Claude and manage your professional presence with natural language:
 
-| Feature | linkedin-mcp-server | stickerdaniel | rugvedp | felipfr |
-|---------|:------------------:|:-------------:|:-------:|:-------:|
-| Create posts | **Yes** | No | No | No |
-| Schedule posts | **Yes** | No | No | No |
-| Upload images/video | **Yes** | No | No | No |
-| AI image generation | **Yes** | No | No | No |
-| Comments & reactions | **Yes** | No | No | No |
-| Content templates | **Yes** | No | No | No |
-| Brand voice config | **Yes** | No | No | No |
-| Read profiles | Planned | Yes | No | Yes |
-| Search jobs | Planned | Yes | No | Yes |
+> "Schedule a thought leadership post about AI automation for Monday 9am with a Gemini-generated banner image"
+
+> "Reply to the latest comments on my posts"
+
+> "Create a case study post about our MCP server launch using the case-study template"
+
+### 24 MCP Tools
+
+**Post Management** — Create, edit, delete, repost, read your posts
+**Scheduling** — Schedule posts for future publication with automatic background publishing
+**Media** — Upload images and videos from local files or URLs
+**AI Images** — Generate images with Google Gemini Imagen 4 and post them directly
+**Comments & Reactions** — Comment, reply, react (LIKE, CELEBRATE, SUPPORT, LOVE, INSIGHTFUL, FUNNY)
+**Content Templates** — 7 built-in templates (Thought Leadership, Case Study, Announcement, and more) plus custom ones
+**Brand Voice** — Configure tone, emoji style, hashtag strategy, and post structure preferences
 
 ## Quick Start
 
@@ -66,131 +68,74 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 
 ### 4. Authenticate
 
-Once connected, ask Claude:
+Ask Claude:
 > "Connect my LinkedIn account"
 
-Claude will use `linkedin_auth_start` to generate an authorization URL. Open it in your browser, approve, and tokens are saved automatically.
+Claude will generate an authorization URL. Open it in your browser, approve access, and tokens are saved automatically (valid for 60 days with auto-refresh).
 
 ### 5. Start Posting!
 
-> "Post on LinkedIn: Just shipped the world's first LinkedIn MCP server with write operations. The future of AI-powered social media management is here. #MCP #AI #LinkedIn"
+> "Post on LinkedIn: Just shipped a LinkedIn MCP server with 24 tools. The future of AI-powered content management is here. #MCP #AI #LinkedIn"
 
-## Features
+## Tools Reference
 
-### 24 MCP Tools
-
-#### Authentication
-- `linkedin_auth_start` — Start OAuth 2.0 flow
-- `linkedin_auth_status` — Check auth status and token expiry
-
-#### Post Management
-- `linkedin_post_create` — Create text, image, video, or article posts
-- `linkedin_post_update` — Edit existing posts
-- `linkedin_post_delete` — Delete posts
-- `linkedin_post_repost` — Reshare with optional commentary
-- `linkedin_post_get` — Get post details
-- `linkedin_posts_list` — List your recent posts
-
-#### Comments & Reactions
-- `linkedin_comment_create` — Comment or reply to comments
-- `linkedin_comments_list` — List post comments
-- `linkedin_comment_delete` — Delete your comments
-- `linkedin_reaction_add` — React (LIKE, CELEBRATE, SUPPORT, LOVE, INSIGHTFUL, FUNNY)
-- `linkedin_reaction_remove` — Remove reaction
-
-#### Media
-- `linkedin_media_upload` — Upload images/videos from files or URLs
-- `linkedin_gemini_image` — Generate AI images with Google Gemini Imagen 4
-
-#### Scheduling
-- `linkedin_schedule_create` — Schedule posts for future publication
-- `linkedin_schedule_list` — View scheduled posts
-- `linkedin_schedule_update` — Modify scheduled posts
-- `linkedin_schedule_cancel` — Cancel scheduled posts
-
-#### Content Templates
-- `linkedin_template_list` — Browse built-in and custom templates
-- `linkedin_template_get` — View template details
-- `linkedin_template_save` — Create custom templates
-
-#### Profile & Brand
-- `linkedin_profile_me` — Get your profile info
-- `linkedin_brand_voice` — Configure tone, emoji, hashtag preferences
+| Tool | Description |
+|------|-------------|
+| `linkedin_auth_start` | Start OAuth 2.0 authorization flow |
+| `linkedin_auth_status` | Check auth status and token expiry |
+| `linkedin_profile_me` | Get your profile info and person URN |
+| `linkedin_brand_voice` | Get/set brand voice preferences |
+| `linkedin_post_create` | Create a post (text, image, video, article) |
+| `linkedin_post_update` | Edit an existing post |
+| `linkedin_post_delete` | Delete a post |
+| `linkedin_post_repost` | Reshare with optional commentary |
+| `linkedin_post_get` | Get post details |
+| `linkedin_posts_list` | List your recent posts |
+| `linkedin_comment_create` | Add a comment or reply |
+| `linkedin_comments_list` | List post comments |
+| `linkedin_comment_delete` | Delete your comment |
+| `linkedin_reaction_add` | React to a post or comment |
+| `linkedin_reaction_remove` | Remove your reaction |
+| `linkedin_media_upload` | Upload image/video from file or URL |
+| `linkedin_gemini_image` | Generate AI image with Gemini Imagen 4 |
+| `linkedin_schedule_create` | Schedule a post for future publication |
+| `linkedin_schedule_list` | View all scheduled posts |
+| `linkedin_schedule_update` | Modify a scheduled post |
+| `linkedin_schedule_cancel` | Cancel a scheduled post |
+| `linkedin_template_list` | Browse content templates |
+| `linkedin_template_get` | View template details and variables |
+| `linkedin_template_save` | Create or update a custom template |
 
 ## Post Scheduling
 
-LinkedIn has no native scheduling API. This server implements its own scheduler:
+The server includes a built-in scheduler that runs alongside the MCP server:
 
-1. When you schedule a post, it's stored in a local SQLite database
-2. A background daemon checks every 30 seconds for due posts
+1. Schedule a post with a target datetime (ISO 8601)
+2. Background daemon checks every 30 seconds for due posts
 3. Posts are published automatically at the scheduled time
 4. Failed posts retry up to 3 times with 5-minute intervals
-5. On startup, overdue posts (up to 24h) are published immediately
+5. On startup, overdue posts (up to 24h) are caught up automatically
 
-### Standalone Scheduler
-
-Run the scheduler independently (e.g., as a system service):
+You can also run the scheduler as a standalone daemon:
 
 ```bash
 npx linkedin-mcp-server --scheduler
-```
-
-### macOS launchd
-
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.linkedin-mcp.scheduler</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>npx</string>
-        <string>-y</string>
-        <string>linkedin-mcp-server</string>
-        <string>--scheduler</string>
-    </array>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>LINKEDIN_ACCESS_TOKEN</key>
-        <string>your_token</string>
-        <key>LINKEDIN_PERSON_URN</key>
-        <string>urn:li:person:your_id</string>
-    </dict>
-    <key>KeepAlive</key>
-    <true/>
-    <key>RunAtLoad</key>
-    <true/>
-</dict>
-</plist>
 ```
 
 ## AI Image Generation
 
 Generate images with Google Gemini Imagen 4 and post them directly to LinkedIn.
 
-### Setup
-
 Get a free API key at [Google AI Studio](https://aistudio.google.com) and set `GEMINI_API_KEY`.
 
-### Usage
-
-> "Generate a professional banner image about AI automation and post it on LinkedIn with the text: AI is transforming how we manage social media..."
-
-The server will:
-1. Generate an image using Imagen 4
-2. Upload it to LinkedIn
-3. Create the post with the image attached
-
-Scheduled posts can also auto-generate images at publish time using the `gemini_prompt` parameter.
+Scheduled posts can auto-generate images at publish time using the `gemini_prompt` parameter — the image is created fresh right before publishing.
 
 ## Content Templates
 
 7 built-in templates for consistent, high-quality posts:
 
-| Template | Format |
-|----------|--------|
+| Template | Structure |
+|----------|-----------|
 | Thought Leadership | Hook → Insights → CTA |
 | Case Study | Problem → Solution → Results |
 | Announcement | Headline → Details → Features → CTA |
@@ -199,11 +144,11 @@ Scheduled posts can also auto-generate images at publish time using the `gemini_
 | Lesson Learned | Confession → Mistake → Lesson → Advice |
 | Carousel Text | Title → Slides → CTA |
 
-Create custom templates with `{{variable}}` syntax.
+Create your own templates with `{{variable}}` syntax using `linkedin_template_save`.
 
 ## Manual Token Mode
 
-If you already have a LinkedIn access token (e.g., from another tool):
+If you already have a LinkedIn access token (e.g., from n8n or another tool):
 
 ```json
 {
@@ -231,19 +176,6 @@ This skips OAuth entirely. Useful for CI/CD or existing integrations.
 
 \*Either Client ID + Secret OR Access Token is required.
 
-## Data Storage
-
-All data is stored locally at `~/.linkedin-mcp/`:
-
-```
-~/.linkedin-mcp/
-├── auth.json           # OAuth tokens (file permissions: 0600)
-├── scheduler.db        # SQLite database for scheduled posts
-├── brand-voice.json    # Brand voice configuration
-├── templates/          # Custom content templates
-└── images/             # Generated Gemini images
-```
-
 ## Development
 
 ```bash
@@ -254,6 +186,21 @@ npm run dev   # Run with tsx (hot reload)
 npm run build # Compile TypeScript
 ```
 
+## Built With
+
+This project was built using the [Model Context Protocol](https://modelcontextprotocol.io/) and follows patterns from the [Anthropic MCP Builder Skill](https://github.com/anthropics/skills/tree/main/skills/mcp-builder).
+
+Architecture and code patterns were informed by studying existing LinkedIn MCP projects — thanks to the community for the inspiration:
+- [stickerdaniel/linkedin-mcp-server](https://github.com/stickerdaniel/linkedin-mcp-server) — great work on LinkedIn profile scraping and the Patchright-based session approach
+- [rugvedp/linkedin-mcp](https://github.com/rugvedp/linkedin-mcp) — useful reference for post data structures
+- [felipfr/linkedin-mcpserver](https://github.com/felipfr/linkedin-mcpserver) — TypeScript MCP patterns and OAuth architecture ideas
+
+Development was accelerated by [Ralph](https://github.com/gacabartosz/ralph-claude-code) — an autonomous AI dev loop that runs Claude Code in iterative cycles for automated implementation, testing, and code polish.
+
+## Author
+
+**Bartosz Gaca** — [bartoszgaca.pl](https://bartoszgaca.pl) — [kontakt@bartoszgaca.pl](mailto:kontakt@bartoszgaca.pl)
+
 ## License
 
-MIT — [Bartosz Gaca](https://bartoszgaca.pl)
+MIT
