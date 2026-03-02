@@ -1,0 +1,14 @@
+{
+  "id": "lesson-learned",
+  "name": "Lesson Learned",
+  "category": "personal",
+  "description": "Mistake + what I learned format for vulnerability and connection.",
+  "body": "{{confession}}\n\n{{mistake}}\n\n{{lesson}}\n\n{{advice}}\n\n{{hashtags}}",
+  "variables": [
+    { "name": "confession", "description": "Opening admission (e.g., 'I made a costly mistake...')", "required": true },
+    { "name": "mistake", "description": "What went wrong and why", "required": true },
+    { "name": "lesson", "description": "What you learned from it", "required": true },
+    { "name": "advice", "description": "Actionable advice for others + question", "required": true },
+    { "name": "hashtags", "description": "3-5 relevant hashtags", "required": false, "default": "" }
+  ]
+}

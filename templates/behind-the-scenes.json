@@ -1,0 +1,13 @@
+{
+  "id": "behind-the-scenes",
+  "name": "Behind the Scenes",
+  "category": "personal",
+  "description": "Day-in-the-life or process reveal for authenticity.",
+  "body": "{{intro}}\n\n{{story}}\n\n{{lesson}}\n\n{{hashtags}}",
+  "variables": [
+    { "name": "intro", "description": "Hook that reveals something personal/behind-the-scenes", "required": true },
+    { "name": "story", "description": "The story or process being revealed", "required": true },
+    { "name": "lesson", "description": "What you learned or want others to take away", "required": true },
+    { "name": "hashtags", "description": "3-5 relevant hashtags", "required": false, "default": "" }
+  ]
+}

@@ -1,0 +1,53 @@
+{
+  "name": "linkedin-mcp-server",
+  "version": "1.0.0",
+  "description": "MCP server for LinkedIn — create posts, schedule content, generate AI images, manage comments. The only LinkedIn MCP with write operations.",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "linkedin-mcp-server": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx src/index.ts",
+    "start": "node dist/index.js"
+  },
+  "keywords": [
+    "mcp",
+    "linkedin",
+    "social-media",
+    "ai",
+    "claude",
+    "model-context-protocol",
+    "scheduling",
+    "content-creation",
+    "gemini",
+    "imagen"
+  ],
+  "author": "Bartosz Gaca <bartosz@bartoszgaca.pl> (https://bartoszgaca.pl)",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/bartoszgaca/linkedin-mcp-server"
+  },
+  "homepage": "https://bartoszgaca.pl",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "better-sqlite3": "^11.0.0",
+    "zod": "^3.23.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.0",
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "dist",
+    "templates",
+    "README.md",
+    "LICENSE"
+  ]
+}

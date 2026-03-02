@@ -1,0 +1,13 @@
+{
+  "id": "engagement-hook",
+  "name": "Engagement Hook",
+  "category": "engagement",
+  "description": "Question or poll-style post designed to drive comments.",
+  "body": "{{question}}\n\n{{context}}\n\n{{options}}\n\n{{hashtags}}",
+  "variables": [
+    { "name": "question", "description": "Provocative or thought-provoking question", "required": true },
+    { "name": "context", "description": "Why this question matters (2-3 sentences)", "required": true },
+    { "name": "options", "description": "2-4 options or perspectives to choose from", "required": false },
+    { "name": "hashtags", "description": "3-5 relevant hashtags", "required": false, "default": "" }
+  ]
+}

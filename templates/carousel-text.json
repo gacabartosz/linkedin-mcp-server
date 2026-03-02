@@ -1,0 +1,16 @@
+{
+  "id": "carousel-text",
+  "name": "Carousel Text",
+  "category": "carousel",
+  "description": "Multi-slide text for document/carousel posts.",
+  "body": "{{title}}\n\n{{slide_1}}\n\n---\n\n{{slide_2}}\n\n---\n\n{{slide_3}}\n\n---\n\n{{slide_4}}\n\n---\n\n{{cta}}\n\n{{hashtags}}",
+  "variables": [
+    { "name": "title", "description": "Carousel title/hook (shown in feed)", "required": true },
+    { "name": "slide_1", "description": "Content for slide 1", "required": true },
+    { "name": "slide_2", "description": "Content for slide 2", "required": true },
+    { "name": "slide_3", "description": "Content for slide 3", "required": true },
+    { "name": "slide_4", "description": "Content for slide 4", "required": false },
+    { "name": "cta", "description": "Final slide with call to action", "required": true },
+    { "name": "hashtags", "description": "3-5 relevant hashtags", "required": false, "default": "" }
+  ]
+}

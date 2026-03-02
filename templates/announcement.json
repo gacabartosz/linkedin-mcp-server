@@ -1,0 +1,14 @@
+{
+  "id": "announcement",
+  "name": "Announcement",
+  "category": "announcement",
+  "description": "Product launch, event, or news announcement.",
+  "body": "{{headline}}\n\n{{details}}\n\n{{features}}\n\n{{cta}}\n\n{{hashtags}}",
+  "variables": [
+    { "name": "headline", "description": "The main announcement in 1-2 sentences", "required": true },
+    { "name": "details", "description": "Context and background", "required": true },
+    { "name": "features", "description": "Key features or highlights (bullet points)", "required": true },
+    { "name": "cta", "description": "Call to action (link, follow, comment)", "required": true },
+    { "name": "hashtags", "description": "3-5 relevant hashtags", "required": false, "default": "" }
+  ]
+}

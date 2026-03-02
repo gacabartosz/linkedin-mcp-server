@@ -1,0 +1,15 @@
+{
+  "id": "case-study",
+  "name": "Case Study",
+  "category": "case-study",
+  "description": "Before/after story with measurable results.",
+  "body": "{{title}}\n\nThe problem:\n{{problem}}\n\nWhat we did:\n{{solution}}\n\nResults:\n{{results}}\n\n{{takeaway}}\n\n{{hashtags}}",
+  "variables": [
+    { "name": "title", "description": "Attention-grabbing title with a metric", "required": true },
+    { "name": "problem", "description": "The challenge/pain point", "required": true },
+    { "name": "solution", "description": "What was implemented", "required": true },
+    { "name": "results", "description": "Measurable outcomes (numbers, percentages)", "required": true },
+    { "name": "takeaway", "description": "Key lesson or CTA", "required": true },
+    { "name": "hashtags", "description": "3-5 relevant hashtags", "required": false, "default": "" }
+  ]
+}
