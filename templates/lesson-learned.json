@@ -2,13 +2,19 @@
   "id": "lesson-learned",
   "name": "Lesson Learned",
   "category": "personal",
-  "description": "Mistake + what I learned format for vulnerability and connection.",
+  "description": "Mistake + what I learned format for vulnerability and connection. Storytelling drives highest dwell time.",
   "body": "{{confession}}\n\n{{mistake}}\n\n{{lesson}}\n\n{{advice}}\n\n{{hashtags}}",
   "variables": [
-    { "name": "confession", "description": "Opening admission (e.g., 'I made a costly mistake...')", "required": true },
-    { "name": "mistake", "description": "What went wrong and why", "required": true },
-    { "name": "lesson", "description": "What you learned from it", "required": true },
-    { "name": "advice", "description": "Actionable advice for others + question", "required": true },
-    { "name": "hashtags", "description": "3-5 relevant hashtags", "required": false, "default": "" }
+    { "name": "confession", "description": "Opening admission — first 210 chars before 'see more'. E.g. 'I made a mistake that cost me 100K...'", "required": true },
+    { "name": "mistake", "description": "What went wrong and why — be honest and specific", "required": true },
+    { "name": "lesson", "description": "What you learned from it — the real value for the reader", "required": true },
+    { "name": "advice", "description": "Actionable advice + engagement question. E.g. 'What's the biggest lesson you learned the hard way?'", "required": true },
+    { "name": "hashtags", "description": "1-3 precise hashtags. Never more than 3.", "required": false, "default": "" }
+  ],
+  "tips": [
+    "Vulnerability builds trust — but always include the lesson",
+    "Specific numbers make confessions more real and compelling",
+    "This format drives the highest quality comments",
+    "Keep it 1300-1600 chars for optimal engagement"
   ]
 }

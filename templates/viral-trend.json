@@ -1,0 +1,21 @@
+{
+  "id": "viral-trend",
+  "name": "Viral Trend Commentary",
+  "category": "engagement",
+  "description": "React to a trending topic with a strong stat, your perspective, and a CTA. High dwell time and comment potential.",
+  "body": "{{hook}}\n\n{{trend_context}}\n\n{{stat_or_data}}\n\n{{your_take}}\n\n{{cta}}\n\n{{hashtags}}",
+  "variables": [
+    { "name": "hook", "description": "Attention-grabbing opener in first 210 chars (before 'see more'). Use stats, contrast, or a bold statement.", "required": true },
+    { "name": "trend_context", "description": "What trend/news are you reacting to? 1-2 sentences.", "required": true },
+    { "name": "stat_or_data", "description": "A specific number, stat, or data point that backs your perspective.", "required": true },
+    { "name": "your_take", "description": "Your unique insight or opinion on this trend. What does everyone miss?", "required": true },
+    { "name": "cta", "description": "Engagement question. E.g. 'What do you think?', 'Had a similar experience?'", "required": true, "default": "What's your take on this?" },
+    { "name": "hashtags", "description": "1-3 precise hashtags. Never more than 3.", "required": false, "default": "" }
+  ],
+  "tips": [
+    "Post within 24h of the trend breaking — timing is key",
+    "Keep text 1300-1600 chars for best engagement",
+    "Never put links in the post body — add in comment after 15 min",
+    "Be available in the golden hour (first 60 min) to reply to comments"
+  ]
+}

@@ -1,0 +1,188 @@
+{
+  "version": "2.0",
+  "updated": "2025-09-26",
+  "source": "LinkedIn Algorithm Strategy — Bartosz Gaca & AI Assistant",
+
+  "algorithm": {
+    "ranking_factors": [
+      { "factor": "Dwell time", "impact": 5, "notes": "Czas spędzony na poście. PDF, storytelling, video = najwyższy dwell time" },
+      { "factor": "Komentarze >15 słów", "impact": 5, "notes": "Najsilniejszy sygnał. Posty z rozbudowanymi komentarzami mają 10-15x większy reach" },
+      { "factor": "Early engagement (golden hour)", "impact": 5, "notes": "Pierwsze 60-90 min = kluczowe dla dystrybucji. Bądź dostępny, odpowiadaj natychmiast" },
+      { "factor": "Relewancja dla sieci", "impact": 5, "notes": "Algorytm dobiera treści do zainteresowań odbiorców" },
+      { "factor": "Spójność tematyczna autora", "impact": 4, "notes": "Publikuj regularnie o jednym temacie = autorytet tematyczny" },
+      { "factor": "Udostępnienia", "impact": 4, "notes": "Silne, ale nie zawsze wiralizują" },
+      { "factor": "Zapisy (Save)", "impact": 4, "notes": "Świadczą o wartości treści" },
+      { "factor": "Częstotliwość postów", "impact": 3, "notes": "3-5x/tydzień optymalnie" }
+    ],
+    "risk_factors": [
+      { "factor": "Link w treści posta", "impact": -5, "notes": "Ogranicza zasięg nawet o 40%. ZAWSZE przenoś link do komentarza po 15-30 min" },
+      { "factor": "Edycja posta po publikacji", "impact": -2, "notes": "Może ograniczyć zasięg. Nie edytuj w golden hour" },
+      { "factor": "Hashtagi >3", "impact": -1, "notes": "Zbyt dużo = spam tagging" },
+      { "factor": "Tagowanie przypadkowych osób", "impact": -2, "notes": "Masowe tagowanie = spam = ograniczenie zasięgu" },
+      { "factor": "Publikacja >1x na 12h", "impact": -3, "notes": "Nie częściej niż co 12h" },
+      { "factor": "Clickbait / engagement bait", "impact": -4, "notes": "Np. 'Skomentuj TAK' — karane przez algorytm" }
+    ],
+    "key_insight": "LinkedIn przeszedł z logiki chronologicznej na relewancyjną — promuje posty sprzed nawet 2 tygodni jeśli są nadal wartościowe"
+  },
+
+  "copywriting": {
+    "hook_rules": [
+      "Pierwsze 210 znaków widoczne przed 'zobacz więcej' — to decyduje o kliknięciu",
+      "Używaj statystyk: 'Czy wiesz, że 90% XYZ...'",
+      "Używaj kontrastu: 'Popełniłem błąd, który kosztował mnie 100 tys...'",
+      "Używaj wyobraźni: 'Wyobraź sobie, że...'",
+      "Unikaj clickbaitu — obietnica musi być spełniona w treści"
+    ],
+    "structure": "Hook → wartość → rozwinięcie → CTA",
+    "style_rules": [
+      "Krótkie akapity, dużo enterów",
+      "Emotikony jako punktor (👉, ✅, ❌) — ale nie przesadzaj",
+      "Krótkie zdania, bez żargonu",
+      "Konkret — bez lania wody",
+      "90% wartość, 10% autopromocja",
+      "Storytelling > sucha informacja"
+    ],
+    "tone": "Profesjonalny, ale ludzki. Mów do 'Ty', nie do 'Państwo'",
+    "optimal_length": {
+      "min_chars": 1300,
+      "max_chars": 1600,
+      "note": "Najwyższy engagement rate w tym przedziale"
+    }
+  },
+
+  "formats": {
+    "text": {
+      "best_for": "storytelling, refleksje, opinie, edukacja",
+      "pros": "szybki, lekki, dobry do dyskusji",
+      "tip": "potrzebny mocny hook i formatowanie"
+    },
+    "image": {
+      "best_for": "ogłoszenia, grafiki, cytaty, podsumowania",
+      "pros": "przyciąga uwagę, 2x więcej komentarzy",
+      "tip": "użyj 2-9 obrazów — multi image = top ER"
+    },
+    "pdf_carousel": {
+      "best_for": "instrukcje krok-po-kroku, poradniki, checklists",
+      "pros": "najwyższy dwell time (~6.1% ER), zapisują i share'ują",
+      "tip": "użyj CTA na końcu slajdów"
+    },
+    "video": {
+      "best_for": "demo, Q&A, kamera prosto w twarz",
+      "pros": "5x wyższe zaangażowanie, buduje więź",
+      "tip": "<90s, z napisami, dynamiczne wejście w 3s"
+    },
+    "poll": {
+      "best_for": "szybki research, angażowanie dużej liczby ludzi",
+      "pros": "rekordowe impresje, niski próg zaangażowania",
+      "tip": "mało komentarzy — używaj oszczędnie"
+    },
+    "article": {
+      "best_for": "długie treści (1000+ słów), pogłębiona ekspertyza",
+      "pros": "subskrypcje, powiadomienia do followersów",
+      "tip": "mniejszy reach w feedzie — promuj osobnym postem"
+    }
+  },
+
+  "links_hashtags_tags": {
+    "links": {
+      "rule": "NIGDY w treści posta",
+      "how": "Dodaj link w komentarzu po 15-30 minutach od publikacji",
+      "alternative": "Zero-click content lub 'Napisz, wyślę PDF'"
+    },
+    "hashtags": {
+      "rule": "1-3 precyzyjne hashtagi",
+      "examples": ["#automatyzacja", "#AI", "#ecommerce"],
+      "avoid": "Nigdy >5. Nie spamuj środka tekstu tagami"
+    },
+    "tags": {
+      "rule": "Tylko jeśli osoba ma związek z postem",
+      "note": "Zadziała jeśli oznaczony zareaguje (komentarz). Masowe tagowanie = spam"
+    }
+  },
+
+  "cadence": {
+    "frequency": "3-5 postów tygodniowo",
+    "min_gap_hours": 12,
+    "max_per_day": 1,
+    "best_days": ["wtorek", "środa", "czwartek"],
+    "best_hours": ["08:00", "09:30", "17:00"],
+    "golden_hour": {
+      "duration_minutes": 60,
+      "rules": [
+        "Bądź dostępny — odpowiadaj na komentarze natychmiast",
+        "Nie edytuj posta w tym czasie",
+        "Komentuj u innych 10-15 min PRZED publikacją"
+      ]
+    },
+    "tip": "Zawsze testuj własną sieć — analizuj aktywność followersów"
+  },
+
+  "dos_and_donts": {
+    "dos": [
+      "Komentuj u innych 10-15 min przed publikacją",
+      "Buduj relacje, nie tylko nadawaj",
+      "Używaj storytellingu, emocji, konkretnych przykładów",
+      "Testuj różne formaty (PDF, wideo, tekst)",
+      "Bądź dostępny w golden hour",
+      "Publikuj regularnie o jednym temacie (autorytet)"
+    ],
+    "donts": [
+      "Nie wrzucaj linków w treść posta",
+      "Nie taguj losowych ludzi",
+      "Nie publikuj 2 postów w ciągu 12h",
+      "Nie ignoruj komentarzy",
+      "Nie edytuj posta tuż po publikacji",
+      "Nie używaj engagement baitu ('Skomentuj TAK')",
+      "Nie używaj >5 hashtagów"
+    ]
+  },
+
+  "hooks": [
+    "Czy wiesz, że 85% XYZ…",
+    "Nie uwierzysz, co zrobił mój klient…",
+    "90% leadów ginie z TEGO powodu…",
+    "Popełniłem błąd — kosztował mnie 30K…",
+    "Wyobraź sobie: dostajesz DM z…",
+    "Czy wiesz, że 90% XYZ…",
+    "Popełniłem błąd, który kosztował mnie 100 tys…",
+    "Wyobraź sobie, że…",
+    "3 lata temu nie wiedziałem, że…",
+    "Wszyscy mówią o X. Ale nikt nie mówi o…"
+  ],
+
+  "ctas": [
+    "Co o tym myślisz? Komentarz mile widziany.",
+    "Masz podobne doświadczenie? Podziel się.",
+    "Znasz kogoś, komu to się przyda? Oznacz.",
+    "Chcesz PDF? Napisz DM.",
+    "Zostaw 👍 jeśli to pomocne.",
+    "Co o tym sądzisz?",
+    "Masz inne doświadczenie?",
+    "Znasz kogoś, komu to się przyda?"
+  ],
+
+  "checklist": [
+    "Hook w pierwszych 3 linijkach (210 znaków)?",
+    "Wartość dla czytelnika (wiedza, inspiracja)?",
+    "Podział na akapity + formatowanie?",
+    "Styl: ludzki, czytelny, bez żargonu?",
+    "Brak literówek, błędów?",
+    "Max 3 hashtagi?",
+    "Link w komentarzu, nie w treści?",
+    "CTA na końcu?",
+    "Media dodane (obraz/PDF/wideo)?",
+    "Czas publikacji optymalny (wt-czw, 8:00/9:30/17:00)?",
+    "Będziesz dostępny w złotej godzinie (60 min)?"
+  ],
+
+  "ab_test_plan": [
+    "Link w poście vs. link w komentarzu",
+    "0 hashtagów vs. 3 hashtagi",
+    "Tag @ osoby vs. bez tagu",
+    "Krótki post (~400 znaków) vs. długi (~1500 znaków)",
+    "Post z grafiką vs. bez",
+    "Z CTA pytaniem vs. bez CTA",
+    "Storytelling vs. faktograficzny post",
+    "Publikacja rano vs. wieczorem"
+  ]
+}

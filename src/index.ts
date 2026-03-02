@@ -22,6 +22,7 @@ import { createSchedule, listSchedules, cancelSchedule, updateScheduleFields, ge
 import { startSchedulerDaemon } from "./scheduler/daemon.js";
 import { listTemplates, getTemplate, saveTemplate, applyTemplate } from "./content/templates.js";
 import { getBrandVoice, setBrandVoice } from "./content/brand-voice.js";
+import { loadGuidelines } from "./content/guidelines.js";
 import { generateImage } from "./gemini/client.js";
 
 // ─── Zod Schemas ─────────────────────────────────────────────────────────────
@@ -134,6 +135,10 @@ const TemplateSaveInput = z.object({
   })).optional(),
 });
 
+const GuidelinesInput = z.object({
+  topic: z.enum(["all", "algorithm", "copywriting", "formats", "timing", "hooks", "ctas", "checklist", "dos_donts", "links", "ab_testing"]).optional(),
+});
+
 const BrandVoiceInput = z.object({
   action: z.enum(["get", "set"]),
   config: z.object({
@@ -146,6 +151,15 @@ const BrandVoiceInput = z.object({
     avoid_words: z.array(z.string()).optional(),
     signature_phrases: z.array(z.string()).optional(),
     line_spacing: z.string().optional(),
+    hook_max_chars: z.number().optional(),
+    optimal_post_length: z.object({ min: z.number(), max: z.number() }).optional(),
+    link_in_comment: z.boolean().optional(),
+    max_hashtags: z.number().optional(),
+    posting_times: z.array(z.string()).optional(),
+    posting_days: z.array(z.string()).optional(),
+    min_gap_hours: z.number().optional(),
+    golden_hour_minutes: z.number().optional(),
+    first_comment_delay_minutes: z.number().optional(),
   }).optional(),
 });
 
@@ -184,7 +198,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "linkedin_brand_voice",
-      description: "Get or set brand voice configuration (tone, emoji style, hashtag strategy, post structure, language preferences).",
+      description: "Get or set brand voice configuration — tone, emoji style, hashtag strategy, post structure, language, and LinkedIn algorithm settings (hook length, optimal post length, posting times, golden hour).",
       inputSchema: {
         type: "object",
         properties: {
@@ -211,7 +225,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     // Posts — Write
     {
       name: "linkedin_post_create",
-      description: "Create a new LinkedIn post. Supports text-only, text with image/video (use linkedin_media_upload first), or text with article link. Optionally apply a content template.",
+      description: "Create a new LinkedIn post. Best practices: keep text 1300-1600 chars for highest engagement, put hook in first 210 chars (before 'see more'), max 3 hashtags at end, NO external links in post body (use linkedin_comment_create after 15 min). Use linkedin_guidelines first for full strategy.",
       inputSchema: {
         type: "object",
         properties: {
@@ -380,7 +394,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     // Scheduling
     {
       name: "linkedin_schedule_create",
-      description: "Schedule a LinkedIn post for future publication. The background daemon auto-publishes at the specified time. Supports Gemini image generation at publish time.",
+      description: "Schedule a LinkedIn post for future publication. Optimal times: Tue-Thu at 8:00, 9:30, or 17:00. Min 12h gap between posts, max 1/day. The daemon auto-publishes and supports Gemini image generation at publish time.",
       inputSchema: {
         type: "object",
         properties: {
@@ -453,6 +467,20 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           template_id: { type: "string", description: "Template ID" },
         },
         required: ["template_id"],
+      },
+    },
+    {
+      name: "linkedin_guidelines",
+      description: "Get LinkedIn algorithm strategy guidelines — ranking factors, copywriting rules, hooks, CTAs, posting checklist, dos & donts, optimal timing, format tips. Use before creating posts to follow best practices and maximize reach.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          topic: {
+            type: "string",
+            enum: ["all", "algorithm", "copywriting", "formats", "timing", "hooks", "ctas", "checklist", "dos_donts", "links", "ab_testing"],
+            description: "Topic to get guidelines for (default: all)",
+          },
+        },
       },
     },
     {
@@ -703,6 +731,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const template = getTemplate(input.template_id);
         if (!template) return toolError(`Template '${input.template_id}' not found.`);
         return toolResult(template);
+      }
+      case "linkedin_guidelines": {
+        const input = GuidelinesInput.parse(args);
+        const guidelines = loadGuidelines(input.topic);
+        return toolResult(guidelines);
       }
       case "linkedin_template_save": {
         const input = TemplateSaveInput.parse(args);

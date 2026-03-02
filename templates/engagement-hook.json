@@ -2,12 +2,19 @@
   "id": "engagement-hook",
   "name": "Engagement Hook",
   "category": "engagement",
-  "description": "Question or poll-style post designed to drive comments.",
-  "body": "{{question}}\n\n{{context}}\n\n{{options}}\n\n{{hashtags}}",
+  "description": "Question or poll-style post designed to drive quality comments (>15 words) — the strongest LinkedIn ranking signal.",
+  "body": "{{question}}\n\n{{context}}\n\n{{options}}\n\n{{cta}}\n\n{{hashtags}}",
   "variables": [
-    { "name": "question", "description": "Provocative or thought-provoking question", "required": true },
+    { "name": "question", "description": "Provocative or thought-provoking question — first 210 chars before 'see more'", "required": true },
     { "name": "context", "description": "Why this question matters (2-3 sentences)", "required": true },
-    { "name": "options", "description": "2-4 options or perspectives to choose from", "required": false },
-    { "name": "hashtags", "description": "3-5 relevant hashtags", "required": false, "default": "" }
+    { "name": "options", "description": "2-4 options or perspectives to choose from (use emoji bullets)", "required": false },
+    { "name": "cta", "description": "Engagement invitation. E.g. 'Share your perspective below.' Avoid engagement bait ('Comment YES').", "required": true, "default": "Share your perspective below." },
+    { "name": "hashtags", "description": "1-3 precise hashtags. Never more than 3.", "required": false, "default": "" }
+  ],
+  "tips": [
+    "Quality comments (>15 words) give 10-15x more reach than likes",
+    "Avoid engagement bait ('Comment YES') — LinkedIn penalizes this",
+    "Reply to every comment in the golden hour (first 60 min)",
+    "Polls get record impressions but few comments — use sparingly"
   ]
 }

@@ -1,0 +1,24 @@
+{
+  "id": "thought-leadership-pl",
+  "name": "Thought Leadership (PL)",
+  "category": "thought-leadership",
+  "description": "Polska wersja thought leadership postu. Struktura: hook - kontekst - 3 insighty - CTA. Ton: profesjonalny ale ludzki, na 'Ty'.",
+  "body": "{{hook}}\n\n{{kontekst}}\n\n{{insight_1}}\n{{insight_2}}\n{{insight_3}}\n\n{{podsumowanie}}\n\n{{cta}}\n\n{{hashtags}}",
+  "variables": [
+    { "name": "hook", "description": "Otwieracz, pierwsze 210 znaków widoczne przed 'zobacz wiecej'. Uzyj statystyk, kontrastu lub pytania retorycznego.", "required": true },
+    { "name": "kontekst", "description": "Kontekst sytuacyjny — dlaczego o tym piszesz? 1-2 zdania.", "required": true },
+    { "name": "insight_1", "description": "Pierwszy kluczowy insight z emoji na poczatku", "required": true },
+    { "name": "insight_2", "description": "Drugi insight", "required": true },
+    { "name": "insight_3", "description": "Trzeci insight", "required": false },
+    { "name": "podsumowanie", "description": "Podsumowanie w 1-2 zdaniach", "required": true },
+    { "name": "cta", "description": "Pytanie angazujace. Np. 'Co o tym myslisz?', 'Masz podobne doswiadczenie?'", "required": true, "default": "Co o tym myslisz?" },
+    { "name": "hashtags", "description": "1-3 precyzyjne hashtagi. NIGDY wiecej niz 3.", "required": false, "default": "" }
+  ],
+  "tips": [
+    "Mow do 'Ty', nie do 'Panstwo'",
+    "Krotkie akapity, duzo enterow — latwiejsze do czytania na mobile",
+    "90% wartosc, 10% autopromocja",
+    "Storytelling > sucha informacja",
+    "Optymalna dlugosc: 1300-1600 znakow"
+  ]
+}

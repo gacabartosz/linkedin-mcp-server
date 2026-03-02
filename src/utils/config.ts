@@ -11,6 +11,7 @@ export const config = {
   brandVoiceFile: join(DATA_DIR, "brand-voice.json"),
   userTemplatesDir: join(DATA_DIR, "templates"),
   imagesDir: join(DATA_DIR, "images"),
+  guidelinesDir: "", // set dynamically — package root
 
   linkedinClientId: process.env.LINKEDIN_CLIENT_ID || "",
   linkedinClientSecret: process.env.LINKEDIN_CLIENT_SECRET || "",

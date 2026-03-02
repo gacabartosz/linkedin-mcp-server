@@ -2,15 +2,21 @@
   "id": "carousel-text",
   "name": "Carousel Text",
   "category": "carousel",
-  "description": "Multi-slide text for document/carousel posts.",
+  "description": "Multi-slide text for document/carousel posts. PDF carousels have the highest engagement rate (~6.1%) on LinkedIn.",
   "body": "{{title}}\n\n{{slide_1}}\n\n---\n\n{{slide_2}}\n\n---\n\n{{slide_3}}\n\n---\n\n{{slide_4}}\n\n---\n\n{{cta}}\n\n{{hashtags}}",
   "variables": [
-    { "name": "title", "description": "Carousel title/hook (shown in feed)", "required": true },
-    { "name": "slide_1", "description": "Content for slide 1", "required": true },
+    { "name": "title", "description": "Carousel title/hook — first 210 chars visible in feed before 'see more'. Use numbers.", "required": true },
+    { "name": "slide_1", "description": "Content for slide 1 — one clear point", "required": true },
     { "name": "slide_2", "description": "Content for slide 2", "required": true },
     { "name": "slide_3", "description": "Content for slide 3", "required": true },
     { "name": "slide_4", "description": "Content for slide 4", "required": false },
-    { "name": "cta", "description": "Final slide with call to action", "required": true },
-    { "name": "hashtags", "description": "3-5 relevant hashtags", "required": false, "default": "" }
+    { "name": "cta", "description": "Final slide — save/share CTA. E.g. 'Save this for later.'", "required": true },
+    { "name": "hashtags", "description": "1-3 precise hashtags. Never more than 3.", "required": false, "default": "" }
+  ],
+  "tips": [
+    "PDF carousels = highest engagement rate on LinkedIn (~6.1%)",
+    "Include CTA on the last slide",
+    "Saves are a strong ranking signal — educational content gets saved most",
+    "Optimal: 6-10 slides, one clear point per slide"
   ]
 }

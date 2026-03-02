@@ -5,13 +5,19 @@
   "description": "Share expertise with hook-insights-CTA structure to build authority.",
   "body": "{{hook}}\n\n{{context}}\n\n{{insight_1}}\n{{insight_2}}\n{{insight_3}}\n\n{{closing}}\n\n{{hashtags}}",
   "variables": [
-    { "name": "hook", "description": "Opening line that grabs attention (1-2 sentences)", "required": true },
+    { "name": "hook", "description": "Opening line — first 210 chars visible before 'see more'. Use stats, contrast, or a bold claim.", "required": true },
     { "name": "context", "description": "Background/situation that frames the insights", "required": true },
     { "name": "insight_1", "description": "First key insight, prefixed with emoji", "required": true },
     { "name": "insight_2", "description": "Second key insight", "required": true },
     { "name": "insight_3", "description": "Third key insight", "required": false },
-    { "name": "closing", "description": "Call to action or question for engagement", "required": true },
-    { "name": "hashtags", "description": "3-5 relevant hashtags", "required": false, "default": "" }
+    { "name": "closing", "description": "Call to action or question. E.g. 'What's your experience?' or 'Which one resonates most?'", "required": true },
+    { "name": "hashtags", "description": "1-3 precise hashtags at end. Never more than 3.", "required": false, "default": "" }
+  ],
+  "tips": [
+    "Optimal post length: 1300-1600 chars for highest engagement",
+    "Publish Tue-Thu at 8:00, 9:30, or 17:00",
+    "Be available in golden hour (first 60 min) to reply to comments",
+    "Storytelling beats dry information — use personal experience"
   ],
   "example_output": "I spent 3 years building MCP servers and here's what nobody tells you...\n\nAfter shipping 15 integrations across LinkedIn, Slack, and GitHub:\n\n1. The tool description is 80% of the battle\n2. Structured output beats raw text every time\n3. OAuth is harder than the actual API\n\nWhat's the most painful integration you've built?\n\n#MCP #DevTools #AI"
 }

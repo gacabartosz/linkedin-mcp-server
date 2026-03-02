@@ -2,14 +2,20 @@
   "id": "case-study",
   "name": "Case Study",
   "category": "case-study",
-  "description": "Before/after story with measurable results.",
+  "description": "Before/after story with measurable results. Concrete numbers build authority.",
   "body": "{{title}}\n\nThe problem:\n{{problem}}\n\nWhat we did:\n{{solution}}\n\nResults:\n{{results}}\n\n{{takeaway}}\n\n{{hashtags}}",
   "variables": [
-    { "name": "title", "description": "Attention-grabbing title with a metric", "required": true },
-    { "name": "problem", "description": "The challenge/pain point", "required": true },
-    { "name": "solution", "description": "What was implemented", "required": true },
-    { "name": "results", "description": "Measurable outcomes (numbers, percentages)", "required": true },
-    { "name": "takeaway", "description": "Key lesson or CTA", "required": true },
-    { "name": "hashtags", "description": "3-5 relevant hashtags", "required": false, "default": "" }
+    { "name": "title", "description": "Attention-grabbing title with a metric — first 210 chars before 'see more'. E.g. 'How we increased X by 200%'", "required": true },
+    { "name": "problem", "description": "The challenge/pain point — be specific", "required": true },
+    { "name": "solution", "description": "What was implemented — concrete steps", "required": true },
+    { "name": "results", "description": "Measurable outcomes with numbers and percentages", "required": true },
+    { "name": "takeaway", "description": "Key lesson or question. E.g. 'What metrics matter most to you?'", "required": true },
+    { "name": "hashtags", "description": "1-3 precise hashtags. Never more than 3.", "required": false, "default": "" }
+  ],
+  "tips": [
+    "Concrete numbers (revenue, %, time saved) make case studies believable",
+    "Tag the client if they're OK with it — their comment boosts reach",
+    "NO links to the full case study in post — add in comment after 15 min",
+    "Multi-image format (before/after screenshots) doubles comments"
   ]
 }

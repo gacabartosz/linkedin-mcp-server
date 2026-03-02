@@ -1,0 +1,25 @@
+{
+  "id": "carousel-edu",
+  "name": "Educational Carousel Post",
+  "category": "education",
+  "description": "Step-by-step educational post designed for PDF carousel format. Highest dwell time (~6.1% ER) and save/share rates on LinkedIn.",
+  "body": "{{hook}}\n\n{{intro}}\n\n{{step_1}}\n\n{{step_2}}\n\n{{step_3}}\n\n{{step_4}}\n\n{{step_5}}\n\n{{summary}}\n\n{{cta}}\n\n{{hashtags}}",
+  "variables": [
+    { "name": "hook", "description": "Carousel title/opener. First 210 chars visible before 'see more'. Use numbers: '5 steps to...', '3 mistakes in...'", "required": true },
+    { "name": "intro", "description": "Brief intro — why this matters. 1-2 sentences.", "required": true },
+    { "name": "step_1", "description": "Step/slide 1 — one clear point with emoji bullet", "required": true },
+    { "name": "step_2", "description": "Step/slide 2", "required": true },
+    { "name": "step_3", "description": "Step/slide 3", "required": true },
+    { "name": "step_4", "description": "Step/slide 4", "required": false, "default": "" },
+    { "name": "step_5", "description": "Step/slide 5", "required": false, "default": "" },
+    { "name": "summary", "description": "Key takeaway in 1 sentence.", "required": true },
+    { "name": "cta", "description": "Save/share CTA. E.g. 'Save this for later' or 'Share with someone who needs it.'", "required": true, "default": "Save this for later." },
+    { "name": "hashtags", "description": "1-3 precise hashtags. Never more than 3.", "required": false, "default": "" }
+  ],
+  "tips": [
+    "PDF carousels have the highest engagement rate on LinkedIn (~6.1%)",
+    "Include CTA on the last slide of the PDF",
+    "Optimal carousel: 6-10 slides, clear visuals, one point per slide",
+    "Saves are a strong ranking signal — educational content gets saved most"
+  ]
+}

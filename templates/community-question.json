@@ -1,0 +1,21 @@
+{
+  "id": "community-question",
+  "name": "Community Question",
+  "category": "engagement",
+  "description": "Ask your network a specific question with context. Drives quality comments (>15 words) which are the strongest LinkedIn ranking signal.",
+  "body": "{{hook}}\n\n{{context}}\n\n{{question}}\n\n{{your_answer}}\n\n{{cta}}\n\n{{hashtags}}",
+  "variables": [
+    { "name": "hook", "description": "Opening that frames the question. First 210 chars visible before 'see more'.", "required": true },
+    { "name": "context", "description": "Why is this question relevant now? What prompted it?", "required": true },
+    { "name": "question", "description": "The main question you're asking. Be specific — vague questions get vague answers.", "required": true },
+    { "name": "your_answer", "description": "Share your own answer first to set the tone and encourage others.", "required": false, "default": "" },
+    { "name": "cta", "description": "Invitation to respond. E.g. 'Share your experience below.'", "required": true, "default": "Share your experience below." },
+    { "name": "hashtags", "description": "1-3 precise hashtags. Never more than 3.", "required": false, "default": "" }
+  ],
+  "tips": [
+    "Quality comments (>15 words) give 10-15x more reach than likes",
+    "Reply to EVERY comment in the golden hour (first 60 min)",
+    "Your own answer should be detailed to set the bar for quality responses",
+    "Avoid engagement bait ('Comment YES') — LinkedIn penalizes this"
+  ]
+}
