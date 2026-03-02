@@ -27,7 +27,7 @@
   "author": "Bartosz Gaca <bartosz@bartoszgaca.pl> (https://bartoszgaca.pl)",
   "repository": {
     "type": "git",
-    "url": "https://github.com/bartoszgaca/linkedin-mcp-server"
+    "url": "https://github.com/gacabartosz/linkedin-mcp-server"
   },
   "homepage": "https://bartoszgaca.pl",
   "dependencies": {

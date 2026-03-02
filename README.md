@@ -247,7 +247,7 @@ All data is stored locally at `~/.linkedin-mcp/`:
 ## Development
 
 ```bash
-git clone https://github.com/bartoszgaca/linkedin-mcp-server.git
+git clone https://github.com/gacabartosz/linkedin-mcp-server.git
 cd linkedin-mcp-server
 npm install
 npm run dev   # Run with tsx (hot reload)
