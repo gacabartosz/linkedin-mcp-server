@@ -22,7 +22,7 @@
 - [x] Build passes, 24 tools verified
 
 ### TODO — Next tasks for Ralph
-- [ ] Add shebang to dist/index.js (#!/usr/bin/env node) via prepublish script
+- [x] Add shebang to dist/index.js (#!/usr/bin/env node) via prepublish script
 - [ ] Add CLAUDE.md with project conventions
 - [ ] Test linkedin_auth_status tool with no tokens — verify graceful response
 - [ ] Test linkedin_template_list — verify built-in templates load correctly

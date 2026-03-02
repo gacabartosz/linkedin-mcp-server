@@ -2,3 +2,13 @@ node_modules/
 dist/
 *.js.map
 .env
+.ralph/logs/
+.ralph/live.log
+.ralph/status.json
+.ralph/.call_count
+.ralph/.last_reset
+.ralph/.circuit_breaker_*
+.ralph/.exit_signals
+.ralph/.loop_start_sha
+.ralph/.ralph_session*
+.ralph/progress.json
