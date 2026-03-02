@@ -2,6 +2,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { randomBytes } from "node:crypto";
 import { config } from "../utils/config.js";
 import { saveTokens, clearTokenCache } from "./client.js";
+import { fetchWithTimeout } from "../utils/fetch.js";
 import { log } from "../utils/logger.js";
 
 interface OAuthState {
@@ -107,7 +108,7 @@ async function exchangeCode(code: string): Promise<{
 }> {
   const redirectUri = `http://localhost:${config.callbackPort}/callback`;
 
-  const tokenResponse = await fetch("https://www.linkedin.com/oauth/v2/accessToken", {
+  const tokenResponse = await fetchWithTimeout("https://www.linkedin.com/oauth/v2/accessToken", {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({
@@ -133,7 +134,7 @@ async function exchangeCode(code: string): Promise<{
   };
 
   // Fetch user info
-  const userResponse = await fetch("https://api.linkedin.com/v2/userinfo", {
+  const userResponse = await fetchWithTimeout("https://api.linkedin.com/v2/userinfo", {
     headers: { Authorization: `Bearer ${tokenData.access_token}` },
   });
 

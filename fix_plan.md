@@ -29,14 +29,14 @@
 - [x] Updated tool descriptions with algorithm best practices
 
 ### TODO — Next tasks for Ralph
-- [ ] Update CLAUDE.md to reflect Phase 2 changes (25 tools, 12 templates, guidelines module)
+- [x] Update CLAUDE.md to reflect Phase 2 changes (25 tools, 12 templates, guidelines module)
 - [ ] Test linkedin_auth_status tool with no tokens — verify graceful response
 - [ ] Test linkedin_guidelines tool with various topics — verify all return data
 - [ ] Test linkedin_template_list — verify 12 templates load correctly
 - [ ] Test linkedin_brand_voice get — verify new LinkedIn-specific fields present
 - [ ] Test linkedin_schedule_create → linkedin_schedule_list flow
 - [ ] Add input validation error messages that guide users (e.g., "text is required, use linkedin_template_list to browse templates")
-- [ ] Add connection timeout to fetch calls (AbortController with 30s timeout)
+- [x] Add connection timeout to fetch calls (AbortController with 30s timeout)
 - [ ] Verify the scheduler catch-up logic works (overdue posts published on startup)
 - [ ] Consider adding linkedin_post_create_with_image convenience tool (generate + upload + post in one call)
 - [ ] Ensure guidelines/linkedin-strategy.json is included in npm package (files[] in package.json)

@@ -15,15 +15,16 @@ Connect your LinkedIn account to Claude and manage your professional presence wi
 
 > "Create a case study post about our MCP server launch using the case-study template"
 
-### 24 MCP Tools
+### 25 MCP Tools
 
 **Post Management** — Create, edit, delete, repost, read your posts
 **Scheduling** — Schedule posts for future publication with automatic background publishing
 **Media** — Upload images and videos from local files or URLs
 **AI Images** — Generate images with Google Gemini Imagen 4 and post them directly
 **Comments & Reactions** — Comment, reply, react (LIKE, CELEBRATE, SUPPORT, LOVE, INSIGHTFUL, FUNNY)
-**Content Templates** — 7 built-in templates (Thought Leadership, Case Study, Announcement, and more) plus custom ones
-**Brand Voice** — Configure tone, emoji style, hashtag strategy, and post structure preferences
+**Content Templates** — 12 built-in templates (Thought Leadership, Case Study, Viral Trend, Lead Magnet, and more) plus custom ones
+**Brand Voice** — Configure tone, emoji style, hashtag strategy, post structure, and LinkedIn algorithm settings
+**Algorithm Guidelines** — Built-in LinkedIn algorithm knowledge: ranking factors, copywriting rules, hooks, CTAs, timing, checklist
 
 ## Quick Start
 
@@ -105,6 +106,7 @@ Claude will generate an authorization URL. Open it in your browser, approve acce
 | `linkedin_template_list` | Browse content templates |
 | `linkedin_template_get` | View template details and variables |
 | `linkedin_template_save` | Create or update a custom template |
+| `linkedin_guidelines` | LinkedIn algorithm strategy and best practices |
 
 ## Post Scheduling
 
@@ -132,17 +134,22 @@ Scheduled posts can auto-generate images at publish time using the `gemini_promp
 
 ## Content Templates
 
-7 built-in templates for consistent, high-quality posts:
+12 built-in templates for consistent, high-quality posts:
 
 | Template | Structure |
 |----------|-----------|
 | Thought Leadership | Hook → Insights → CTA |
+| Thought Leadership (PL) | Hook → Kontekst → Insighty → CTA |
 | Case Study | Problem → Solution → Results |
 | Announcement | Headline → Details → Features → CTA |
 | Engagement Hook | Question → Context → Options |
 | Behind the Scenes | Intro → Story → Lesson |
 | Lesson Learned | Confession → Mistake → Lesson → Advice |
 | Carousel Text | Title → Slides → CTA |
+| Carousel Edu | Hook → Steps → Summary → CTA |
+| Viral Trend | Hook → Trend → Stat → Your Take → CTA |
+| Community Question | Hook → Context → Question → CTA |
+| Lead Magnet | Hook → Problem → What You Get → CTA |
 
 Create your own templates with `{{variable}}` syntax using `linkedin_template_save`.
 
@@ -195,7 +202,7 @@ Architecture and code patterns were informed by studying existing LinkedIn MCP p
 - [rugvedp/linkedin-mcp](https://github.com/rugvedp/linkedin-mcp) — useful reference for post data structures
 - [felipfr/linkedin-mcpserver](https://github.com/felipfr/linkedin-mcpserver) — TypeScript MCP patterns and OAuth architecture ideas
 
-Development was accelerated by [Ralph](https://github.com/gacabartosz/ralph-claude-code) — an autonomous AI dev loop that runs Claude Code in iterative cycles for automated implementation, testing, and code polish.
+Development was accelerated by [Ralph](https://github.com/frankbria/ralph-claude-code) — an autonomous AI dev loop that runs Claude Code in iterative cycles for automated implementation, testing, and code polish.
 
 ## Author
 

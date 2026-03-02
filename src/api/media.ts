@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { basename, extname } from "node:path";
 import { linkedinRequest, linkedinUploadBinary, getPersonUrn } from "./client.js";
+import { fetchWithTimeout } from "../utils/fetch.js";
 import { log } from "../utils/logger.js";
 
 const IMAGE_MIME: Record<string, string> = {
@@ -46,7 +47,7 @@ export async function uploadMedia(options: {
     buffer = readFileSync(options.file_path);
     fileName = basename(options.file_path);
   } else if (options.url) {
-    const response = await fetch(options.url);
+    const response = await fetchWithTimeout(options.url, { timeoutMs: 120_000 });
     if (!response.ok) throw new Error(`Failed to download: ${response.status}`);
     buffer = Buffer.from(await response.arrayBuffer());
     fileName = options.url.split("/").pop() || "media";

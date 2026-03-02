@@ -1,4 +1,5 @@
-import { linkedinRequest, getPersonUrn } from "./client.js";
+import { getPersonUrn } from "./client.js";
+import { fetchWithTimeout } from "../utils/fetch.js";
 
 interface UserInfo {
   sub: string;
@@ -19,7 +20,7 @@ export async function getMyProfile(): Promise<{
   const personUrn = getPersonUrn();
 
   // Use userinfo endpoint (OpenID Connect)
-  const response = await fetch("https://api.linkedin.com/v2/userinfo", {
+  const response = await fetchWithTimeout("https://api.linkedin.com/v2/userinfo", {
     headers: {
       Authorization: `Bearer ${(await import("./client.js")).loadTokens()!.access_token}`,
     },

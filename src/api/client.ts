@@ -1,6 +1,7 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import { config } from "../utils/config.js";
 import { LinkedInApiError, toolError } from "../utils/errors.js";
+import { fetchWithTimeout } from "../utils/fetch.js";
 import { log } from "../utils/logger.js";
 
 interface AuthTokens {
@@ -78,7 +79,7 @@ export async function linkedinRequest<T>(
 
   log("info", `LinkedIn API ${method} ${path}`);
 
-  const response = await fetch(url, {
+  const response = await fetchWithTimeout(url, {
     method,
     headers,
     body: body ? JSON.stringify(body) : undefined,
@@ -112,13 +113,14 @@ export async function linkedinUploadBinary(
   const tokens = loadTokens();
   if (!tokens) throw new Error("Not authenticated.");
 
-  const response = await fetch(uploadUrl, {
+  const response = await fetchWithTimeout(uploadUrl, {
     method: "PUT",
     headers: {
       Authorization: `Bearer ${tokens.access_token}`,
       "Content-Type": contentType,
     },
     body: new Uint8Array(buffer),
+    timeoutMs: 120_000,
   });
 
   if (!response.ok) {
@@ -130,7 +132,7 @@ async function refreshAccessToken(tokens: AuthTokens): Promise<boolean> {
   if (!tokens.refresh_token || !config.linkedinClientId) return false;
 
   try {
-    const response = await fetch("https://www.linkedin.com/oauth/v2/accessToken", {
+    const response = await fetchWithTimeout("https://www.linkedin.com/oauth/v2/accessToken", {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams({

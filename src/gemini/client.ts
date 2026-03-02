@@ -1,6 +1,7 @@
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { config } from "../utils/config.js";
+import { fetchWithTimeout } from "../utils/fetch.js";
 import { log } from "../utils/logger.js";
 
 interface GeminiPrediction {
@@ -33,7 +34,7 @@ export async function generateImage(options: {
 
   log("info", `Generating image: "${options.prompt.substring(0, 50)}..." (${aspectRatio})`);
 
-  const response = await fetch(url, {
+  const response = await fetchWithTimeout(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -43,6 +44,7 @@ export async function generateImage(options: {
         aspectRatio,
       },
     }),
+    timeoutMs: 60_000,
   });
 
   if (!response.ok) {
