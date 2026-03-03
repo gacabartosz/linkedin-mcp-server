@@ -11,6 +11,7 @@
     "build": "tsc -p tsconfig.json && node -e \"const f='dist/index.js',c=require('fs');let s=c.readFileSync(f,'utf8');if(!s.startsWith('#!'))c.writeFileSync(f,'#!/usr/bin/env node\\n'+s)\"",
     "dev": "tsx src/index.ts",
     "start": "node dist/index.js",
+    "dashboard": "node dashboard.mjs",
     "prepublishOnly": "npm run build"
   },
   "keywords": [
