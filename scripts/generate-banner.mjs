@@ -90,6 +90,81 @@ const PRESETS = {
       { label: 'Auto-Publish', desc: 'Background Daemon', color: '#059669' },
     ],
   },
+
+  // ── New posts about other projects ────────────────────────────────────────
+
+  post13: {
+    style: 'grid',
+    title: 'SEOleo MCP — 33 SEO Tools',
+    subtitle: 'Technical SEO + GEO + AI Search Optimization',
+    items: [
+      '🔍 Technical Audit', '📝 Content Analysis',
+      '🔗 Link Graph (BFS)', '🔒 SSL/TLS Audit',
+      '♿ WCAG 2.2 AA', '🌐 Hreflang Check',
+      '🤖 AI Robots.txt', '📊 Core Web Vitals',
+      '📋 Schema Validation', '🏢 Local SEO',
+      '🧠 GEO Princeton 9', '📄 PDF Reports',
+    ],
+  },
+
+  post14: {
+    style: 'stack',
+    title: 'G.A.C.A. — AI Bus',
+    layers: [
+      { label: 'Your App', desc: 'Any OpenAI Client', color: '#7C3AED' },
+      { label: 'G.A.C.A. Proxy', desc: 'Smart Routing', color: '#D97706' },
+      { label: '11 AI Providers', desc: '69+ Free Models', color: '#059669' },
+      { label: 'Auto-Failover', desc: '30 Fallback Attempts', color: '#DC2626' },
+    ],
+  },
+
+  post15: {
+    style: 'terminal',
+    title: 'linkedin-mcp-server — Auto-Post + Auto-Comment',
+    lines: [
+      { text: '$ node auto-publish.mjs', color: '#4EC9B0' },
+      { text: 'LinkedIn Auto-Publisher v2 started', color: '#6A9955' },
+      { text: 'Features: image upload, per-post comments, retry logic', color: '#6A9955' },
+      { text: '', color: '' },
+      { text: '[09:30:01] Publishing post 13...', color: '#DCDCAA' },
+      { text: '  Uploading image: post13-banner.png', color: '#569CD6' },
+      { text: '  Image uploaded: urn:li:image:xxxxx', color: '#4EC9B0' },
+      { text: '  Published: urn:li:share:xxxxx', color: '#4EC9B0' },
+      { text: '  Comment queued for 15 min later', color: '#CE9178' },
+      { text: '[09:45:01] Adding GitHub link comment...', color: '#DCDCAA' },
+      { text: '  Comment added ✓', color: '#4EC9B0' },
+    ],
+  },
+
+  post16: {
+    style: 'checklist',
+    title: 'Presidio Browser Anonymizer v2.0',
+    subtitle: '100% Offline PII Protection',
+    checks: [
+      { text: '28 PII entity types (PESEL, NIP, REGON...)', ok: true },
+      { text: 'Auto-paste anonymization (Ctrl+V)', ok: true },
+      { text: 'Works with ChatGPT, Claude, Perplexity', ok: true },
+      { text: '100% offline — localhost only', ok: true },
+      { text: 'Chrome Extension (Manifest V3)', ok: true },
+      { text: 'Docker + multi-language support', ok: true },
+      { text: 'Deanonymization mapping (NEW)', ok: true },
+      { text: 'Plugin system for custom recognizers', ok: true },
+    ],
+  },
+
+  post17: {
+    style: 'grid',
+    title: 'Facebook MCP Server',
+    subtitle: 'Full Facebook Page Automation',
+    items: [
+      '📝 Create Posts', '💬 Comments',
+      '📊 Post Insights', '👍 Reactions',
+      '📈 Impressions', '🎯 Engagement',
+      '🖼️ Image Posts', '📅 Schedule',
+      '🔍 Analytics', '👥 Fan Count',
+      '🛡️ Moderation', '📨 DMs',
+    ],
+  },
 };
 
 // ── HTML Templates ────────────────────────────────────────────────────────────

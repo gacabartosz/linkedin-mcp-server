@@ -38,6 +38,12 @@ const AUTO_COMMENTS = {
   'post10': 'Algorithm rules + 25 tools: https://github.com/gacabartosz/linkedin-mcp-server — built-in guidelines, templates, and auto-publish. Open source.',
   'post11': 'My full stack is open source: https://github.com/gacabartosz/linkedin-mcp-server — LinkedIn MCP with scheduling, templates, algorithm intelligence. Build your own AI content pipeline.',
   'post12': 'Full source code + 3 weeks of real data: https://github.com/gacabartosz/linkedin-mcp-server — the open-source LinkedIn MCP that powers this entire content series.',
+  // Week 4-5 — other projects
+  'post13': 'SEOleo MCP — 33 SEO tools: https://github.com/gacabartosz/seoleo-mcp — technical SEO, GEO (AI search optimization), Core Web Vitals, Schema.org, PDF reports. Open source, MIT. Install: pip install seoleo-mcp',
+  'post14': 'G.A.C.A. source code: https://github.com/gacabartosz/gaca-core — 69+ free AI models, 11 providers, auto-failover, OpenAI-compatible API. Drop-in replacement. MIT licensed.',
+  'post15': 'Full auto-publish pipeline: https://github.com/gacabartosz/linkedin-mcp-server — 25 MCP tools, SQLite scheduler, image upload, auto-comments. This post AND this comment were both automated. MIT licensed.',
+  'post16': 'Presidio Browser Anonymizer v2.0: https://github.com/gacabartosz/second-mind — Chrome extension + local backend. 28 PII types, 100% offline, Docker, plugins. MIT licensed.',
+  'post17': 'Both MCP servers open source:\nLinkedIn: https://github.com/gacabartosz/linkedin-mcp-server (25 tools)\nFacebook: https://github.com/gacabartosz/facebook-mcp-server (28 tools)\nSEO: https://github.com/gacabartosz/seoleo-mcp (33 tools)',
   'default': 'Full source code: https://github.com/gacabartosz/linkedin-mcp-server — 25 MCP tools, 12 templates, built-in algorithm guidelines. Open source, MIT licensed.',
 };
 
@@ -53,6 +59,12 @@ const POST_IDENTIFIERS = {
   '3 weeks ago I published my first post': 'post12',
   'Schedule a thought leadership post for Thursday': 'post3',
   'most powerful signal on LinkedIn': 'post4',
+  // Week 4-5
+  'built an MCP server that runs 33 SEO audits': 'post13',
+  '69 free AI models. 11 providers': 'post14',
+  'This post was written on Sunday': 'post15',
+  'Wklejasz dane klientow do ChatGPT': 'post16',
+  'MCP servers for LinkedIn AND Facebook': 'post17',
 };
 
 // Map post keys → image file paths
@@ -65,6 +77,11 @@ const POST_IMAGES = {
   'post10': join(IMG_DIR, 'post10-banner.png'),
   'post11': join(IMG_DIR, 'post11-banner.png'),
   'post12': join(IMG_DIR, 'post12-banner.png'),
+  'post13': join(IMG_DIR, 'post13-banner.png'),
+  'post14': join(IMG_DIR, 'post14-banner.png'),
+  'post15': join(IMG_DIR, 'post15-banner.png'),
+  'post16': join(IMG_DIR, 'post16-banner.png'),
+  'post17': join(IMG_DIR, 'post17-banner.png'),
 };
 
 function identifyPost(text) {
