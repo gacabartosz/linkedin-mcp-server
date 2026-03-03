@@ -51,26 +51,28 @@ const AUTO_COMMENTS = {
 };
 
 const POST_IDENTIFIERS = {
+  'Schedule a post for Thursday 9:30': 'post3',
+  'most powerful signal on LinkedIn': 'post4',
   'This post published itself': 'post5',
   'Opublikowalem jedyny open-source MCP server': 'post6',
   'Write a thought leadership post about AI automation': 'post7',
   '48 hours. 25 MCP tools': 'post8',
   'MCP (Model Context Protocol) to najwazniejsza zmiana': 'post9',
-  'read about the LinkedIn algorithm. I coded it': 'post10',
-  'content management stack as a solo founder': 'post11',
-  '3 weeks ago I published my first post': 'post12',
-  'Schedule a thought leadership post for Thursday': 'post3',
-  'most powerful signal on LinkedIn': 'post4',
+  'read about the LinkedIn algorithm. I coded every rule': 'post10',
+  '2 hours on Sunday': 'post11',
+  '3 weeks ago I published my first automated post': 'post12',
   'built an MCP server that runs 33 SEO audits': 'post13',
   '69 free AI models. 11 providers': 'post14',
-  'This post was written on Sunday': 'post15',
+  'This post was written on Sunday. Published Thursday': 'post15',
   'Wklejasz dane klientow do ChatGPT': 'post16',
   'MCP servers for LinkedIn AND Facebook': 'post17',
 };
 
 const POST_IMAGES = {
+  'post3': 'post3-banner.png',
+  'post4': 'post4-banner.png',
   'post5': 'post5-banner.png',
-  'post6': 'post6-github.png',
+  'post6': 'post6-banner.png',
   'post7': 'post7-banner.png',
   'post8': 'post8-banner.png',
   'post9': 'post9-banner.png',

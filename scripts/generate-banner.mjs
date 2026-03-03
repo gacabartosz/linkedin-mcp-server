@@ -111,6 +111,28 @@ function vsHTML({ gradient, before, after, headline, cta }) {
 // ── Presets ───────────────────────────────────────────────────────────────────
 
 const PRESETS = {
+  post3: () => splitHTML({
+    gradient: GRADIENTS.midnight,
+    headline: 'Smart Scheduling That Actually Works',
+    bullets: [
+      'Natural language → auto-publish',
+      'Daemon checks every 30 seconds',
+      'Retry logic (3 attempts)',
+      'AI images at publish time',
+      '12 built-in templates',
+    ],
+    cta: 'See how it works ↓',
+  }),
+
+  post4: () => heroHTML({
+    gradient: GRADIENTS.ocean,
+    stat: '15+',
+    statLabel: 'word comments = highest reach',
+    headline: 'The Golden Hour Decides Everything',
+    subline: 'First 60 minutes after posting determine your reach. My tool knows this.',
+    cta: 'Algorithm rules in comments ↓',
+  }),
+
   post5: () => heroHTML({
     gradient: GRADIENTS.midnight,
     stat: '0',
