@@ -4,7 +4,7 @@
 
 | Day | Time | Language | Topic | Project | Status |
 |-----|------|----------|-------|---------|--------|
-| Tue Mar 24 | 09:30 CET | EN | SEOleo MCP — 33 SEO Tools + PDF Report | seoleo-mcp | SCHEDULED |
+| Tue Mar 24 | 09:30 CET | EN | SEO GACA MCP — 33 SEO Tools + PDF Report | seo-gaca-mcp | SCHEDULED |
 | Wed Mar 25 | 08:00 CET | EN | G.A.C.A. — AI Bus with 69 Free Models | gaca-core | SCHEDULED |
 | Thu Mar 26 | 09:30 CET | EN | linkedin-mcp-server — Full Auto Pipeline | linkedin-mcp-server | SCHEDULED |
 | Fri Mar 27 | 08:00 CET | PL | Presidio Anonymizer v2.0 — Update | second-mind | SCHEDULED |
@@ -14,8 +14,8 @@
 
 ## Post 13 — Tuesday 24.03, 09:30 CET (EN)
 
-### Topic: SEOleo MCP — 33 SEO Tools in One AI Conversation
-### Project: github.com/gacabartosz/seoleo-mcp
+### Topic: SEO GACA MCP — 33 SEO Tools in One AI Conversation
+### Project: github.com/gacabartosz/seo-gaca-mcp
 ### Image: post13-banner.png (grid of 12 SEO tool categories)
 
 I built an MCP server that runs 33 SEO audits from a single AI conversation.
@@ -24,7 +24,7 @@ I built an MCP server that runs 33 SEO audits from a single AI conversation.
 
 One prompt. Four tools. One branded PDF delivered to my desktop.
 
-Meet SEOleo MCP — an open-source SEO analysis server with 33 tools:
+Meet SEO GACA MCP — an open-source SEO analysis server with 33 tools:
 
 🔍 Technical SEO — meta tags, crawlability, HTTP headers, robots.txt, sitemap
 📝 Content Analysis — readability (Flesch-Kincaid, Gunning Fog), keyword density, E-E-A-T signals
@@ -41,14 +41,14 @@ The GEO module alone tracks 13 AI crawlers (GPTBot, ClaudeBot, PerplexityBot...)
 
 All 33 tools work via MCP — meaning Claude Code or Claude Desktop can run full SEO audits autonomously.
 
-This post was scheduled and published by linkedin-mcp-server. The SEO audit was run by seoleo-mcp. Both open source.
+This post was scheduled and published by linkedin-mcp-server. The SEO audit was run by seo-gaca-mcp. Both open source.
 
 What would you audit first?
 
 #SEO #MCP #OpenSource
 
 ### Auto-comment (add after 15 min):
-SEOleo MCP — 33 SEO tools: https://github.com/gacabartosz/seoleo-mcp — technical SEO, GEO (AI search optimization), Core Web Vitals, Schema.org, PDF reports. Open source, MIT. Install: pip install seoleo-mcp
+SEO GACA MCP — 33 SEO tools: https://github.com/gacabartosz/seo-gaca-mcp — technical SEO, GEO (AI search optimization), Core Web Vitals, Schema.org, PDF reports. Open source, MIT. Install: pip install seo-gaca-mcp
 
 ---
 
@@ -225,4 +225,4 @@ What platform would you MCP-ify next?
 Both MCP servers open source:
 LinkedIn: https://github.com/gacabartosz/linkedin-mcp-server (25 tools)
 Facebook: https://github.com/gacabartosz/facebook-mcp-server (28 tools)
-SEO: https://github.com/gacabartosz/seoleo-mcp (33 tools)
+SEO: https://github.com/gacabartosz/seo-gaca-mcp (33 tools)

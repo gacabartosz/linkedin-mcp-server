@@ -39,11 +39,11 @@ const AUTO_COMMENTS = {
   'post11': 'My full stack is open source: https://github.com/gacabartosz/linkedin-mcp-server — LinkedIn MCP with scheduling, templates, algorithm intelligence. Build your own AI content pipeline.',
   'post12': 'Full source code + 3 weeks of real data: https://github.com/gacabartosz/linkedin-mcp-server — the open-source LinkedIn MCP that powers this entire content series.',
   // Week 4-5 — other projects
-  'post13': 'SEOleo MCP — 33 SEO tools: https://github.com/gacabartosz/seoleo-mcp — technical SEO, GEO (AI search optimization), Core Web Vitals, Schema.org, PDF reports. Open source, MIT. Install: pip install seoleo-mcp',
+  'post13': 'SEO GACA MCP — 33 SEO tools: https://github.com/gacabartosz/seo-gaca-mcp — technical SEO, GEO (AI search optimization), Core Web Vitals, Schema.org, PDF reports. Open source, MIT.',
   'post14': 'G.A.C.A. source code: https://github.com/gacabartosz/gaca-core — 69+ free AI models, 11 providers, auto-failover, OpenAI-compatible API. Drop-in replacement. MIT licensed.',
   'post15': 'Full auto-publish pipeline: https://github.com/gacabartosz/linkedin-mcp-server — 25 MCP tools, SQLite scheduler, image upload, auto-comments. This post AND this comment were both automated. MIT licensed.',
   'post16': 'Presidio Browser Anonymizer v2.0: https://github.com/gacabartosz/second-mind — Chrome extension + local backend. 28 PII types, 100% offline, Docker, plugins. MIT licensed.',
-  'post17': 'Both MCP servers open source:\nLinkedIn: https://github.com/gacabartosz/linkedin-mcp-server (25 tools)\nFacebook: https://github.com/gacabartosz/facebook-mcp-server (28 tools)\nSEO: https://github.com/gacabartosz/seoleo-mcp (33 tools)',
+  'post17': 'Both MCP servers open source:\nLinkedIn: https://github.com/gacabartosz/linkedin-mcp-server (25 tools)\nFacebook: https://github.com/gacabartosz/facebook-mcp-server (28 tools)\nSEO: https://github.com/gacabartosz/seo-gaca-mcp (33 tools)',
   'default': 'Full source code: https://github.com/gacabartosz/linkedin-mcp-server — 25 MCP tools, 12 templates, built-in algorithm guidelines. Open source, MIT licensed.',
 };
 
