@@ -15,7 +15,7 @@ echo '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' | node dist/in
 
 ## Architecture
 
-- `src/index.ts` — MCP server entry point, all 29 tool handlers (single switch statement)
+- `src/index.ts` — MCP server entry point, all 31 tool handlers (single switch statement)
 - `src/api/` — LinkedIn REST API modules (client, auth, posts, comments, media, profile, reactions)
 - `src/scheduler/` — SQLite-based post scheduler (store, daemon, publisher)
 - `src/content/` — Content templates (12 built-in + custom), brand voice config, and guidelines loader
@@ -25,7 +25,7 @@ echo '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' | node dist/in
 - `src/utils/` — Config, logger, errors (toolResult/toolError helpers)
 - `guidelines/` — LinkedIn algorithm strategy data (`linkedin-strategy.json`)
 - `scripts/generate-banner.mjs` — Standalone banner generator CLI
-- `auto-engage.mjs` — Intelligent auto-reply daemon (Claude AI, socjotechnika, persona from second-mind)
+- `auto-engage.mjs` — Intelligent auto-reply daemon (Gemini via MCP, socjotechnika, persona from second-mind)
 - `auto-publish.mjs` — Auto-publish daemon (60s interval, comment queue, banner generation)
 
 ## Code Conventions
@@ -47,7 +47,7 @@ echo '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' | node dist/in
 4. Parse input with `Schema.parse(args)`, call API function, return `toolResult()`
 5. Wrap in try/catch — errors caught by the outer handler
 
-## Tools (29 total)
+## Tools (31 total)
 
 **Auth & Profile:** linkedin_auth_start, linkedin_auth_status, linkedin_profile_me
 **Posts:** linkedin_post_create, linkedin_post_update, linkedin_post_delete, linkedin_post_repost, linkedin_post_get, linkedin_posts_list
@@ -56,6 +56,7 @@ echo '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' | node dist/in
 **Media:** linkedin_media_upload, linkedin_gemini_image
 **Banners:** linkedin_banner_generate, linkedin_carousel_generate, linkedin_screenshot_capture
 **Case Study:** linkedin_casestudy_generate
+**AI Engage:** linkedin_comment_classify, linkedin_comment_reply_generate
 **Scheduling:** linkedin_schedule_create, linkedin_schedule_list, linkedin_schedule_cancel, linkedin_schedule_update
 **Content:** linkedin_template_list, linkedin_template_get, linkedin_template_save, linkedin_brand_voice, linkedin_guidelines
 
@@ -104,7 +105,7 @@ Supports custom viewport, CSS selector targeting, and full-page capture.
 - Hate handling: constructive criticism → openness, trolling → ironic dismissal, spam → ignore
 - Language detection (PL/EN), project context mapping (5 GitHub repos)
 - Max 10 replies per cycle, 2s delay between API calls
-- Requires `ANTHROPIC_API_KEY` environment variable
+- Uses Gemini Flash via MCP tools (linkedin_comment_classify, linkedin_comment_reply_generate) — no separate API key needed
 
 ## Templates (12 built-in)
 

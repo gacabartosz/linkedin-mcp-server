@@ -1,15 +1,17 @@
 #!/usr/bin/env node
 /**
- * LinkedIn Auto-Engage Daemon v2 — Intelligent AI Replies
+ * LinkedIn Auto-Engage Daemon v3 — Gemini-powered AI Replies via MCP
  *
- * Uses Claude (Anthropic API) to:
+ * Uses linkedin_comment_classify + linkedin_comment_reply_generate MCP tools to:
  * 1. Classify comments (reply / like_only / skip_troll / skip_spam)
  * 2. Generate context-aware replies with persona from second-mind
  * 3. Apply socjotechnika (reciprocity, social proof, authority)
  * 4. Handle hate with common sense
  * 5. Adapt language (PL/EN) and reference correct GitHub project
  *
- * Usage: ANTHROPIC_API_KEY=sk-... node auto-engage.mjs
+ * No external API keys required — uses GEMINI_API_KEY from MCP server config.
+ *
+ * Usage: node auto-engage.mjs
  * Interval: every 2 hours, max 10 replies per cycle
  */
 
@@ -18,7 +20,6 @@ import { readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import Database from 'better-sqlite3';
-import Anthropic from '@anthropic-ai/sdk';
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
@@ -30,7 +31,6 @@ const PERSON_URN = 'urn:li:person:FihAwG4y_B';
 const CHECK_INTERVAL = 2 * 60 * 60 * 1000; // 2 hours
 const MAX_REPLIES_PER_CYCLE = 10;
 const MAX_POSTS_TO_MONITOR = 10;
-const ANTHROPIC_MODEL = 'claude-sonnet-4-20250514';
 const API_DELAY_MS = 2000;
 
 // ── Persona Loader ──────────────────────────────────────────────────────────
@@ -115,146 +115,41 @@ function detectLanguage(text) {
   return hasPL ? 'pl' : 'en';
 }
 
-// ── Anthropic Client ────────────────────────────────────────────────────────
-
-let anthropicClient = null;
-
-function getClient() {
-  if (!anthropicClient) {
-    const apiKey = process.env.ANTHROPIC_API_KEY;
-    if (!apiKey) {
-      throw new Error('ANTHROPIC_API_KEY environment variable is required for intelligent replies');
-    }
-    anthropicClient = new Anthropic({ apiKey });
-  }
-  return anthropicClient;
-}
-
-// ── Comment Classifier ──────────────────────────────────────────────────────
+// ── Comment Classifier (via MCP → Gemini) ──────────────────────────────────
 
 async function classifyComment(commentText, postText, commentAuthor) {
-  // Fast-path: emoji-only
-  if (/^[\p{Emoji}\p{Emoji_Presentation}\s\u200d\ufe0f]+$/u.test(commentText) && commentText.length < 30) {
-    return { decision: 'skip_emoji', sentiment: 'positive' };
-  }
-
-  // Fast-path: very short
-  if (commentText.trim().length < 6) {
-    return { decision: 'like_only', sentiment: 'neutral' };
-  }
-
   try {
-    const client = getClient();
-    const response = await client.messages.create({
-      model: ANTHROPIC_MODEL,
-      max_tokens: 150,
-      system: `You classify LinkedIn comments. Return ONLY valid JSON.
-
-Categories:
-- "reply" — genuine comment deserving a personal reply (questions, thoughtful feedback, experience sharing, constructive criticism, someone tagging others, asking for details)
-- "like_only" — positive but generic ("Great post!", "Thanks!", single word praise, "Interesting") — just like, don't reply
-- "skip_troll" — hostile, trolling, bad-faith, personal attacks — ignore completely
-- "skip_spam" — promotional spam, irrelevant self-promotion, link drops — ignore
-
-Sentiment: "positive" | "negative" | "neutral" | "question"
-
-Bias toward "reply" for questions and substantive comments. Bias toward "like_only" for short generic praise.
-
-Return: {"decision":"...","sentiment":"..."}`,
-      messages: [{
-        role: 'user',
-        content: `Post (first 400 chars): "${postText.substring(0, 400)}"\n\nComment by ${commentAuthor}: "${commentText}"`,
-      }],
+    return await callMCP('linkedin_comment_classify', {
+      comment_text: commentText,
+      post_text: postText.substring(0, 400),
+      comment_author: commentAuthor,
     });
-
-    const text = response.content[0].text.trim();
-    // Extract JSON from response (handle markdown code blocks)
-    const jsonMatch = text.match(/\{[^}]+\}/);
-    if (jsonMatch) {
-      return JSON.parse(jsonMatch[0]);
-    }
-    return JSON.parse(text);
   } catch (err) {
     console.error(`    [classify] Error: ${err.message}`);
     return { decision: 'like_only', sentiment: 'neutral' };
   }
 }
 
-// ── Reply Generator (self-adapting prompts + socjotechnika) ─────────────────
+// ── Reply Generator (via MCP → Gemini + socjotechnika) ──────────────────────
 
 async function generateReply(commentText, postText, language, sentiment, project, persona, threadContext) {
   try {
-    const client = getClient();
-
-    const systemPrompt = `You are ghostwriting LinkedIn comment replies as Bartosz Gaca. Your replies must sound EXACTLY like him — not like a bot, not like corporate LinkedIn.
-
-## WHO YOU ARE (from real profile):
-${persona.profile.substring(0, 1200)}
-
-## HOW YOU COMMUNICATE (real patterns):
-${persona.workStyle.substring(0, 1200)}
-
-## REPLY LANGUAGE: ${language === 'pl' ? 'Polish (use Polish characters: ą, ć, ę, ł, ń, ó, ś, ź, ż)' : 'English'}
-
-## REPLY RULES:
-- MAX 1-3 sentences. Short. Direct. Like a real human reply.
-- Sound like Bartosz: casual, direct, no corporate BS
-- If someone asks a technical question → answer directly, link to repo if relevant
-- If someone shares experience → brief acknowledgment, find common ground
-- If compliment → don't just say thanks, add a nugget of value or redirect to the tool
-- If criticism → "konstruktywna krytyka mile widziana" style, be open, factual
-- If hate/troll → brief ironic dismissal or measured one-liner, never defensive
-
-## SOCJOTECHNIKA (use naturally, don't force):
-- Reciprocity: share something useful (a tip, insight, link) before asking anything
-- Social proof: casually mention stats, users, or results when relevant ("25 tools", "zero manual work")
-- Authority: reference real experience, not credentials ("I built this because...")
-- Commitment: ask a small question to engage ("have you tried X?", "what's your stack?")
-- Liking: find common ground, match their energy level
-- Scarcity: mention what's unique about the approach ("only open-source LinkedIn MCP")
-
-## FORBIDDEN:
-- "Great question!", "Thanks for your valuable insight!", "Appreciate your engagement"
-- "I'm glad you found this helpful!", "Thanks for sharing your thoughts!"
-- Hashtags in replies
-- More than 1 emoji (prefer 0)
-- Sycophantic LinkedIn-speak
-- Long paragraphs
-
-## OK TO USE:
-- ${language === 'pl' ? '"dzięki", "daj znać", "sprawdź repo", "witamy w przyszłości"' : '"thanks", "check it out", "let me know", "welcome to the future"'}
-- Direct answers to direct questions
-- A touch of irony when appropriate
-- Brief personal anecdotes (1 sentence max)
-
-## CONTEXT:
-- Project: ${project.name} (${project.repo})
-- This post is about: ${postText.substring(0, 600)}
-${threadContext ? `\n## CONVERSATION THREAD (previous replies, continue naturally):\n${threadContext}` : ''}
-
-## SENTIMENT CALIBRATION:
-${sentiment === 'question' ? 'QUESTION — be helpful, direct, give a real answer. If relevant, point to the GitHub repo.' : ''}
-${sentiment === 'positive' ? 'POSITIVE — brief acknowledgment + add value. Not just "thanks" — give them a reason to come back.' : ''}
-${sentiment === 'negative' ? 'CRITICISM — stay calm, factual, brief. If valid, acknowledge. If trolling, one ironic line and move on.' : ''}
-${sentiment === 'neutral' ? 'NEUTRAL — engage if there is substance. Brief response that invites further discussion.' : ''}`;
-
-    const response = await client.messages.create({
-      model: ANTHROPIC_MODEL,
-      max_tokens: 250,
-      system: systemPrompt,
-      messages: [{
-        role: 'user',
-        content: `Comment to reply to:\n"${commentText}"\n\nGenerate ONE reply. No quotes, no prefix, just the reply text.`,
-      }],
+    const result = await callMCP('linkedin_comment_reply_generate', {
+      comment_text: commentText,
+      post_text: postText.substring(0, 600),
+      language,
+      sentiment,
+      project_name: project.name,
+      project_repo: project.repo,
+      persona_profile: persona.profile.substring(0, 1200),
+      persona_work_style: persona.workStyle.substring(0, 1200),
+      thread_context: threadContext || undefined,
     });
-
-    let reply = response.content[0].text.trim();
-    // Clean up any quotes or prefixes Claude might add
-    reply = reply.replace(/^["']|["']$/g, '').replace(/^Reply:\s*/i, '');
-    return reply;
+    return result.reply || (language === 'pl'
+      ? 'Dzięki za komentarz! Daj znać jeśli masz pytania.'
+      : 'Thanks! Let me know if you have questions.');
   } catch (err) {
     console.error(`    [reply] Error: ${err.message}`);
-    // Fallback to simple reply on API error
     return language === 'pl'
       ? 'Dzięki za komentarz! Daj znać jeśli masz pytania.'
       : 'Thanks! Let me know if you have questions.';
@@ -579,18 +474,11 @@ function printStats() {
 
 // ── Startup ─────────────────────────────────────────────────────────────────
 
-console.log('LinkedIn Auto-Engage v2.0 — Intelligent AI Replies');
-console.log(`Model: ${ANTHROPIC_MODEL}`);
+console.log('LinkedIn Auto-Engage v3.0 — Gemini-powered AI Replies (via MCP)');
 console.log(`Interval: ${CHECK_INTERVAL / 60000} min | Max replies/cycle: ${MAX_REPLIES_PER_CYCLE}`);
 console.log(`Persona: second-mind | Socjotechnika: enabled`);
+console.log(`AI: linkedin_comment_classify + linkedin_comment_reply_generate (Gemini Flash)`);
 console.log('');
-
-// Verify Anthropic API key
-if (!process.env.ANTHROPIC_API_KEY) {
-  console.error('ERROR: ANTHROPIC_API_KEY environment variable is required');
-  console.error('Set it in your environment or in scripts/run-autoengage.sh');
-  process.exit(1);
-}
 
 initEngageDB();
 loadPersona();

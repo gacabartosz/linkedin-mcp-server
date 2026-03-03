@@ -23,7 +23,7 @@ import { startSchedulerDaemon } from "./scheduler/daemon.js";
 import { listTemplates, getTemplate, saveTemplate, applyTemplate } from "./content/templates.js";
 import { getBrandVoice, setBrandVoice } from "./content/brand-voice.js";
 import { loadGuidelines } from "./content/guidelines.js";
-import { generateImage } from "./gemini/client.js";
+import { generateImage, generateText } from "./gemini/client.js";
 import { generateBanner, generateCarousel, captureScreenshot, listPresets, GRADIENTS } from "./banner/index.js";
 import { generateCaseStudy } from "./casestudy/index.js";
 
@@ -205,6 +205,24 @@ const CaseStudyInput = z.object({
   generate_banner: z.boolean().optional(),
   language: z.enum(["pl", "en"]).optional(),
   save_path: z.string().optional(),
+});
+
+const CommentClassifyInput = z.object({
+  comment_text: z.string().describe("The comment text to classify"),
+  post_text: z.string().describe("The original post text (first 400 chars is enough)"),
+  comment_author: z.string().optional().describe("Name of the comment author"),
+});
+
+const CommentReplyInput = z.object({
+  comment_text: z.string().describe("The comment to reply to"),
+  post_text: z.string().describe("The original post text for context"),
+  language: z.enum(["pl", "en"]).describe("Reply language"),
+  sentiment: z.enum(["positive", "negative", "neutral", "question"]).describe("Comment sentiment"),
+  project_name: z.string().optional().describe("Project name for context"),
+  project_repo: z.string().optional().describe("GitHub repo URL"),
+  persona_profile: z.string().optional().describe("Author persona profile text"),
+  persona_work_style: z.string().optional().describe("Author work style text"),
+  thread_context: z.string().optional().describe("Previous replies in thread"),
 });
 
 const GuidelinesInput = z.object({
@@ -568,6 +586,39 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           save_path: { type: "string", description: "Custom save path for PDF" },
         },
         required: ["project_name", "problem", "solution"],
+      },
+    },
+    // AI Classification & Reply (Gemini-powered)
+    {
+      name: "linkedin_comment_classify",
+      description: "Classify a LinkedIn comment using Gemini AI. Returns decision (reply/like_only/skip_troll/skip_spam) and sentiment (positive/negative/neutral/question). Used by auto-engage daemon.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          comment_text: { type: "string", description: "The comment text to classify" },
+          post_text: { type: "string", description: "The original post text (first 400 chars)" },
+          comment_author: { type: "string", description: "Comment author name" },
+        },
+        required: ["comment_text", "post_text"],
+      },
+    },
+    {
+      name: "linkedin_comment_reply_generate",
+      description: "Generate an intelligent reply to a LinkedIn comment using Gemini AI with persona, socjotechnika, and context-awareness. Used by auto-engage daemon.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          comment_text: { type: "string", description: "The comment to reply to" },
+          post_text: { type: "string", description: "Original post text for context" },
+          language: { type: "string", enum: ["pl", "en"], description: "Reply language" },
+          sentiment: { type: "string", enum: ["positive", "negative", "neutral", "question"], description: "Comment sentiment" },
+          project_name: { type: "string", description: "Project name" },
+          project_repo: { type: "string", description: "GitHub repo URL" },
+          persona_profile: { type: "string", description: "Author persona profile" },
+          persona_work_style: { type: "string", description: "Author work style" },
+          thread_context: { type: "string", description: "Previous replies in thread" },
+        },
+        required: ["comment_text", "post_text", "language", "sentiment"],
       },
     },
     // Scheduling
@@ -965,6 +1016,104 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           save_path: input.save_path,
         });
         return toolResult(csResult);
+      }
+
+      // ── AI Classification & Reply (Gemini) ──────────────────────────
+      case "linkedin_comment_classify": {
+        const input = CommentClassifyInput.parse(args);
+
+        // Fast-path: emoji-only
+        if (/^[\p{Emoji}\p{Emoji_Presentation}\s\u200d\ufe0f]+$/u.test(input.comment_text) && input.comment_text.length < 30) {
+          return toolResult({ decision: "skip_emoji", sentiment: "positive" });
+        }
+        // Fast-path: very short
+        if (input.comment_text.trim().length < 6) {
+          return toolResult({ decision: "like_only", sentiment: "neutral" });
+        }
+
+        const classifySystem = `You classify LinkedIn comments. Return ONLY valid JSON.
+
+Categories:
+- "reply" — genuine comment deserving a personal reply (questions, thoughtful feedback, experience sharing, constructive criticism)
+- "like_only" — positive but generic ("Great post!", "Thanks!", single word praise) — just like, don't reply
+- "skip_troll" — hostile, trolling, bad-faith, personal attacks — ignore
+- "skip_spam" — promotional spam, irrelevant self-promotion, link drops — ignore
+
+Sentiment: "positive" | "negative" | "neutral" | "question"
+
+Bias toward "reply" for questions and substantive comments. Bias toward "like_only" for short generic praise.
+
+Return: {"decision":"...","sentiment":"..."}`;
+
+        try {
+          const raw = await generateText({
+            system: classifySystem,
+            prompt: `Post (first 400 chars): "${input.post_text.substring(0, 400)}"\n\nComment by ${input.comment_author || "someone"}: "${input.comment_text}"`,
+            maxTokens: 100,
+          });
+          const jsonMatch = raw.match(/\{[^}]+\}/);
+          const result = jsonMatch ? JSON.parse(jsonMatch[0]) : { decision: "like_only", sentiment: "neutral" };
+          return toolResult(result);
+        } catch (err) {
+          log("warn", `Comment classify failed: ${(err as Error).message}`);
+          return toolResult({ decision: "like_only", sentiment: "neutral" });
+        }
+      }
+
+      case "linkedin_comment_reply_generate": {
+        const input = CommentReplyInput.parse(args);
+
+        const replySystem = `You are ghostwriting LinkedIn comment replies as Bartosz Gaca. Your replies must sound EXACTLY like him — not like a bot, not like corporate LinkedIn.
+
+${input.persona_profile ? `## WHO YOU ARE:\n${input.persona_profile.substring(0, 1200)}` : "## WHO YOU ARE:\nBartosz Gaca — Fractional Head of Automation. AI-first, action-oriented, direct, low formality."}
+
+${input.persona_work_style ? `## HOW YOU COMMUNICATE:\n${input.persona_work_style.substring(0, 1200)}` : "## STYLE:\nShort messages, zero preamble. No corporate BS. Typical: 'daj znać', 'sprawdź repo'."}
+
+## REPLY LANGUAGE: ${input.language === "pl" ? "Polish (use Polish characters: ą, ć, ę, ł, ń, ó, ś, ź, ż)" : "English"}
+
+## REPLY RULES:
+- MAX 1-3 sentences. Short. Direct. Like a real human reply.
+- If question → answer directly, link to repo if relevant
+- If compliment → don't just say thanks, add a nugget of value
+- If criticism → be open, factual, "konstruktywna krytyka mile widziana"
+- If hate/troll → brief ironic dismissal, never defensive
+
+## SOCJOTECHNIKA (use naturally):
+- Reciprocity: share something useful before asking anything
+- Social proof: casually mention stats or results when relevant
+- Authority: reference real experience ("I built this because...")
+- Commitment: ask a small question ("have you tried X?")
+
+## FORBIDDEN:
+- "Great question!", "Thanks for your valuable insight!", "Appreciate your engagement"
+- Hashtags in replies, more than 1 emoji, sycophantic LinkedIn-speak
+
+## CONTEXT:
+- Project: ${input.project_name || "LinkedIn MCP Server"} (${input.project_repo || "https://github.com/gacabartosz/linkedin-mcp-server"})
+- Post about: ${input.post_text.substring(0, 600)}
+${input.thread_context ? `\n## THREAD:\n${input.thread_context}` : ""}
+
+## SENTIMENT: ${input.sentiment}
+${input.sentiment === "question" ? "Be helpful, direct, give a real answer." : ""}
+${input.sentiment === "positive" ? "Brief acknowledgment + add value." : ""}
+${input.sentiment === "negative" ? "Stay calm, factual, brief." : ""}
+${input.sentiment === "neutral" ? "Engage if substance, invite discussion." : ""}`;
+
+        try {
+          let reply = await generateText({
+            system: replySystem,
+            prompt: `Comment to reply to:\n"${input.comment_text}"\n\nGenerate ONE reply. No quotes, no prefix, just the reply text.`,
+            maxTokens: 250,
+          });
+          reply = reply.replace(/^["']|["']$/g, "").replace(/^Reply:\s*/i, "");
+          return toolResult({ reply });
+        } catch (err) {
+          const fallback = input.language === "pl"
+            ? "Dzięki za komentarz! Daj znać jeśli masz pytania."
+            : "Thanks! Let me know if you have questions.";
+          log("warn", `Reply generation failed: ${(err as Error).message}`);
+          return toolResult({ reply: fallback });
+        }
       }
 
       // ── Scheduling ────────────────────────────────────────────────────
