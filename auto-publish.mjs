@@ -118,11 +118,19 @@ async function callMCP(toolName, args) {
       for (const line of out.split('\n')) {
         try {
           const msg = JSON.parse(line.trim());
-          if (msg.id === 2 && msg.result && !resolved) {
+          if (msg.id === 2 && !resolved) {
             resolved = true;
-            const text = msg.result.content?.[0]?.text || '{}';
             proc.kill();
-            resolve(JSON.parse(text));
+            if (msg.result?.isError) {
+              reject(new Error(msg.result.content?.[0]?.text || 'MCP tool error'));
+              return;
+            }
+            const text = msg.result?.content?.[0]?.text || '{}';
+            try {
+              resolve(JSON.parse(text));
+            } catch {
+              resolve({ raw: text });
+            }
             return;
           }
         } catch {}
