@@ -59,25 +59,34 @@ export async function linkedinRequest<T>(
   method: string,
   path: string,
   body?: unknown,
+  options?: { apiBase?: "rest" | "v2" },
 ): Promise<T> {
   const tokens = loadTokens();
   if (!tokens) throw new Error("Not authenticated. Run linkedin_auth_start first.");
 
+  const base = options?.apiBase === "v2"
+    ? "https://api.linkedin.com/v2"
+    : "https://api.linkedin.com/rest";
+
   const url = path.startsWith("https://")
     ? path
-    : `https://api.linkedin.com/rest${path}`;
+    : `${base}${path}`;
 
   const headers: Record<string, string> = {
     Authorization: `Bearer ${tokens.access_token}`,
-    "LinkedIn-Version": config.apiVersion,
     "X-Restli-Protocol-Version": "2.0.0",
   };
+
+  // Only add LinkedIn-Version for /rest API
+  if (options?.apiBase !== "v2") {
+    headers["LinkedIn-Version"] = config.apiVersion;
+  }
 
   if (body) {
     headers["Content-Type"] = "application/json";
   }
 
-  log("info", `LinkedIn API ${method} ${path}`);
+  log("info", `LinkedIn API ${method} ${url}`);
 
   const response = await fetchWithTimeout(url, {
     method,
@@ -89,7 +98,7 @@ export async function linkedinRequest<T>(
     log("warn", "Token expired, attempting refresh");
     const refreshed = await refreshAccessToken(tokens);
     if (refreshed) {
-      return linkedinRequest(method, path, body);
+      return linkedinRequest(method, path, body, options);
     }
   }
 
@@ -100,9 +109,20 @@ export async function linkedinRequest<T>(
 
   if (response.status === 204) return {} as T;
 
+  // Capture x-restli-id header (LinkedIn returns new entity IDs here)
+  const restliId = response.headers.get("x-restli-id") || "";
+
   const text = await response.text();
+  if (!text && restliId) {
+    return { "x-restli-id": restliId } as T;
+  }
   if (!text) return {} as T;
-  return JSON.parse(text) as T;
+
+  const parsed = JSON.parse(text) as Record<string, unknown>;
+  if (restliId && !parsed["x-restli-id"]) {
+    parsed["x-restli-id"] = restliId;
+  }
+  return parsed as T;
 }
 
 export async function linkedinUploadBinary(

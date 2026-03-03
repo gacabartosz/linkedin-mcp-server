@@ -18,6 +18,7 @@ export interface ContentTemplate {
   description: string;
   body: string;
   variables: TemplateVariable[];
+  tips?: string[];
   example_output?: string;
 }
 

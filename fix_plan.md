@@ -39,5 +39,5 @@
 - [x] Add connection timeout to fetch calls (AbortController with 30s timeout)
 - [ ] Verify the scheduler catch-up logic works (overdue posts published on startup)
 - [ ] Consider adding linkedin_post_create_with_image convenience tool (generate + upload + post in one call)
-- [ ] Ensure guidelines/linkedin-strategy.json is included in npm package (files[] in package.json)
-- [ ] Add tips field to ContentTemplate TypeScript interface in templates.ts
+- [x] Ensure guidelines/linkedin-strategy.json is included in npm package (files[] in package.json)
+- [x] Add tips field to ContentTemplate TypeScript interface in templates.ts
