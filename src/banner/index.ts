@@ -1,9 +1,12 @@
 /**
  * LinkedIn Banner Generator — MCP-integrated module.
  * Generates professional, scroll-stopping 1200×627 banners with CTA and branding.
+ * 6 templates: hero, split, numbers, vs, infographic, quote
+ * Carousel PDF support (1080×1080 slides → PDF).
+ * Screenshot capture for web pages.
  * Uses Puppeteer for HTML→PNG rendering (dynamic import).
  */
-import { mkdirSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync, unlinkSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { config } from "../utils/config.js";
 import { log } from "../utils/logger.js";
@@ -45,6 +48,23 @@ function ctaBar(text = "Link in comments"): string {
 function decorCircles(): string {
   return `<div style="position:absolute;top:-80px;right:-80px;width:300px;height:300px;border-radius:50%;background:rgba(255,255,255,0.06)"></div>
   <div style="position:absolute;bottom:-120px;left:-60px;width:350px;height:350px;border-radius:50%;background:rgba(255,255,255,0.04)"></div>`;
+}
+
+// ── Visual Complexity (dwell time boosters) ──────────────────────────────────
+
+function noiseOverlay(): string {
+  return `<div style="position:absolute;inset:0;opacity:0.03;background-image:url('data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 200 200%22%3E%3Cfilter id=%22n%22%3E%3CfeTurbulence type=%22fractalNoise%22 baseFrequency=%220.65%22 numOctaves=%224%22/%3E%3CfeColorMatrix type=%22saturate%22 values=%220%22/%3E%3C/filter%3E%3Crect width=%22200%22 height=%22200%22 filter=%22url(%23n)%22/%3E%3C/svg%3E');background-repeat:repeat;background-size:200px"></div>`;
+}
+
+function decorGeometric(): string {
+  return `${decorCircles()}
+    <div style="position:absolute;top:50px;left:50px;width:80px;height:80px;border:2px solid rgba(255,255,255,0.08);transform:rotate(45deg)"></div>
+    <div style="position:absolute;bottom:80px;right:120px;width:60px;height:60px;border:2px solid rgba(255,255,255,0.06);border-radius:50%"></div>
+    <div style="position:absolute;top:200px;right:40px;width:4px;height:120px;background:rgba(255,255,255,0.05)"></div>`;
+}
+
+function dotGrid(): string {
+  return `<div style="position:absolute;inset:0;opacity:0.04;background-image:radial-gradient(circle, rgba(255,255,255,0.8) 1px, transparent 1px);background-size:24px 24px"></div>`;
 }
 
 // ── Templates ─────────────────────────────────────────────────────────────────
@@ -142,9 +162,59 @@ function vsHTML(cfg: VsConfig): string {
   </body></html>`;
 }
 
+// ── Infographic Template ──────────────────────────────────────────────────────
+
+export interface InfographicConfig {
+  gradient: string;
+  headline: string;
+  data_points: Array<{ label: string; value: number; max?: number }>;
+  cta?: string;
+}
+
+function infographicHTML(cfg: InfographicConfig): string {
+  const maxVal = Math.max(...cfg.data_points.map(d => d.max || d.value));
+  const bars = cfg.data_points.map(d => {
+    const pct = Math.round((d.value / maxVal) * 100);
+    return `<div style="display:flex;align-items:center;gap:16px;margin-bottom:14px">
+      <span style="color:rgba(255,255,255,0.7);font-size:14px;width:140px;text-align:right;flex-shrink:0;text-transform:uppercase;letter-spacing:1px">${esc(d.label)}</span>
+      <div style="flex:1;height:36px;background:rgba(255,255,255,0.1);border-radius:8px;overflow:hidden">
+        <div style="width:${pct}%;height:100%;background:rgba(255,255,255,0.25);border-radius:8px;display:flex;align-items:center;padding-left:12px;min-width:40px">
+          <span style="color:#fff;font-size:15px;font-weight:700">${d.value}</span>
+        </div>
+      </div>
+    </div>`;
+  }).join("");
+
+  return `<!DOCTYPE html><html><body style="${baseStyle(cfg.gradient)}">
+    ${decorGeometric()}${noiseOverlay()}${dotGrid()}
+    <div style="font-size:38px;font-weight:800;color:#fff;text-align:center;max-width:900px;line-height:1.15;margin-bottom:36px;padding:0 40px;text-shadow:0 2px 12px rgba(0,0,0,0.3)">${esc(cfg.headline)}</div>
+    <div style="width:85%;max-width:800px">${bars}</div>
+    ${ctaBar(cfg.cta || "Link in comments")}
+  </body></html>`;
+}
+
+// ── Quote Template ───────────────────────────────────────────────────────────
+
+export interface QuoteConfig {
+  gradient: string;
+  quote: string;
+  author?: string;
+  cta?: string;
+}
+
+function quoteHTML(cfg: QuoteConfig): string {
+  return `<!DOCTYPE html><html><body style="${baseStyle(cfg.gradient)}">
+    ${decorGeometric()}${noiseOverlay()}
+    <div style="font-size:140px;color:rgba(255,255,255,0.12);position:absolute;top:30px;left:60px;font-family:Georgia,serif;line-height:1">&ldquo;</div>
+    <div style="font-size:30px;font-weight:600;color:#fff;text-align:center;max-width:800px;line-height:1.45;padding:0 80px;font-style:italic;text-shadow:0 2px 12px rgba(0,0,0,0.2)">${esc(cfg.quote)}</div>
+    ${cfg.author ? `<div style="margin-top:24px;font-size:17px;color:rgba(255,255,255,0.7);font-weight:500">&mdash; ${esc(cfg.author)}</div>` : ""}
+    ${ctaBar(cfg.cta || "Link in comments")}
+  </body></html>`;
+}
+
 // ── Public API ────────────────────────────────────────────────────────────────
 
-export type TemplateType = "hero" | "split" | "numbers" | "vs";
+export type TemplateType = "hero" | "split" | "numbers" | "vs" | "infographic" | "quote";
 
 export interface BannerConfig {
   /** Use a built-in preset name (post5, post6, ..., post17) */
@@ -173,6 +243,12 @@ export interface BannerConfig {
   cta?: string;
   /** Custom save path. Default: ~/.linkedin-mcp/images/banner-{timestamp}.png */
   save_path?: string;
+  /** Data points for infographic template */
+  data_points?: Array<{ label: string; value: number; max?: number }>;
+  /** Quote text for quote template */
+  quote?: string;
+  /** Quote author for quote template */
+  quote_author?: string;
 }
 
 // ── Presets ────────────────────────────────────────────────────────────────────
@@ -366,15 +442,17 @@ export async function generateBanner(cfg: BannerConfig): Promise<{
     const gradient = GRADIENTS[gradientName] || GRADIENTS.ocean;
     templateName = template;
 
-    if (!cfg.headline) {
+    if (!cfg.headline && template !== "quote") {
       throw new Error("headline is required for custom banners (or use preset)");
     }
+
+    const headline = cfg.headline || "";
 
     switch (template) {
       case "hero":
         html = heroHTML({
           gradient,
-          headline: cfg.headline,
+          headline,
           subline: cfg.subline,
           stat: cfg.stat,
           stat_label: cfg.stat_label,
@@ -384,7 +462,7 @@ export async function generateBanner(cfg: BannerConfig): Promise<{
       case "split":
         html = splitHTML({
           gradient,
-          headline: cfg.headline,
+          headline,
           bullets: cfg.bullets || [],
           cta: cfg.cta,
         });
@@ -392,7 +470,7 @@ export async function generateBanner(cfg: BannerConfig): Promise<{
       case "numbers":
         html = numbersHTML({
           gradient,
-          headline: cfg.headline,
+          headline,
           numbers: cfg.numbers || [],
           cta: cfg.cta,
         });
@@ -403,14 +481,33 @@ export async function generateBanner(cfg: BannerConfig): Promise<{
         }
         html = vsHTML({
           gradient,
-          headline: cfg.headline,
+          headline,
           before: cfg.before,
           after: cfg.after,
           cta: cfg.cta,
         });
         break;
+      case "infographic":
+        html = infographicHTML({
+          gradient,
+          headline,
+          data_points: cfg.data_points || [],
+          cta: cfg.cta,
+        });
+        break;
+      case "quote":
+        if (!cfg.quote) {
+          throw new Error("quote text is required for 'quote' template");
+        }
+        html = quoteHTML({
+          gradient,
+          quote: cfg.quote,
+          author: cfg.quote_author,
+          cta: cfg.cta,
+        });
+        break;
       default:
-        throw new Error(`Unknown template: "${template}". Available: hero, split, numbers, vs`);
+        throw new Error(`Unknown template: "${template}". Available: hero, split, numbers, vs, infographic, quote`);
     }
   }
 
@@ -431,5 +528,270 @@ export async function generateBanner(cfg: BannerConfig): Promise<{
     template: templateName,
     gradient: gradientName,
     presets_available: Object.keys(PRESETS),
+  };
+}
+
+// ── Carousel PDF Generation ──────────────────────────────────────────────────
+
+const CAROUSEL_W = 1080;
+const CAROUSEL_H = 1080;
+
+export interface CarouselSlide {
+  template: TemplateType;
+  gradient?: string;
+  headline?: string;
+  subline?: string;
+  stat?: string;
+  stat_label?: string;
+  bullets?: string[];
+  numbers?: NumberItem[];
+  before?: { title: string; items: string[] };
+  after?: { title: string; items: string[] };
+  data_points?: Array<{ label: string; value: number; max?: number }>;
+  quote?: string;
+  quote_author?: string;
+  cta?: string;
+}
+
+export interface CarouselConfig {
+  slides: CarouselSlide[];
+  gradient?: string;
+  save_path?: string;
+}
+
+function carouselBaseStyle(gradient: string): string {
+  return `margin:0;padding:0;width:${CAROUSEL_W}px;height:${CAROUSEL_H}px;background:${gradient};display:flex;flex-direction:column;justify-content:center;align-items:center;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;position:relative;overflow:hidden`;
+}
+
+function generateSlideHTML(slide: CarouselSlide, gradientValue: string): string {
+  // Generate HTML adapted for 1080×1080 square format
+  const style = carouselBaseStyle(gradientValue);
+  const cta = slide.cta || "Swipe →";
+
+  switch (slide.template) {
+    case "hero":
+      return `<!DOCTYPE html><html><body style="${style}">
+        ${decorGeometric()}${noiseOverlay()}
+        ${slide.stat ? `<div style="font-size:90px;font-weight:900;color:#fff;letter-spacing:-2px;margin-bottom:8px;text-shadow:0 4px 20px rgba(0,0,0,0.3)">${esc(slide.stat)}</div>` : ""}
+        ${slide.stat_label ? `<div style="font-size:18px;color:rgba(255,255,255,0.8);font-weight:500;margin-bottom:24px;text-transform:uppercase;letter-spacing:3px">${esc(slide.stat_label)}</div>` : ""}
+        <div style="font-size:48px;font-weight:800;color:#fff;text-align:center;max-width:900px;line-height:1.2;text-shadow:0 2px 12px rgba(0,0,0,0.2);padding:0 50px">${esc(slide.headline || "")}</div>
+        ${slide.subline ? `<div style="font-size:22px;color:rgba(255,255,255,0.85);margin-top:20px;font-weight:500;text-align:center;max-width:800px;padding:0 50px">${esc(slide.subline)}</div>` : ""}
+        ${ctaBar(cta)}
+      </body></html>`;
+
+    case "split":
+      return `<!DOCTYPE html><html><body style="${style}">
+        ${decorGeometric()}${noiseOverlay()}
+        <div style="padding:60px;display:flex;flex-direction:column;justify-content:center;align-items:flex-start;width:100%;box-sizing:border-box">
+          <div style="font-size:40px;font-weight:800;color:#fff;line-height:1.15;margin-bottom:30px;text-shadow:0 2px 8px rgba(0,0,0,0.15)">${esc(slide.headline || "")}</div>
+          ${(slide.bullets || []).map(b => `<div style="display:flex;align-items:center;gap:12px;margin-bottom:12px">
+            <span style="width:28px;height:28px;border-radius:50%;background:rgba(255,255,255,0.2);display:flex;align-items:center;justify-content:center;font-size:14px;color:#fff;flex-shrink:0">✓</span>
+            <span style="color:rgba(255,255,255,0.92);font-size:20px;font-weight:500">${esc(b)}</span>
+          </div>`).join("")}
+        </div>
+        ${ctaBar(cta)}
+      </body></html>`;
+
+    case "numbers": {
+      const numEls = (slide.numbers || []).map(n => `<div style="text-align:center">
+        <div style="font-size:56px;font-weight:900;color:#fff">${esc(n.value)}</div>
+        <div style="font-size:14px;color:rgba(255,255,255,0.7);text-transform:uppercase;letter-spacing:2px;margin-top:6px">${esc(n.label)}</div>
+      </div>`).join("");
+      return `<!DOCTYPE html><html><body style="${style}">
+        ${decorGeometric()}${noiseOverlay()}
+        <div style="font-size:42px;font-weight:800;color:#fff;text-align:center;max-width:900px;line-height:1.15;margin-bottom:40px;padding:0 50px;text-shadow:0 2px 12px rgba(0,0,0,0.2)">${esc(slide.headline || "")}</div>
+        <div style="display:flex;gap:60px;align-items:center">${numEls}</div>
+        ${ctaBar(cta)}
+      </body></html>`;
+    }
+
+    case "infographic": {
+      const maxVal = Math.max(...(slide.data_points || []).map(d => d.max || d.value), 1);
+      const bars = (slide.data_points || []).map(d => {
+        const pct = Math.round((d.value / maxVal) * 100);
+        return `<div style="display:flex;align-items:center;gap:16px;margin-bottom:14px">
+          <span style="color:rgba(255,255,255,0.7);font-size:15px;width:140px;text-align:right;flex-shrink:0">${esc(d.label)}</span>
+          <div style="flex:1;height:36px;background:rgba(255,255,255,0.1);border-radius:8px;overflow:hidden">
+            <div style="width:${pct}%;height:100%;background:rgba(255,255,255,0.25);border-radius:8px;display:flex;align-items:center;padding-left:12px;min-width:40px">
+              <span style="color:#fff;font-size:15px;font-weight:700">${d.value}</span>
+            </div>
+          </div>
+        </div>`;
+      }).join("");
+      return `<!DOCTYPE html><html><body style="${style}">
+        ${decorGeometric()}${noiseOverlay()}${dotGrid()}
+        <div style="font-size:38px;font-weight:800;color:#fff;text-align:center;max-width:900px;line-height:1.15;margin-bottom:36px;padding:0 50px">${esc(slide.headline || "")}</div>
+        <div style="width:85%;max-width:800px">${bars}</div>
+        ${ctaBar(cta)}
+      </body></html>`;
+    }
+
+    case "quote":
+      return `<!DOCTYPE html><html><body style="${style}">
+        ${decorGeometric()}${noiseOverlay()}
+        <div style="font-size:140px;color:rgba(255,255,255,0.12);position:absolute;top:40px;left:60px;font-family:Georgia,serif;line-height:1">&ldquo;</div>
+        <div style="font-size:32px;font-weight:600;color:#fff;text-align:center;max-width:800px;line-height:1.45;padding:0 80px;font-style:italic">${esc(slide.quote || "")}</div>
+        ${slide.quote_author ? `<div style="margin-top:24px;font-size:17px;color:rgba(255,255,255,0.7)">&mdash; ${esc(slide.quote_author)}</div>` : ""}
+        ${ctaBar(cta)}
+      </body></html>`;
+
+    case "vs": {
+      const box = (title: string, items: string[], opacity: string) => `<div style="background:rgba(255,255,255,${opacity});border-radius:16px;padding:28px;width:420px">
+        <div style="font-size:22px;font-weight:800;color:#fff;margin-bottom:16px">${esc(title)}</div>
+        ${items.map(i => `<div style="color:rgba(255,255,255,0.85);font-size:17px;margin-bottom:8px">${esc(i)}</div>`).join("")}
+      </div>`;
+      return `<!DOCTYPE html><html><body style="${style}">
+        ${decorGeometric()}${noiseOverlay()}
+        <div style="font-size:38px;font-weight:800;color:#fff;margin-bottom:28px">${esc(slide.headline || "")}</div>
+        <div style="display:flex;gap:24px;align-items:stretch">
+          ${slide.before ? box(slide.before.title, slide.before.items, "0.08") : ""}
+          <div style="display:flex;align-items:center;font-size:36px;color:rgba(255,255,255,0.6);font-weight:900">→</div>
+          ${slide.after ? box(slide.after.title, slide.after.items, "0.15") : ""}
+        </div>
+        ${ctaBar(cta)}
+      </body></html>`;
+    }
+
+    default:
+      return `<!DOCTYPE html><html><body style="${style}">
+        ${decorCircles()}
+        <div style="font-size:48px;font-weight:800;color:#fff;text-align:center;padding:0 60px">${esc(slide.headline || "")}</div>
+        ${ctaBar(cta)}
+      </body></html>`;
+  }
+}
+
+async function renderCarouselSlide(html: string, outPath: string): Promise<void> {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let puppeteer: any;
+  try {
+    puppeteer = await import("puppeteer");
+  } catch {
+    throw new Error("Puppeteer is required for carousel generation");
+  }
+
+  mkdirSync(dirname(outPath), { recursive: true });
+  const launch = puppeteer.default?.launch || puppeteer.launch;
+  const browser = await launch({ headless: true });
+  try {
+    const page = await browser.newPage();
+    await page.setViewport({ width: CAROUSEL_W, height: CAROUSEL_H, deviceScaleFactor: 2 });
+    await page.setContent(html, { waitUntil: "networkidle0" });
+    await page.screenshot({ path: outPath, type: "png" });
+  } finally {
+    await browser.close();
+  }
+}
+
+export async function generateCarousel(cfg: CarouselConfig): Promise<{
+  file_path: string;
+  slide_count: number;
+  format: string;
+}> {
+  const { PDFDocument } = await import("pdf-lib");
+
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-").substring(0, 19);
+  const pdfPath = cfg.save_path || join(config.imagesDir, `carousel-${timestamp}.pdf`);
+  mkdirSync(dirname(pdfPath), { recursive: true });
+
+  const pdfDoc = await PDFDocument.create();
+  const tempFiles: string[] = [];
+
+  for (let i = 0; i < cfg.slides.length; i++) {
+    const slide = cfg.slides[i];
+    const gradientName = slide.gradient || cfg.gradient || "ocean";
+    const gradientValue = GRADIENTS[gradientName] || GRADIENTS.ocean;
+    const html = generateSlideHTML(slide, gradientValue);
+
+    const tempPng = join(config.imagesDir, `carousel-temp-${i}.png`);
+    tempFiles.push(tempPng);
+    await renderCarouselSlide(html, tempPng);
+
+    const pngBytes = readFileSync(tempPng);
+    const pngImage = await pdfDoc.embedPng(pngBytes);
+    const page = pdfDoc.addPage([CAROUSEL_W * 2, CAROUSEL_H * 2]);
+    page.drawImage(pngImage, {
+      x: 0, y: 0,
+      width: CAROUSEL_W * 2,
+      height: CAROUSEL_H * 2,
+    });
+  }
+
+  const pdfBytes = await pdfDoc.save();
+  writeFileSync(pdfPath, pdfBytes);
+
+  // Cleanup temp files
+  for (const f of tempFiles) {
+    try { unlinkSync(f); } catch { /* ignore */ }
+  }
+
+  log("info", `Carousel PDF saved: ${pdfPath} (${cfg.slides.length} slides)`);
+
+  return {
+    file_path: pdfPath,
+    slide_count: cfg.slides.length,
+    format: "pdf",
+  };
+}
+
+// ── Screenshot Capture ───────────────────────────────────────────────────────
+
+export interface ScreenshotConfig {
+  url: string;
+  width?: number;
+  height?: number;
+  selector?: string;
+  save_path?: string;
+  full_page?: boolean;
+}
+
+export async function captureScreenshot(cfg: ScreenshotConfig): Promise<{
+  file_path: string;
+  url: string;
+  width: number;
+  height: number;
+}> {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let puppeteer: any;
+  try {
+    puppeteer = await import("puppeteer");
+  } catch {
+    throw new Error("Puppeteer is required for screenshot capture");
+  }
+
+  const width = cfg.width || 1280;
+  const height = cfg.height || 800;
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-").substring(0, 19);
+  const outPath = cfg.save_path || join(config.imagesDir, `screenshot-${timestamp}.png`);
+  mkdirSync(dirname(outPath), { recursive: true });
+
+  const launch = puppeteer.default?.launch || puppeteer.launch;
+  const browser = await launch({ headless: true });
+  try {
+    const page = await browser.newPage();
+    await page.setViewport({ width, height, deviceScaleFactor: 2 });
+    await page.goto(cfg.url, { waitUntil: "networkidle0", timeout: 30000 });
+
+    if (cfg.selector) {
+      const element = await page.$(cfg.selector);
+      if (element) {
+        await element.screenshot({ path: outPath, type: "png" });
+      } else {
+        await page.screenshot({ path: outPath, type: "png", fullPage: cfg.full_page });
+      }
+    } else {
+      await page.screenshot({ path: outPath, type: "png", fullPage: cfg.full_page });
+    }
+  } finally {
+    await browser.close();
+  }
+
+  log("info", `Screenshot saved: ${outPath}`);
+
+  return {
+    file_path: outPath,
+    url: cfg.url,
+    width,
+    height,
   };
 }

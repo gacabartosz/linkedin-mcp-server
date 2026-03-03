@@ -24,7 +24,8 @@ import { listTemplates, getTemplate, saveTemplate, applyTemplate } from "./conte
 import { getBrandVoice, setBrandVoice } from "./content/brand-voice.js";
 import { loadGuidelines } from "./content/guidelines.js";
 import { generateImage } from "./gemini/client.js";
-import { generateBanner, listPresets, GRADIENTS } from "./banner/index.js";
+import { generateBanner, generateCarousel, captureScreenshot, listPresets, GRADIENTS } from "./banner/index.js";
+import { generateCaseStudy } from "./casestudy/index.js";
 
 // ─── Zod Schemas ─────────────────────────────────────────────────────────────
 
@@ -140,7 +141,7 @@ const TemplateSaveInput = z.object({
 
 const BannerGenerateInput = z.object({
   preset: z.string().optional(),
-  template: z.enum(["hero", "split", "numbers", "vs"]).optional(),
+  template: z.enum(["hero", "split", "numbers", "vs", "infographic", "quote"]).optional(),
   gradient: z.enum(["ocean", "sunset", "purple", "emerald", "fire", "midnight", "teal", "rose"]).optional(),
   headline: z.string().optional(),
   subline: z.string().optional(),
@@ -150,10 +151,60 @@ const BannerGenerateInput = z.object({
   numbers: z.array(z.object({ value: z.string(), label: z.string() })).optional(),
   before: z.object({ title: z.string(), items: z.array(z.string()) }).optional(),
   after: z.object({ title: z.string(), items: z.array(z.string()) }).optional(),
+  data_points: z.array(z.object({ label: z.string(), value: z.number(), max: z.number().optional() })).optional(),
+  quote: z.string().optional(),
+  quote_author: z.string().optional(),
   cta: z.string().optional(),
   save_path: z.string().optional(),
   upload_to_linkedin: z.boolean().optional(),
   alt_text: z.string().optional(),
+});
+
+const CarouselGenerateInput = z.object({
+  slides: z.array(z.object({
+    template: z.enum(["hero", "split", "numbers", "vs", "infographic", "quote"]),
+    gradient: z.string().optional(),
+    headline: z.string().optional(),
+    subline: z.string().optional(),
+    stat: z.string().optional(),
+    stat_label: z.string().optional(),
+    bullets: z.array(z.string()).optional(),
+    numbers: z.array(z.object({ value: z.string(), label: z.string() })).optional(),
+    before: z.object({ title: z.string(), items: z.array(z.string()) }).optional(),
+    after: z.object({ title: z.string(), items: z.array(z.string()) }).optional(),
+    data_points: z.array(z.object({ label: z.string(), value: z.number() })).optional(),
+    quote: z.string().optional(),
+    quote_author: z.string().optional(),
+    cta: z.string().optional(),
+  })),
+  gradient: z.string().optional(),
+  save_path: z.string().optional(),
+  upload_to_linkedin: z.boolean().optional(),
+});
+
+const ScreenshotInput = z.object({
+  url: z.string(),
+  width: z.number().optional(),
+  height: z.number().optional(),
+  selector: z.string().optional(),
+  full_page: z.boolean().optional(),
+  save_path: z.string().optional(),
+  upload_to_linkedin: z.boolean().optional(),
+});
+
+const CaseStudyInput = z.object({
+  project_name: z.string(),
+  project_url: z.string().optional(),
+  problem: z.string(),
+  solution: z.string(),
+  metrics: z.array(z.object({ label: z.string(), value: z.string() })).optional(),
+  screenshots: z.array(z.string()).optional(),
+  tech_stack: z.array(z.string()).optional(),
+  brand: z.enum(["bartoszgaca", "beecommerce", "neutral"]).optional(),
+  generate_cover: z.boolean().optional(),
+  generate_banner: z.boolean().optional(),
+  language: z.enum(["pl", "en"]).optional(),
+  save_path: z.string().optional(),
 });
 
 const GuidelinesInput = z.object({
@@ -415,26 +466,108 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     // Banner Generation
     {
       name: "linkedin_banner_generate",
-      description: "Generate a professional LinkedIn banner image (1200×627, 2x retina). Use presets for existing post designs, or custom params for new banners. 4 templates: hero (big stat + headline), split (bullets + icon), numbers (3 stats), vs (before/after). 8 gradient themes. All banners include CTA bar and personal branding. Optionally upload directly to LinkedIn.",
+      description: "Generate a professional LinkedIn banner image (1200×627, 2x retina). 6 templates: hero (stat + headline), split (bullets + icon), numbers (3 stats), vs (before/after), infographic (bar chart), quote (pull-quote). 8 gradient themes. Visual complexity for max dwell time. Optionally upload to LinkedIn.",
       inputSchema: {
         type: "object",
         properties: {
-          preset: { type: "string", description: "Built-in preset name (post5-post17). Use linkedin_banner_generate with no args to see available presets." },
-          template: { type: "string", enum: ["hero", "split", "numbers", "vs"], description: "Template type for custom banners" },
-          gradient: { type: "string", enum: ["ocean", "sunset", "purple", "emerald", "fire", "midnight", "teal", "rose"], description: "Color gradient theme" },
+          preset: { type: "string", description: "Built-in preset name (post5-post17)" },
+          template: { type: "string", enum: ["hero", "split", "numbers", "vs", "infographic", "quote"], description: "Template type" },
+          gradient: { type: "string", enum: ["ocean", "sunset", "purple", "emerald", "fire", "midnight", "teal", "rose"] },
           headline: { type: "string", description: "Main headline text (required for custom)" },
           subline: { type: "string", description: "Subtitle text (hero template)" },
           stat: { type: "string", description: "Big stat number (hero template)" },
           stat_label: { type: "string", description: "Label under the stat (hero template)" },
           bullets: { type: "array", items: { type: "string" }, description: "Bullet points (split template, max 5)" },
-          numbers: { type: "array", items: { type: "object", properties: { value: { type: "string" }, label: { type: "string" } }, required: ["value", "label"] }, description: "Number items (numbers template, typically 3)" },
-          before: { type: "object", properties: { title: { type: "string" }, items: { type: "array", items: { type: "string" } } }, description: "Before/left section (vs template)" },
-          after: { type: "object", properties: { title: { type: "string" }, items: { type: "array", items: { type: "string" } } }, description: "After/right section (vs template)" },
-          cta: { type: "string", description: "CTA text on bottom bar (default: 'Link in comments')" },
-          save_path: { type: "string", description: "Custom save path for the PNG" },
-          upload_to_linkedin: { type: "boolean", description: "Upload to LinkedIn after generating (default: false)" },
-          alt_text: { type: "string", description: "Accessibility description for LinkedIn" },
+          numbers: { type: "array", items: { type: "object", properties: { value: { type: "string" }, label: { type: "string" } }, required: ["value", "label"] }, description: "Number items (numbers template)" },
+          before: { type: "object", properties: { title: { type: "string" }, items: { type: "array", items: { type: "string" } } }, description: "Before section (vs template)" },
+          after: { type: "object", properties: { title: { type: "string" }, items: { type: "array", items: { type: "string" } } }, description: "After section (vs template)" },
+          data_points: { type: "array", items: { type: "object", properties: { label: { type: "string" }, value: { type: "number" }, max: { type: "number" } }, required: ["label", "value"] }, description: "Data points (infographic template)" },
+          quote: { type: "string", description: "Quote text (quote template)" },
+          quote_author: { type: "string", description: "Quote author (quote template)" },
+          cta: { type: "string", description: "CTA text on bottom bar" },
+          save_path: { type: "string" },
+          upload_to_linkedin: { type: "boolean" },
+          alt_text: { type: "string" },
         },
+      },
+    },
+    // Carousel Generation
+    {
+      name: "linkedin_carousel_generate",
+      description: "Generate a LinkedIn carousel (multi-slide PDF). Carousels get 303% more engagement than single images. Each slide uses the banner template system (1080×1080 square). Output: PDF file ready for upload as LinkedIn document.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          slides: {
+            type: "array",
+            description: "Array of slides, each using a template",
+            items: {
+              type: "object",
+              properties: {
+                template: { type: "string", enum: ["hero", "split", "numbers", "vs", "infographic", "quote"] },
+                gradient: { type: "string" },
+                headline: { type: "string" },
+                subline: { type: "string" },
+                stat: { type: "string" },
+                stat_label: { type: "string" },
+                bullets: { type: "array", items: { type: "string" } },
+                numbers: { type: "array", items: { type: "object", properties: { value: { type: "string" }, label: { type: "string" } } } },
+                before: { type: "object", properties: { title: { type: "string" }, items: { type: "array", items: { type: "string" } } } },
+                after: { type: "object", properties: { title: { type: "string" }, items: { type: "array", items: { type: "string" } } } },
+                data_points: { type: "array", items: { type: "object", properties: { label: { type: "string" }, value: { type: "number" } } } },
+                quote: { type: "string" },
+                quote_author: { type: "string" },
+                cta: { type: "string" },
+              },
+              required: ["template"],
+            },
+          },
+          gradient: { type: "string", description: "Default gradient for all slides" },
+          save_path: { type: "string" },
+          upload_to_linkedin: { type: "boolean" },
+        },
+        required: ["slides"],
+      },
+    },
+    // Screenshot Capture
+    {
+      name: "linkedin_screenshot_capture",
+      description: "Capture a screenshot of any web page. Useful for creating visual content from GitHub repos, dashboards, or project pages. Returns PNG image path. Can auto-upload to LinkedIn.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          url: { type: "string", description: "URL to screenshot" },
+          width: { type: "number", description: "Viewport width (default: 1280)" },
+          height: { type: "number", description: "Viewport height (default: 800)" },
+          selector: { type: "string", description: "CSS selector to capture specific element" },
+          full_page: { type: "boolean", description: "Capture full page (default: false)" },
+          save_path: { type: "string" },
+          upload_to_linkedin: { type: "boolean" },
+        },
+        required: ["url"],
+      },
+    },
+    // Case Study
+    {
+      name: "linkedin_casestudy_generate",
+      description: "Generate a professional case study PDF with branding, screenshots, metrics, and optional AI cover image. Outputs: branded PDF (A4), LinkedIn banner, and cover image. Perfect for showcasing projects on LinkedIn.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          project_name: { type: "string", description: "Name of the project" },
+          project_url: { type: "string", description: "GitHub/website URL (also used for screenshots)" },
+          problem: { type: "string", description: "What problem does it solve" },
+          solution: { type: "string", description: "How it solves the problem" },
+          metrics: { type: "array", items: { type: "object", properties: { label: { type: "string" }, value: { type: "string" } }, required: ["label", "value"] }, description: "Key results/metrics" },
+          screenshots: { type: "array", items: { type: "string" }, description: "URLs to screenshot for the PDF" },
+          tech_stack: { type: "array", items: { type: "string" }, description: "Technologies used" },
+          brand: { type: "string", enum: ["bartoszgaca", "beecommerce", "neutral"], description: "Brand profile (default: bartoszgaca)" },
+          generate_cover: { type: "boolean", description: "Generate AI cover image with Gemini (default: true)" },
+          generate_banner: { type: "boolean", description: "Generate LinkedIn banner (default: true)" },
+          language: { type: "string", enum: ["pl", "en"], description: "Language (default: en)" },
+          save_path: { type: "string", description: "Custom save path for PDF" },
+        },
+        required: ["project_name", "problem", "solution"],
       },
     },
     // Scheduling
@@ -728,12 +861,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const input = BannerGenerateInput.parse(args);
 
         // If no preset and no headline, list available options
-        if (!input.preset && !input.headline) {
+        if (!input.preset && !input.headline && !input.quote && !input.data_points) {
           return toolResult({
             presets: listPresets(),
-            templates: ["hero", "split", "numbers", "vs"],
+            templates: ["hero", "split", "numbers", "vs", "infographic", "quote"],
             gradients: Object.keys(GRADIENTS),
-            usage: "Provide a 'preset' name OR 'template' + 'headline' + other params for a custom banner.",
+            usage: "Provide a 'preset' name OR 'template' + params for a custom banner.",
           });
         }
 
@@ -749,6 +882,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           numbers: input.numbers,
           before: input.before,
           after: input.after,
+          data_points: input.data_points,
+          quote: input.quote,
+          quote_author: input.quote_author,
           cta: input.cta,
           save_path: input.save_path,
         });
@@ -767,6 +903,68 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           ...bannerResult,
           media_urn: mediaUrn,
         });
+      }
+
+      case "linkedin_carousel_generate": {
+        const input = CarouselGenerateInput.parse(args);
+        const carouselResult = await generateCarousel({
+          slides: input.slides,
+          gradient: input.gradient,
+          save_path: input.save_path,
+        });
+
+        let mediaUrn: string | undefined;
+        if (input.upload_to_linkedin) {
+          const uploadResult = await uploadMedia({
+            file_path: carouselResult.file_path,
+            media_type: "IMAGE",
+          });
+          mediaUrn = uploadResult.media_urn;
+        }
+
+        return toolResult({ ...carouselResult, media_urn: mediaUrn });
+      }
+
+      case "linkedin_screenshot_capture": {
+        const input = ScreenshotInput.parse(args);
+        const screenshotResult = await captureScreenshot({
+          url: input.url,
+          width: input.width,
+          height: input.height,
+          selector: input.selector,
+          full_page: input.full_page,
+          save_path: input.save_path,
+        });
+
+        let mediaUrn: string | undefined;
+        if (input.upload_to_linkedin) {
+          const uploadResult = await uploadMedia({
+            file_path: screenshotResult.file_path,
+            media_type: "IMAGE",
+          });
+          mediaUrn = uploadResult.media_urn;
+        }
+
+        return toolResult({ ...screenshotResult, media_urn: mediaUrn });
+      }
+
+      case "linkedin_casestudy_generate": {
+        const input = CaseStudyInput.parse(args);
+        const csResult = await generateCaseStudy({
+          project_name: input.project_name,
+          project_url: input.project_url,
+          problem: input.problem,
+          solution: input.solution,
+          metrics: input.metrics,
+          screenshots: input.screenshots,
+          tech_stack: input.tech_stack,
+          brand: input.brand,
+          generate_cover: input.generate_cover,
+          generate_banner: input.generate_banner,
+          language: input.language,
+          save_path: input.save_path,
+        });
+        return toolResult(csResult);
       }
 
       // ── Scheduling ────────────────────────────────────────────────────
