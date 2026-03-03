@@ -1,327 +1,302 @@
 #!/usr/bin/env node
 /**
- * LinkedIn Post Banner Generator
- *
- * Generates 1200x627 PNG banners for LinkedIn posts using Puppeteer.
+ * LinkedIn Post Banner Generator v2
+ * Professional, scroll-stopping banners with CTA, bold colors, mobile-friendly.
  *
  * Usage:
- *   node scripts/generate-banner.mjs --title "Title" --subtitle "Subtitle" --out banner.png
- *   node scripts/generate-banner.mjs --preset post5 --out post5.png
- *   node scripts/generate-banner.mjs --preset all --outdir /Users/gaca/output/personal/linkedin-mcp/
+ *   node scripts/generate-banner.mjs --preset all
+ *   node scripts/generate-banner.mjs --preset post5
  */
 
 import puppeteer from 'puppeteer';
-import { writeFileSync, mkdirSync } from 'node:fs';
+import { mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { parseArgs } from 'node:util';
 
-const WIDTH = 1200;
-const HEIGHT = 627;
+const W = 1200;
+const H = 627;
+const OUT_DIR = '/Users/gaca/output/personal/linkedin-mcp';
+const BRAND = 'Bartosz Gaca';
 
-// ── Preset banners for each post ──────────────────────────────────────────────
+function esc(s) { return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
 
-const PRESETS = {
-  post5: {
-    style: 'terminal',
-    title: 'This Post Published Itself',
-    lines: [
-      { text: '$ node auto-publish.mjs', color: '#4EC9B0' },
-      { text: 'LinkedIn Auto-Publisher started', color: '#6A9955' },
-      { text: 'Checking every 60 seconds...', color: '#6A9955' },
-      { text: '', color: '' },
-      { text: '[2026-03-10T08:30:02Z] Checking...', color: '#DCDCAA' },
-      { text: 'Publishing scheduled post 7...', color: '#569CD6' },
-      { text: 'Published: urn:li:share:743XXXXXXXXX', color: '#4EC9B0' },
-      { text: 'Comment queued for 09:45 CET', color: '#CE9178' },
-      { text: '', color: '' },
-      { text: '[2026-03-10T08:45:01Z] Adding comment...', color: '#DCDCAA' },
-      { text: 'Comment added: GitHub link ✓', color: '#4EC9B0' },
-    ],
-  },
+// ── Design System ────────────────────────────────────────────────────────────
 
-  post7: {
-    style: 'grid',
-    title: '12 LinkedIn Post Templates',
-    subtitle: 'Built into linkedin-mcp-server',
-    items: [
-      '📝 Thought Leadership', '📝 Thought Leadership PL',
-      '📊 Case Study', '🎬 Behind the Scenes',
-      '🎯 Engagement Hook', '🔥 Viral Trend',
-      '❓ Community Question', '🧲 Lead Magnet',
-      '📚 Carousel Edu', '📖 Carousel Text',
-      '💡 Lesson Learned', '📢 Announcement',
-    ],
-  },
-
-  post9: {
-    style: 'diagram',
-    title: 'MCP — Model Context Protocol',
-    boxes: [
-      { label: 'Claude Code', x: 50, icon: '🤖' },
-      { label: 'MCP Server', x: 420, icon: '⚡' },
-      { label: 'LinkedIn API', x: 790, icon: '💼' },
-    ],
-    arrows: ['→ JSON-RPC →', '→ REST API →'],
-  },
-
-  post10: {
-    style: 'checklist',
-    title: 'LinkedIn Algorithm Checklist',
-    subtitle: 'Coded into linkedin-mcp-server',
-    checks: [
-      { text: 'Hook in first 210 chars', ok: true },
-      { text: 'Post length 1300-1600 chars', ok: true },
-      { text: 'Max 3 hashtags at end', ok: true },
-      { text: 'Link in comment, not body', ok: true },
-      { text: 'CTA as last line', ok: true },
-      { text: 'Post Tue-Thu 8:00/9:30/17:00', ok: true },
-      { text: 'Min 12h gap between posts', ok: true },
-      { text: 'Comment with link after 15 min', ok: true },
-    ],
-  },
-
-  post11: {
-    style: 'stack',
-    title: 'Solo Founder AI Stack',
-    layers: [
-      { label: 'Claude Code', desc: 'AI Assistant', color: '#D97706' },
-      { label: 'LinkedIn MCP', desc: '25 Tools', color: '#0077B5' },
-      { label: 'Facebook MCP', desc: 'Auto-Posts + Groups', color: '#1877F2' },
-      { label: 'Auto-Publish', desc: 'Background Daemon', color: '#059669' },
-    ],
-  },
-
-  // ── New posts about other projects ────────────────────────────────────────
-
-  post13: {
-    style: 'grid',
-    title: 'SEOleo MCP — 33 SEO Tools',
-    subtitle: 'Technical SEO + GEO + AI Search Optimization',
-    items: [
-      '🔍 Technical Audit', '📝 Content Analysis',
-      '🔗 Link Graph (BFS)', '🔒 SSL/TLS Audit',
-      '♿ WCAG 2.2 AA', '🌐 Hreflang Check',
-      '🤖 AI Robots.txt', '📊 Core Web Vitals',
-      '📋 Schema Validation', '🏢 Local SEO',
-      '🧠 GEO Princeton 9', '📄 PDF Reports',
-    ],
-  },
-
-  post14: {
-    style: 'stack',
-    title: 'G.A.C.A. — AI Bus',
-    layers: [
-      { label: 'Your App', desc: 'Any OpenAI Client', color: '#7C3AED' },
-      { label: 'G.A.C.A. Proxy', desc: 'Smart Routing', color: '#D97706' },
-      { label: '11 AI Providers', desc: '69+ Free Models', color: '#059669' },
-      { label: 'Auto-Failover', desc: '30 Fallback Attempts', color: '#DC2626' },
-    ],
-  },
-
-  post15: {
-    style: 'terminal',
-    title: 'linkedin-mcp-server — Auto-Post + Auto-Comment',
-    lines: [
-      { text: '$ node auto-publish.mjs', color: '#4EC9B0' },
-      { text: 'LinkedIn Auto-Publisher v2 started', color: '#6A9955' },
-      { text: 'Features: image upload, per-post comments, retry logic', color: '#6A9955' },
-      { text: '', color: '' },
-      { text: '[09:30:01] Publishing post 13...', color: '#DCDCAA' },
-      { text: '  Uploading image: post13-banner.png', color: '#569CD6' },
-      { text: '  Image uploaded: urn:li:image:xxxxx', color: '#4EC9B0' },
-      { text: '  Published: urn:li:share:xxxxx', color: '#4EC9B0' },
-      { text: '  Comment queued for 15 min later', color: '#CE9178' },
-      { text: '[09:45:01] Adding GitHub link comment...', color: '#DCDCAA' },
-      { text: '  Comment added ✓', color: '#4EC9B0' },
-    ],
-  },
-
-  post16: {
-    style: 'checklist',
-    title: 'Presidio Browser Anonymizer v2.0',
-    subtitle: '100% Offline PII Protection',
-    checks: [
-      { text: '28 PII entity types (PESEL, NIP, REGON...)', ok: true },
-      { text: 'Auto-paste anonymization (Ctrl+V)', ok: true },
-      { text: 'Works with ChatGPT, Claude, Perplexity', ok: true },
-      { text: '100% offline — localhost only', ok: true },
-      { text: 'Chrome Extension (Manifest V3)', ok: true },
-      { text: 'Docker + multi-language support', ok: true },
-      { text: 'Deanonymization mapping (NEW)', ok: true },
-      { text: 'Plugin system for custom recognizers', ok: true },
-    ],
-  },
-
-  post17: {
-    style: 'grid',
-    title: 'Facebook MCP Server',
-    subtitle: 'Full Facebook Page Automation',
-    items: [
-      '📝 Create Posts', '💬 Comments',
-      '📊 Post Insights', '👍 Reactions',
-      '📈 Impressions', '🎯 Engagement',
-      '🖼️ Image Posts', '📅 Schedule',
-      '🔍 Analytics', '👥 Fan Count',
-      '🛡️ Moderation', '📨 DMs',
-    ],
-  },
+const GRADIENTS = {
+  ocean:    'linear-gradient(135deg, #0077B5 0%, #00A0DC 50%, #0E76A8 100%)',
+  sunset:   'linear-gradient(135deg, #FF6B35 0%, #F7C948 100%)',
+  purple:   'linear-gradient(135deg, #5B21B6 0%, #7C3AED 40%, #A78BFA 100%)',
+  emerald:  'linear-gradient(135deg, #059669 0%, #10B981 50%, #34D399 100%)',
+  fire:     'linear-gradient(135deg, #DC2626 0%, #F97316 100%)',
+  midnight: 'linear-gradient(135deg, #1E1B4B 0%, #312E81 50%, #4338CA 100%)',
+  teal:     'linear-gradient(135deg, #0D9488 0%, #14B8A6 100%)',
+  rose:     'linear-gradient(135deg, #BE185D 0%, #EC4899 100%)',
 };
 
-// ── HTML Templates ────────────────────────────────────────────────────────────
+function baseStyle(gradient) {
+  return `margin:0;padding:0;width:${W}px;height:${H}px;background:${gradient};display:flex;flex-direction:column;justify-content:center;align-items:center;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;position:relative;overflow:hidden`;
+}
 
-function terminalHTML({ title, lines }) {
-  const lineRows = lines.map(l =>
-    l.text ? `<div style="color:${l.color};font-family:'SF Mono','Fira Code',monospace;font-size:18px;line-height:1.6">${escHtml(l.text)}</div>` : '<div style="height:12px"></div>'
-  ).join('');
-  return `<!DOCTYPE html><html><body style="margin:0;padding:0;width:${WIDTH}px;height:${HEIGHT}px;background:#1E1E1E;display:flex;flex-direction:column">
-    <div style="background:#323233;padding:10px 20px;display:flex;align-items:center;gap:8px">
-      <div style="width:12px;height:12px;border-radius:50%;background:#FF5F56"></div>
-      <div style="width:12px;height:12px;border-radius:50%;background:#FFBD2E"></div>
-      <div style="width:12px;height:12px;border-radius:50%;background:#27C93F"></div>
-      <span style="color:#999;font-family:sans-serif;font-size:14px;margin-left:12px">auto-publish.mjs — linkedin-mcp-server</span>
+function ctaBar(text = 'Link in comments') {
+  return `<div style="position:absolute;bottom:0;left:0;right:0;padding:14px 40px;background:rgba(0,0,0,0.35);display:flex;justify-content:space-between;align-items:center">
+    <span style="color:rgba(255,255,255,0.9);font-size:15px;font-weight:600">${esc(BRAND)}</span>
+    <span style="color:#fff;font-size:15px;font-weight:700;display:flex;align-items:center;gap:6px">${esc(text)} <span style="font-size:20px">↓</span></span>
+  </div>`;
+}
+
+function decorCircles() {
+  return `<div style="position:absolute;top:-80px;right:-80px;width:300px;height:300px;border-radius:50%;background:rgba(255,255,255,0.06)"></div>
+  <div style="position:absolute;bottom:-120px;left:-60px;width:350px;height:350px;border-radius:50%;background:rgba(255,255,255,0.04)"></div>`;
+}
+
+// ── Templates ────────────────────────────────────────────────────────────────
+
+function heroHTML({ gradient, headline, subline, stat, statLabel, cta }) {
+  return `<!DOCTYPE html><html><body style="${baseStyle(gradient)}">
+    ${decorCircles()}
+    ${stat ? `<div style="font-size:80px;font-weight:900;color:#fff;letter-spacing:-2px;margin-bottom:4px;text-shadow:0 4px 20px rgba(0,0,0,0.3)">${esc(stat)}</div>` : ''}
+    ${statLabel ? `<div style="font-size:18px;color:rgba(255,255,255,0.8);font-weight:500;margin-bottom:20px;text-transform:uppercase;letter-spacing:3px">${esc(statLabel)}</div>` : ''}
+    <div style="font-size:46px;font-weight:800;color:#fff;text-align:center;max-width:900px;line-height:1.2;text-shadow:0 2px 12px rgba(0,0,0,0.2);padding:0 40px">${esc(headline)}</div>
+    ${subline ? `<div style="font-size:22px;color:rgba(255,255,255,0.85);margin-top:16px;font-weight:500;text-align:center;max-width:800px;padding:0 40px">${esc(subline)}</div>` : ''}
+    ${ctaBar(cta || 'Link in comments')}
+  </body></html>`;
+}
+
+function splitHTML({ gradient, headline, bullets, cta }) {
+  const left = `<div style="flex:1;padding:50px;display:flex;flex-direction:column;justify-content:center">
+    <div style="font-size:40px;font-weight:800;color:#fff;line-height:1.15;margin-bottom:24px;text-shadow:0 2px 8px rgba(0,0,0,0.15)">${esc(headline)}</div>
+    ${bullets.map(b => `<div style="display:flex;align-items:center;gap:12px;margin-bottom:10px">
+      <span style="width:28px;height:28px;border-radius:50%;background:rgba(255,255,255,0.2);display:flex;align-items:center;justify-content:center;font-size:14px;color:#fff;flex-shrink:0">✓</span>
+      <span style="color:rgba(255,255,255,0.92);font-size:18px;font-weight:500">${esc(b)}</span>
+    </div>`).join('')}
+  </div>`;
+  const right = `<div style="flex:0.7;display:flex;align-items:center;justify-content:center">
+    <div style="width:280px;height:280px;border-radius:24px;background:rgba(255,255,255,0.12);backdrop-filter:blur(10px);display:flex;align-items:center;justify-content:center;font-size:120px;text-shadow:0 4px 20px rgba(0,0,0,0.2)">🚀</div>
+  </div>`;
+  return `<!DOCTYPE html><html><body style="${baseStyle(gradient)};flex-direction:row">
+    ${decorCircles()}${left}${right}${ctaBar(cta || 'Link in comments')}
+  </body></html>`;
+}
+
+function numbersHTML({ gradient, numbers, headline, cta }) {
+  const numEls = numbers.map(n => `<div style="text-align:center">
+    <div style="font-size:52px;font-weight:900;color:#fff">${esc(n.value)}</div>
+    <div style="font-size:14px;color:rgba(255,255,255,0.7);text-transform:uppercase;letter-spacing:2px;margin-top:4px">${esc(n.label)}</div>
+  </div>`).join('');
+  return `<!DOCTYPE html><html><body style="${baseStyle(gradient)}">
+    ${decorCircles()}
+    <div style="font-size:42px;font-weight:800;color:#fff;text-align:center;max-width:900px;line-height:1.15;margin-bottom:36px;padding:0 40px;text-shadow:0 2px 12px rgba(0,0,0,0.2)">${esc(headline)}</div>
+    <div style="display:flex;gap:60px;align-items:center">${numEls}</div>
+    ${ctaBar(cta || 'Link in comments')}
+  </body></html>`;
+}
+
+function vsHTML({ gradient, before, after, headline, cta }) {
+  const box = (title, items, opacity) => `<div style="background:rgba(255,255,255,${opacity});border-radius:16px;padding:28px;width:400px">
+    <div style="font-size:22px;font-weight:800;color:#fff;margin-bottom:16px">${esc(title)}</div>
+    ${items.map(i => `<div style="color:rgba(255,255,255,0.85);font-size:16px;margin-bottom:8px;display:flex;align-items:center;gap:8px">${esc(i)}</div>`).join('')}
+  </div>`;
+  return `<!DOCTYPE html><html><body style="${baseStyle(gradient)}">
+    ${decorCircles()}
+    <div style="font-size:38px;font-weight:800;color:#fff;margin-bottom:28px;text-shadow:0 2px 8px rgba(0,0,0,0.2)">${esc(headline)}</div>
+    <div style="display:flex;gap:24px;align-items:stretch">
+      ${box(before.title, before.items, '0.08')}
+      <div style="display:flex;align-items:center;font-size:36px;color:rgba(255,255,255,0.6);font-weight:900">→</div>
+      ${box(after.title, after.items, '0.15')}
     </div>
-    <div style="flex:1;padding:24px 30px;overflow:hidden">${lineRows}</div>
-    <div style="padding:12px 30px;background:#252526;color:#0077B5;font-family:sans-serif;font-size:16px;font-weight:bold">${escHtml(title)} — github.com/gacabartosz/linkedin-mcp-server</div>
+    ${ctaBar(cta || 'Link in comments')}
   </body></html>`;
 }
 
-function gridHTML({ title, subtitle, items }) {
-  const cards = items.map(item =>
-    `<div style="background:#252526;border:1px solid #3E3E42;border-radius:10px;padding:16px 14px;text-align:center;font-size:15px;color:#E0E0E0;font-family:sans-serif">${escHtml(item)}</div>`
-  ).join('');
-  return `<!DOCTYPE html><html><body style="margin:0;padding:0;width:${WIDTH}px;height:${HEIGHT}px;background:#1A1A2E;display:flex;flex-direction:column;align-items:center;justify-content:center">
-    <h1 style="color:#fff;font-family:sans-serif;font-size:36px;margin:0 0 6px">${escHtml(title)}</h1>
-    <p style="color:#0077B5;font-family:sans-serif;font-size:18px;margin:0 0 28px">${escHtml(subtitle)}</p>
-    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;width:90%">${cards}</div>
-    <p style="color:#666;font-family:sans-serif;font-size:14px;margin-top:20px">github.com/gacabartosz/linkedin-mcp-server</p>
-  </body></html>`;
-}
+// ── Presets ───────────────────────────────────────────────────────────────────
 
-function diagramHTML({ title, boxes, arrows }) {
-  const boxEls = boxes.map(b =>
-    `<div style="position:absolute;left:${b.x}px;top:220px;width:280px;height:140px;background:#252526;border:2px solid #0077B5;border-radius:16px;display:flex;flex-direction:column;align-items:center;justify-content:center">
-      <span style="font-size:48px">${b.icon}</span>
-      <span style="color:#fff;font-family:sans-serif;font-size:22px;font-weight:bold;margin-top:8px">${escHtml(b.label)}</span>
-    </div>`
-  ).join('');
-  const arrowEls = arrows.map((a, i) =>
-    `<div style="position:absolute;left:${330 + i * 370}px;top:272px;color:#0077B5;font-family:sans-serif;font-size:16px;font-weight:bold;width:90px;text-align:center">${escHtml(a)}</div>`
-  ).join('');
-  return `<!DOCTYPE html><html><body style="margin:0;padding:0;width:${WIDTH}px;height:${HEIGHT}px;background:#1A1A2E;position:relative">
-    <h1 style="color:#fff;font-family:sans-serif;font-size:38px;text-align:center;padding-top:40px;margin:0">${escHtml(title)}</h1>
-    <p style="color:#0077B5;font-family:sans-serif;font-size:18px;text-align:center;margin:8px 0">How AI tools connect to real APIs</p>
-    ${boxEls}${arrowEls}
-    <p style="position:absolute;bottom:16px;width:100%;text-align:center;color:#666;font-family:sans-serif;font-size:14px;margin:0">github.com/gacabartosz/linkedin-mcp-server</p>
-  </body></html>`;
-}
+const PRESETS = {
+  post5: () => heroHTML({
+    gradient: GRADIENTS.midnight,
+    stat: '0',
+    statLabel: 'manual steps to publish',
+    headline: 'This Post Published Itself',
+    subline: 'Written Sunday → Auto-published Tuesday 9:30 → GitHub link added 15 min later',
+    cta: 'See how it works ↓',
+  }),
 
-function checklistHTML({ title, subtitle, checks }) {
-  const rows = checks.map(c =>
-    `<div style="display:flex;align-items:center;gap:14px;padding:10px 0;border-bottom:1px solid #2A2A3E">
-      <span style="font-size:24px">${c.ok ? '✅' : '❌'}</span>
-      <span style="color:#E0E0E0;font-family:sans-serif;font-size:19px">${escHtml(c.text)}</span>
-    </div>`
-  ).join('');
-  return `<!DOCTYPE html><html><body style="margin:0;padding:0;width:${WIDTH}px;height:${HEIGHT}px;background:#1A1A2E;display:flex;flex-direction:column;align-items:center;padding-top:30px">
-    <h1 style="color:#fff;font-family:sans-serif;font-size:34px;margin:0">${escHtml(title)}</h1>
-    <p style="color:#0077B5;font-family:sans-serif;font-size:17px;margin:4px 0 20px">${escHtml(subtitle)}</p>
-    <div style="width:75%">${rows}</div>
-    <p style="color:#666;font-family:sans-serif;font-size:14px;margin-top:auto;margin-bottom:16px">github.com/gacabartosz/linkedin-mcp-server</p>
-  </body></html>`;
-}
+  post6: () => numbersHTML({
+    gradient: GRADIENTS.ocean,
+    headline: 'Jedyny Open-Source LinkedIn MCP',
+    numbers: [
+      { value: '25', label: 'narzedzi MCP' },
+      { value: '12', label: 'szablonow' },
+      { value: '0', label: 'oplat' },
+    ],
+    cta: 'Kod zrodlowy w komentarzu ↓',
+  }),
 
-function stackHTML({ title, layers }) {
-  const layerEls = layers.map(l =>
-    `<div style="background:${l.color};border-radius:12px;padding:18px 32px;display:flex;justify-content:space-between;align-items:center;width:80%">
-      <span style="color:#fff;font-family:sans-serif;font-size:24px;font-weight:bold">${escHtml(l.label)}</span>
-      <span style="color:rgba(255,255,255,0.8);font-family:sans-serif;font-size:17px">${escHtml(l.desc)}</span>
-    </div>`
-  ).join('');
-  return `<!DOCTYPE html><html><body style="margin:0;padding:0;width:${WIDTH}px;height:${HEIGHT}px;background:#1A1A2E;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px">
-    <h1 style="color:#fff;font-family:sans-serif;font-size:36px;margin:0 0 16px">${escHtml(title)}</h1>
-    ${layerEls}
-    <p style="color:#666;font-family:sans-serif;font-size:14px;margin-top:12px">github.com/gacabartosz/linkedin-mcp-server</p>
-  </body></html>`;
-}
+  post7: () => splitHTML({
+    gradient: GRADIENTS.purple,
+    headline: '12 Templates That Write LinkedIn Posts For You',
+    bullets: [
+      'Hook optimized for 210-char cutoff',
+      'Algorithm rules built-in',
+      'Link in comment, never in body',
+      'Max 3 hashtags, CTA as last line',
+      'Auto-scheduled + auto-published',
+    ],
+    cta: 'Get all 12 templates free ↓',
+  }),
 
-function genericHTML({ title, subtitle, style }) {
-  const bg = style === 'light' ? '#FFFFFF' : '#1A1A2E';
-  const fg = style === 'light' ? '#1A1A2E' : '#FFFFFF';
-  return `<!DOCTYPE html><html><body style="margin:0;padding:0;width:${WIDTH}px;height:${HEIGHT}px;background:${bg};display:flex;flex-direction:column;align-items:center;justify-content:center">
-    <h1 style="color:${fg};font-family:sans-serif;font-size:42px;text-align:center;margin:0;padding:0 60px">${escHtml(title)}</h1>
-    ${subtitle ? `<p style="color:#0077B5;font-family:sans-serif;font-size:22px;margin:16px 0">${escHtml(subtitle)}</p>` : ''}
-    <p style="color:#666;font-family:sans-serif;font-size:16px;margin-top:32px">github.com/gacabartosz/linkedin-mcp-server</p>
-  </body></html>`;
-}
+  post8: () => numbersHTML({
+    gradient: GRADIENTS.fire,
+    headline: 'From Zero to 25 LinkedIn Tools',
+    numbers: [
+      { value: '48h', label: 'build time' },
+      { value: '25', label: 'MCP tools' },
+      { value: '1', label: 'developer + AI' },
+    ],
+    cta: 'Full git history in comments ↓',
+  }),
 
-function escHtml(s) {
-  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-}
+  post9: () => vsHTML({
+    gradient: GRADIENTS.teal,
+    headline: 'MCP zmienia wszystko',
+    before: {
+      title: '❌ Przed MCP',
+      items: ['→ AI pisze tekst', '→ Ty sam wklejasz', '→ Ty sam publikujesz', '→ Ty sam dodajesz link'],
+    },
+    after: {
+      title: '✅ Z MCP',
+      items: ['→ "Zaplanuj post na czwartek"', '→ Gotowe. Opublikowany.', '→ Z grafika i komentarzem.', '→ Zero recznej pracy.'],
+    },
+    cta: 'Kod zrodlowy w komentarzu ↓',
+  }),
+
+  post10: () => splitHTML({
+    gradient: GRADIENTS.ocean,
+    headline: 'LinkedIn Algorithm Rules I Coded Into a Tool',
+    bullets: [
+      'Hook in first 210 characters',
+      '1300-1600 chars sweet spot',
+      'Link in comment after 15 min',
+      'Post Tue-Thu at 8:00 / 9:30 / 17:00',
+      'Max 3 hashtags at the end',
+    ],
+    cta: 'Open source — link in comments ↓',
+  }),
+
+  post11: () => numbersHTML({
+    gradient: GRADIENTS.emerald,
+    headline: 'My Entire Content Stack\nas a Solo Founder',
+    numbers: [
+      { value: '2h', label: 'per week' },
+      { value: '4', label: 'posts auto-published' },
+      { value: '0', label: 'manual work' },
+    ],
+    cta: 'Full stack is open source ↓',
+  }),
+
+  post12: () => numbersHTML({
+    gradient: GRADIENTS.sunset,
+    headline: '3 Weeks of MCP-Powered LinkedIn',
+    numbers: [
+      { value: '12', label: 'posts published' },
+      { value: '100%', label: 'automated' },
+      { value: '6h', label: 'total time spent' },
+    ],
+    cta: 'Real numbers in comments ↓',
+  }),
+
+  post13: () => heroHTML({
+    gradient: GRADIENTS.purple,
+    stat: '33',
+    statLabel: 'SEO audit tools in one MCP',
+    headline: 'Run a Full SEO Audit From a Single AI Conversation',
+    subline: 'Technical SEO + Core Web Vitals + Schema + GEO — all open source',
+    cta: 'GitHub link in comments ↓',
+  }),
+
+  post14: () => heroHTML({
+    gradient: GRADIENTS.midnight,
+    stat: '69+',
+    statLabel: 'free AI models, one API',
+    headline: 'G.A.C.A. — Drop-In OpenAI Replacement',
+    subline: '11 providers, auto-failover, smart routing. Your app doesn\'t change a line of code.',
+    cta: 'Open source — link in comments ↓',
+  }),
+
+  post15: () => vsHTML({
+    gradient: GRADIENTS.emerald,
+    headline: 'The Full Auto-Publish Pipeline',
+    before: {
+      title: '🕐 Sunday',
+      items: ['→ Write 4 posts with Claude', '→ Review + approve', '→ Schedule via MCP', '→ Done. Close laptop.'],
+    },
+    after: {
+      title: '🤖 Mon-Fri (auto)',
+      items: ['→ Daemon checks every 60s', '→ Publish at optimal time', '→ Upload image automatically', '→ Add GitHub link after 15min'],
+    },
+    cta: 'This post was automated too ↓',
+  }),
+
+  post16: () => heroHTML({
+    gradient: GRADIENTS.rose,
+    stat: '28',
+    statLabel: 'typow danych PII do anonimizacji',
+    headline: 'Przestań wklejać dane klientów do ChatGPT',
+    subline: 'Presidio Browser Anonymizer — 100% offline, Chrome Extension, Docker',
+    cta: 'Link w komentarzu ↓',
+  }),
+
+  post17: () => numbersHTML({
+    gradient: GRADIENTS.ocean,
+    headline: 'My Open Source MCP Ecosystem',
+    numbers: [
+      { value: '25', label: 'LinkedIn tools' },
+      { value: '28', label: 'Facebook tools' },
+      { value: '33', label: 'SEO tools' },
+    ],
+    cta: 'All repos in comments ↓',
+  }),
+};
 
 // ── Render ────────────────────────────────────────────────────────────────────
-
-function buildHTML(preset) {
-  switch (preset.style) {
-    case 'terminal': return terminalHTML(preset);
-    case 'grid': return gridHTML(preset);
-    case 'diagram': return diagramHTML(preset);
-    case 'checklist': return checklistHTML(preset);
-    case 'stack': return stackHTML(preset);
-    default: return genericHTML(preset);
-  }
-}
 
 async function renderPNG(html, outPath) {
   const browser = await puppeteer.launch({ headless: true });
   const page = await browser.newPage();
-  await page.setViewport({ width: WIDTH, height: HEIGHT });
+  await page.setViewport({ width: W, height: H, deviceScaleFactor: 2 });
   await page.setContent(html, { waitUntil: 'networkidle0' });
   mkdirSync(dirname(outPath), { recursive: true });
   await page.screenshot({ path: outPath, type: 'png' });
   await browser.close();
-  console.log(`Generated: ${outPath}`);
+  console.log('Generated: ' + outPath);
 }
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
 const { values } = parseArgs({
   options: {
-    title: { type: 'string' },
-    subtitle: { type: 'string', default: '' },
-    style: { type: 'string', default: 'dark' },
     preset: { type: 'string' },
     out: { type: 'string' },
-    outdir: { type: 'string', default: '/Users/gaca/output/personal/linkedin-mcp' },
+    outdir: { type: 'string', default: OUT_DIR },
   },
 });
 
 async function main() {
   if (values.preset === 'all') {
-    for (const [name, preset] of Object.entries(PRESETS)) {
-      const html = buildHTML(preset);
-      await renderPNG(html, join(values.outdir, `${name}-banner.png`));
+    for (const [name, fn] of Object.entries(PRESETS)) {
+      await renderPNG(fn(), join(values.outdir, name + '-banner.png'));
     }
+    console.log('\nAll ' + Object.keys(PRESETS).length + ' banners generated!');
     return;
   }
 
   if (values.preset && PRESETS[values.preset]) {
-    const html = buildHTML(PRESETS[values.preset]);
-    const out = values.out || join(values.outdir, `${values.preset}-banner.png`);
-    await renderPNG(html, out);
+    const out = values.out || join(values.outdir, values.preset + '-banner.png');
+    await renderPNG(PRESETS[values.preset](), out);
     return;
   }
 
-  if (values.title) {
-    const html = genericHTML({ title: values.title, subtitle: values.subtitle, style: values.style });
-    const out = values.out || join(values.outdir, 'custom-banner.png');
-    await renderPNG(html, out);
-    return;
-  }
-
-  console.log('Usage:');
-  console.log('  --preset post5|post7|post9|post10|post11|all');
-  console.log('  --title "Title" [--subtitle "Sub"] [--style dark|light]');
-  console.log('  --out output.png');
+  console.log('Available presets: ' + Object.keys(PRESETS).join(', '));
+  console.log('Usage: --preset post5|all [--outdir path]');
 }
 
 main().catch(console.error);

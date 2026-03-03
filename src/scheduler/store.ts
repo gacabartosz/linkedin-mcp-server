@@ -17,6 +17,8 @@ export interface ScheduledPost {
   template_vars: string | null;
   gemini_prompt: string | null;
   gemini_aspect_ratio: string | null;
+  banner_preset: string | null;
+  banner_config: string | null;
   publish_at: string;
   status: "scheduled" | "publishing" | "published" | "failed" | "cancelled";
   post_urn: string | null;
@@ -58,6 +60,10 @@ export function getDb(): Database.Database {
     )
   `);
 
+  // Migrate: add banner columns if missing
+  try { db.exec("ALTER TABLE scheduled_posts ADD COLUMN banner_preset TEXT"); } catch { /* exists */ }
+  try { db.exec("ALTER TABLE scheduled_posts ADD COLUMN banner_config TEXT"); } catch { /* exists */ }
+
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_scheduled_status_time
     ON scheduled_posts(status, publish_at)
@@ -79,14 +85,17 @@ export function createSchedule(data: {
   template_vars?: Record<string, string>;
   gemini_prompt?: string;
   gemini_aspect_ratio?: string;
+  banner_preset?: string;
+  banner_config?: string;
 }): ScheduledPost {
   const db = getDb();
   const id = randomUUID();
 
   const stmt = db.prepare(`
     INSERT INTO scheduled_posts (id, text, visibility, media_ids, article_url, article_title,
-      article_description, template_id, template_vars, gemini_prompt, gemini_aspect_ratio, publish_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      article_description, template_id, template_vars, gemini_prompt, gemini_aspect_ratio,
+      banner_preset, banner_config, publish_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
 
   stmt.run(
@@ -101,6 +110,8 @@ export function createSchedule(data: {
     data.template_vars ? JSON.stringify(data.template_vars) : null,
     data.gemini_prompt || null,
     data.gemini_aspect_ratio || null,
+    data.banner_preset || null,
+    data.banner_config || null,
     data.publish_at,
   );
 

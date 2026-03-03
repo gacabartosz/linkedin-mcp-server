@@ -1,6 +1,7 @@
 import { type ScheduledPost, updateScheduleStatus } from "./store.js";
 import { createPost } from "../api/posts.js";
 import { generateImage } from "../gemini/client.js";
+import { generateBanner } from "../banner/index.js";
 import { uploadMedia } from "../api/media.js";
 import { applyTemplate } from "../content/templates.js";
 import { log } from "../utils/logger.js";
@@ -19,8 +20,29 @@ export async function publishScheduledPost(post: ScheduledPost): Promise<void> {
       if (templateText) text = templateText;
     }
 
-    // Generate Gemini image if specified
-    if (post.gemini_prompt) {
+    // Generate banner if specified (takes priority over Gemini)
+    if (post.banner_preset || post.banner_config) {
+      try {
+        const bannerCfg = post.banner_config ? JSON.parse(post.banner_config) : {};
+        const bannerResult = await generateBanner({
+          preset: post.banner_preset || undefined,
+          ...bannerCfg,
+        });
+
+        const uploadResult = await uploadMedia({
+          file_path: bannerResult.file_path,
+          media_type: "IMAGE",
+        });
+
+        mediaIds.push(uploadResult.media_urn);
+        log("info", `Banner generated for schedule ${post.id}: ${bannerResult.file_path}`);
+      } catch (err) {
+        log("warn", `Banner generation failed for schedule ${post.id}`, err);
+        // Continue without banner
+      }
+    }
+    // Generate Gemini image if specified (and no banner)
+    else if (post.gemini_prompt) {
       try {
         const imageResult = await generateImage({
           prompt: post.gemini_prompt,

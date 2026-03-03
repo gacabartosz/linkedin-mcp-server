@@ -15,13 +15,15 @@ echo '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' | node dist/in
 
 ## Architecture
 
-- `src/index.ts` — MCP server entry point, all 25 tool handlers (single switch statement)
+- `src/index.ts` — MCP server entry point, all 26 tool handlers (single switch statement)
 - `src/api/` — LinkedIn REST API modules (client, auth, posts, comments, media, profile, reactions)
 - `src/scheduler/` — SQLite-based post scheduler (store, daemon, publisher)
 - `src/content/` — Content templates (12 built-in + custom), brand voice config, and guidelines loader
 - `src/gemini/` — Google Gemini Imagen 4 image generation
+- `src/banner/` — Professional LinkedIn banner generator (HTML→PNG via Puppeteer, 4 templates, 8 gradients)
 - `src/utils/` — Config, logger, errors (toolResult/toolError helpers)
 - `guidelines/` — LinkedIn algorithm strategy data (`linkedin-strategy.json`)
+- `scripts/generate-banner.mjs` — Standalone banner generator CLI (same design system as MCP tool)
 
 ## Code Conventions
 
@@ -42,15 +44,28 @@ echo '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' | node dist/in
 4. Parse input with `Schema.parse(args)`, call API function, return `toolResult()`
 5. Wrap in try/catch — errors caught by the outer handler
 
-## Tools (25 total)
+## Tools (26 total)
 
 **Auth & Profile:** linkedin_auth_start, linkedin_auth_status, linkedin_profile_me
 **Posts:** linkedin_post_create, linkedin_post_update, linkedin_post_delete, linkedin_post_repost, linkedin_post_get, linkedin_posts_list
 **Comments:** linkedin_comment_create, linkedin_comments_list, linkedin_comment_delete
 **Reactions:** linkedin_reaction_add, linkedin_reaction_remove
-**Media:** linkedin_media_upload, linkedin_gemini_image
+**Media:** linkedin_media_upload, linkedin_gemini_image, linkedin_banner_generate
 **Scheduling:** linkedin_schedule_create, linkedin_schedule_list, linkedin_schedule_cancel, linkedin_schedule_update
 **Content:** linkedin_template_list, linkedin_template_get, linkedin_template_save, linkedin_brand_voice, linkedin_guidelines
+
+## Banner Generator
+
+`linkedin_banner_generate` creates professional 1200×627 LinkedIn banners (2x retina).
+
+**Templates:** hero (big stat + headline), split (bullets + icon), numbers (3 stats), vs (before/after)
+**Gradients:** ocean, sunset, purple, emerald, fire, midnight, teal, rose
+**Presets:** post5-post17 (pre-configured designs for scheduled posts)
+
+All banners include CTA bar (bottom) with personal branding + call-to-action text.
+Can auto-upload to LinkedIn via `upload_to_linkedin: true`.
+
+Scheduler supports `banner_preset` / `banner_config` fields for auto-generation at publish time.
 
 ## Templates (12 built-in)
 

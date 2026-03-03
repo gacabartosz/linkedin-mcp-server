@@ -24,6 +24,7 @@ import { listTemplates, getTemplate, saveTemplate, applyTemplate } from "./conte
 import { getBrandVoice, setBrandVoice } from "./content/brand-voice.js";
 import { loadGuidelines } from "./content/guidelines.js";
 import { generateImage } from "./gemini/client.js";
+import { generateBanner, listPresets, GRADIENTS } from "./banner/index.js";
 
 // ─── Zod Schemas ─────────────────────────────────────────────────────────────
 
@@ -105,6 +106,8 @@ const ScheduleCreateInput = z.object({
   template_vars: z.record(z.string()).optional(),
   gemini_prompt: z.string().optional(),
   gemini_aspect_ratio: z.string().optional(),
+  banner_preset: z.string().optional(),
+  banner_config: z.string().optional(),
 });
 
 const ScheduleListInput = z.object({
@@ -133,6 +136,24 @@ const TemplateSaveInput = z.object({
     required: z.boolean().optional(),
     default: z.string().optional(),
   })).optional(),
+});
+
+const BannerGenerateInput = z.object({
+  preset: z.string().optional(),
+  template: z.enum(["hero", "split", "numbers", "vs"]).optional(),
+  gradient: z.enum(["ocean", "sunset", "purple", "emerald", "fire", "midnight", "teal", "rose"]).optional(),
+  headline: z.string().optional(),
+  subline: z.string().optional(),
+  stat: z.string().optional(),
+  stat_label: z.string().optional(),
+  bullets: z.array(z.string()).optional(),
+  numbers: z.array(z.object({ value: z.string(), label: z.string() })).optional(),
+  before: z.object({ title: z.string(), items: z.array(z.string()) }).optional(),
+  after: z.object({ title: z.string(), items: z.array(z.string()) }).optional(),
+  cta: z.string().optional(),
+  save_path: z.string().optional(),
+  upload_to_linkedin: z.boolean().optional(),
+  alt_text: z.string().optional(),
 });
 
 const GuidelinesInput = z.object({
@@ -391,10 +412,35 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ["prompt"],
       },
     },
+    // Banner Generation
+    {
+      name: "linkedin_banner_generate",
+      description: "Generate a professional LinkedIn banner image (1200×627, 2x retina). Use presets for existing post designs, or custom params for new banners. 4 templates: hero (big stat + headline), split (bullets + icon), numbers (3 stats), vs (before/after). 8 gradient themes. All banners include CTA bar and personal branding. Optionally upload directly to LinkedIn.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          preset: { type: "string", description: "Built-in preset name (post5-post17). Use linkedin_banner_generate with no args to see available presets." },
+          template: { type: "string", enum: ["hero", "split", "numbers", "vs"], description: "Template type for custom banners" },
+          gradient: { type: "string", enum: ["ocean", "sunset", "purple", "emerald", "fire", "midnight", "teal", "rose"], description: "Color gradient theme" },
+          headline: { type: "string", description: "Main headline text (required for custom)" },
+          subline: { type: "string", description: "Subtitle text (hero template)" },
+          stat: { type: "string", description: "Big stat number (hero template)" },
+          stat_label: { type: "string", description: "Label under the stat (hero template)" },
+          bullets: { type: "array", items: { type: "string" }, description: "Bullet points (split template, max 5)" },
+          numbers: { type: "array", items: { type: "object", properties: { value: { type: "string" }, label: { type: "string" } }, required: ["value", "label"] }, description: "Number items (numbers template, typically 3)" },
+          before: { type: "object", properties: { title: { type: "string" }, items: { type: "array", items: { type: "string" } } }, description: "Before/left section (vs template)" },
+          after: { type: "object", properties: { title: { type: "string" }, items: { type: "array", items: { type: "string" } } }, description: "After/right section (vs template)" },
+          cta: { type: "string", description: "CTA text on bottom bar (default: 'Link in comments')" },
+          save_path: { type: "string", description: "Custom save path for the PNG" },
+          upload_to_linkedin: { type: "boolean", description: "Upload to LinkedIn after generating (default: false)" },
+          alt_text: { type: "string", description: "Accessibility description for LinkedIn" },
+        },
+      },
+    },
     // Scheduling
     {
       name: "linkedin_schedule_create",
-      description: "Schedule a LinkedIn post for future publication. Optimal times: Tue-Thu at 8:00, 9:30, or 17:00. Min 12h gap between posts, max 1/day. The daemon auto-publishes and supports Gemini image generation at publish time.",
+      description: "Schedule a LinkedIn post for future publication. Optimal times: Tue-Thu at 8:00, 9:30, or 17:00. Min 12h gap between posts, max 1/day. The daemon auto-publishes and supports Gemini image generation or professional banner generation at publish time.",
       inputSchema: {
         type: "object",
         properties: {
@@ -405,8 +451,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           article_url: { type: "string" },
           template_id: { type: "string", description: "Content template to apply" },
           template_vars: { type: "object", description: "Template variables" },
-          gemini_prompt: { type: "string", description: "Generate image at publish time with this prompt" },
+          gemini_prompt: { type: "string", description: "Generate AI image at publish time with this prompt" },
           gemini_aspect_ratio: { type: "string", description: "Aspect ratio for Gemini image" },
+          banner_preset: { type: "string", description: "Generate professional banner at publish time using preset (post5-post17)" },
+          banner_config: { type: "string", description: "JSON config for custom banner generation at publish time" },
         },
         required: ["text", "publish_at"],
       },
@@ -671,6 +719,52 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return toolResult({
           file_path: imageResult.file_path,
           aspect_ratio: imageResult.aspect_ratio,
+          media_urn: mediaUrn,
+        });
+      }
+
+      // ── Banner Generation ─────────────────────────────────────────────
+      case "linkedin_banner_generate": {
+        const input = BannerGenerateInput.parse(args);
+
+        // If no preset and no headline, list available options
+        if (!input.preset && !input.headline) {
+          return toolResult({
+            presets: listPresets(),
+            templates: ["hero", "split", "numbers", "vs"],
+            gradients: Object.keys(GRADIENTS),
+            usage: "Provide a 'preset' name OR 'template' + 'headline' + other params for a custom banner.",
+          });
+        }
+
+        const bannerResult = await generateBanner({
+          preset: input.preset,
+          template: input.template,
+          gradient: input.gradient,
+          headline: input.headline,
+          subline: input.subline,
+          stat: input.stat,
+          stat_label: input.stat_label,
+          bullets: input.bullets,
+          numbers: input.numbers,
+          before: input.before,
+          after: input.after,
+          cta: input.cta,
+          save_path: input.save_path,
+        });
+
+        let mediaUrn: string | undefined;
+        if (input.upload_to_linkedin) {
+          const uploadResult = await uploadMedia({
+            file_path: bannerResult.file_path,
+            media_type: "IMAGE",
+            alt_text: input.alt_text,
+          });
+          mediaUrn = uploadResult.media_urn;
+        }
+
+        return toolResult({
+          ...bannerResult,
           media_urn: mediaUrn,
         });
       }
