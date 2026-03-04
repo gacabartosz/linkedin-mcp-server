@@ -71,6 +71,12 @@ const AUTO_COMMENTS = {
 
   'post17': 'MCP ecosystem insight: the Model Context Protocol is transport-agnostic — stdio, SSE, or WebSocket. This means one MCP server works identically with Claude Code, Claude Desktop, Cursor, Windsurf, and any future MCP-compatible client. Build once, use everywhere. LinkedIn MCP: https://github.com/gacabartosz/linkedin-mcp-server | SEO MCP: https://github.com/gacabartosz/seo-gaca-mcp',
 
+  'post19': 'Ciekawostka: przecietny uzytkownik Google ma ponad 17 000 maili i 2 GB plikow na Dysku bez zadnej struktury. Google Workspace MCP pozwala AI tworzyc foldery, etykiety i filtry bezposrednio — bez eksportu danych. 30 minut vs pol dnia recznej pracy. Open source i dziala lokalnie: https://github.com/gacabartosz/linkedin-mcp-server',
+
+  'post18-mcp': 'Ciekawostka: Google Workspace MCP nie wymaga eksportu danych — AI dziala bezposrednio na Gmail i Drive API. Tworzy foldery, przenosi pliki, ustawia filtry. Wszystko w jednym prompcie, bez opuszczania Twojego konta Google. Open source: https://github.com/gacabartosz/linkedin-mcp-server',
+
+  'post18': 'Google Workspace MCP to open source — dziala z Claude, Cursor i kazdym klientem MCP. Jeden prompt moze stworzyc foldery, przeniesc pliki, ustawic etykiety Gmail i filtry. Cala organizacja zajela 30 minut zamiast pol dnia recznego klikania. Wiecej o MCP: https://github.com/gacabartosz/linkedin-mcp-server',
+
   'default': 'MCP tip: every MCP tool is composable — schedule a post, generate an image, add a comment, check algorithm guidelines — all in one natural language conversation with your AI assistant. Source: https://github.com/gacabartosz/linkedin-mcp-server',
 };
 
@@ -91,6 +97,9 @@ const POST_IDENTIFIERS = {
   '7 steps to fully automated LinkedIn publishing': 'post15',
   'Wklejasz dane klientow do ChatGPT': 'post16',
   '5 lessons from building 86 MCP tools': 'post17',
+  'Gmail: 25 000 maili. Drive: luzne pliki wszedzie': 'post19',
+  'Twoj Gmail ma 25 000 maili': 'post18-mcp',
+  'Posprzatalem Gmail i Google Drive w 30 minut': 'post18',
 };
 
 // Map post keys → image file paths
@@ -108,6 +117,7 @@ const POST_IMAGES = {
   'post15': join(IMG_DIR, 'post15-banner.png'),
   'post16': join(IMG_DIR, 'post16-banner.png'),
   'post17': join(IMG_DIR, 'post17-banner.png'),
+  'post19': join(IMG_DIR, 'post19-google-mcp-before-after.mp4'),
 };
 
 // Map post keys → carousel PDF paths (uploaded as documents, 303% more engagement)
@@ -115,6 +125,8 @@ const POST_CAROUSELS = {
   'post10': join(IMG_DIR, 'post10-carousel.pdf'),
   'post13': join(IMG_DIR, 'post13-carousel.pdf'),
   'post15': join(IMG_DIR, 'post15-carousel.pdf'),
+  'post18-mcp': join(IMG_DIR, 'post18-carousel.pdf'),
+  'post18': join(IMG_DIR, 'post18-carousel.pdf'),
 };
 
 // Per-post publish jitter (0-7 min, stable per daemon run)
@@ -246,15 +258,17 @@ async function checkAndPublish() {
             }
           }
 
-          // Fallback to banner image
+          // Fallback to banner image or video
           if (mediaIds.length === 0 && POST_IMAGES[postKey]) {
             const imgPath = POST_IMAGES[postKey];
             if (existsSync(imgPath)) {
-              console.log(`  Uploading image: ${imgPath}`);
+              const isVideo = imgPath.endsWith('.mp4') || imgPath.endsWith('.mov');
+              const mediaType = isVideo ? 'VIDEO' : 'IMAGE';
+              console.log(`  Uploading ${mediaType.toLowerCase()}: ${imgPath}`);
               try {
                 const uploadResult = await callMCP('linkedin_media_upload', {
                   file_path: imgPath,
-                  media_type: 'IMAGE',
+                  media_type: mediaType,
                 });
                 if (uploadResult.media_urn) {
                   mediaIds = [uploadResult.media_urn];
