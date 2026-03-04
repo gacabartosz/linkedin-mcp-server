@@ -149,11 +149,6 @@ function getAuth() {
 
 async function callMCP(toolName, args) {
   return new Promise((resolve, reject) => {
-    const msgs = [
-      JSON.stringify({jsonrpc:'2.0',id:1,method:'initialize',params:{protocolVersion:'2024-11-05',capabilities:{},clientInfo:{name:'auto-pub',version:'1.0'}}}),
-      JSON.stringify({jsonrpc:'2.0',id:2,method:'tools/call',params:{name:toolName,arguments:args}}),
-    ].join('\n');
-
     const proc = spawn('node', ['dist/index.js'], {
       cwd: MCP_DIR,
       env: { ...process.env, LINKEDIN_PERSON_URN: 'urn:li:person:FihAwG4y_B' },
@@ -162,13 +157,18 @@ async function callMCP(toolName, args) {
 
     let out = '';
     let resolved = false;
+    let initialized = false;
 
-    proc.stdout.on('data', d => {
-      out += d.toString();
-      // Parse response as it streams — don't wait for process close
-      for (const line of out.split('\n')) {
+    function tryParse(buffer) {
+      for (const line of buffer.split('\n')) {
         try {
           const msg = JSON.parse(line.trim());
+          // Wait for initialize response before sending tools/call
+          if (msg.id === 1 && !initialized) {
+            initialized = true;
+            proc.stdin.write(JSON.stringify({jsonrpc:'2.0',method:'notifications/initialized'}) + '\n');
+            proc.stdin.write(JSON.stringify({jsonrpc:'2.0',id:2,method:'tools/call',params:{name:toolName,arguments:args}}) + '\n');
+          }
           if (msg.id === 2 && !resolved) {
             resolved = true;
             proc.kill();
@@ -186,9 +186,10 @@ async function callMCP(toolName, args) {
           }
         } catch {}
       }
-    });
+    }
 
-    proc.stderr.on('data', d => process.stderr.write(d));
+    proc.stdout.on('data', d => { out += d.toString(); tryParse(out); });
+    proc.stderr.on('data', d => { tryParse(d.toString()); });
 
     proc.on('close', () => {
       if (!resolved) {
@@ -196,8 +197,8 @@ async function callMCP(toolName, args) {
       }
     });
 
-    proc.stdin.write(msgs);
-    proc.stdin.end();
+    // Send initialize first
+    proc.stdin.write(JSON.stringify({jsonrpc:'2.0',id:1,method:'initialize',params:{protocolVersion:'2024-11-05',capabilities:{},clientInfo:{name:'auto-pub',version:'1.0'}}}) + '\n');
 
     setTimeout(() => {
       if (!resolved) {
@@ -219,10 +220,13 @@ async function checkAndPublish() {
   // Check scheduled posts
   try {
     const db = new Database(DB_PATH, { readonly: true });
-    const candidates = db.prepare(
-      "SELECT id, text, media_ids, publish_at, status FROM scheduled_posts WHERE status = 'scheduled' AND publish_at <= ?"
-    ).all(now.toISOString());
+    // Fetch all scheduled, filter in JS for timezone-aware comparison
+    // (SQLite string comparison fails with +01:00 offsets vs UTC)
+    const allScheduled = db.prepare(
+      "SELECT id, text, media_ids, publish_at, status FROM scheduled_posts WHERE status = 'scheduled'"
+    ).all();
     db.close();
+    const candidates = allScheduled.filter(p => new Date(p.publish_at).getTime() <= now.getTime());
 
     // Apply publish jitter: delay 0-7 min past publish_at (stable per post)
     const posts = candidates.filter(post => {
