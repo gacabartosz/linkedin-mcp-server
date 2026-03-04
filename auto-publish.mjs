@@ -43,7 +43,7 @@ const AUTO_COMMENTS = {
   'post4': 'Ciekawostka: komentarze powyzej 15 slow daja postom 10-15x wiekszy zasieg niz same polubienia. Dlatego algorytm LinkedIn traktuje komentarze jako najsilniejszy sygnal zaangazowania — silniejszy niz udostepnienia. Wiecej regul zakodowanych tutaj: https://github.com/gacabartosz/linkedin-mcp-server',
 
   // Week 2
-  'post5': 'Fun fact: MCP (Model Context Protocol) uses JSON-RPC 2.0 over stdio — meaning zero network latency between your AI assistant and your tools. The scheduling daemon is just 200 lines of JavaScript polling SQLite. Sometimes the simplest architecture wins. Code: https://github.com/gacabartosz/linkedin-mcp-server',
+  'post5': 'Fun fact: MCP (Model Context Protocol) uses JSON-RPC 2.0 over stdio — meaning zero network latency between your AI assistant and your tools. The scheduling daemon is ~370 lines of JavaScript polling SQLite. Sometimes the simplest architecture wins. Code: https://github.com/gacabartosz/linkedin-mcp-server',
 
   'post6': 'Wskazowka: link w tresci posta na LinkedIn obcina zasieg nawet o 40%. Dlatego profesjonalni tworcy zawsze daja link w komentarzu 15-30 min po publikacji — algorytm juz zdazyl zaindeksowac post. Ten komentarz tez zostal dodany automatycznie. Kod: https://github.com/gacabartosz/linkedin-mcp-server',
 
@@ -65,11 +65,13 @@ const AUTO_COMMENTS = {
 
   'post14': 'Cost insight: the best-performing AI model for most tasks is often free. Groq and Cerebras offer sub-100ms inference on competitive models at zero cost. The trick is automatic failover — if one provider rate-limits you, the next one picks up seamlessly. Architecture: https://github.com/gacabartosz/gaca-core',
 
-  'post15': 'Technical detail: the auto-publish daemon is a simple setInterval loop checking SQLite every 60 seconds. No cron, no cloud functions, no message queue. If the machine was off, it catches up on overdue posts within 24 hours. Sometimes boring infrastructure is the most reliable. Source: https://github.com/gacabartosz/linkedin-mcp-server/blob/main/auto-publish.mjs',
+  'post15': 'Technical detail: the auto-publish daemon is a simple setInterval loop checking SQLite every 60 seconds. No cron, no cloud functions, no message queue. If the machine was off, it catches up on ALL overdue posts when it restarts — no time limit. Sometimes boring infrastructure is the most reliable. Source: https://github.com/gacabartosz/linkedin-mcp-server/blob/main/auto-publish.mjs',
 
   'post16': 'Ciekawostka o RODO: kary za wyciek danych osobowych siegaja 20 mln EUR lub 4% rocznego obrotu firmy. A wystarczy jedno wklejenie danych klienta do ChatGPT aby stracic kontrole nad danymi. Presidio Anonymizer przechwytuje Ctrl+V i anonimizuje dane PRZED wyslaniem. 100% offline: https://github.com/gacabartosz/presidio-browser-anonymizer',
 
   'post17': 'MCP ecosystem insight: the Model Context Protocol is transport-agnostic — stdio, SSE, or WebSocket. This means one MCP server works identically with Claude Code, Claude Desktop, Cursor, Windsurf, and any future MCP-compatible client. Build once, use everywhere. LinkedIn MCP: https://github.com/gacabartosz/linkedin-mcp-server | SEO MCP: https://github.com/gacabartosz/seo-gaca-mcp',
+
+  'post0': 'Fun fact: LinkedIn oficjalnie nie ma API do schedulowania postow — nawet dla kont premium. Jedyny sposob to zbudowac wlasny daemon ktory odpytuje baze co 60 sekund. Ten post tez opublikowal sie sam. Kod: https://github.com/gacabartosz/linkedin-mcp-server',
 
   'post19': 'Ciekawostka: przecietny uzytkownik Google ma ponad 17 000 maili i 2 GB plikow na Dysku bez zadnej struktury. Google Workspace MCP pozwala AI tworzyc foldery, etykiety i filtry bezposrednio — bez eksportu danych. 30 minut vs pol dnia recznej pracy. Open source i dziala lokalnie: https://github.com/gacabartosz/linkedin-mcp-server',
 
@@ -97,6 +99,7 @@ const POST_IDENTIFIERS = {
   '7 steps to fully automated LinkedIn publishing': 'post15',
   'Wklejasz dane klientow do ChatGPT': 'post16',
   '5 lessons from building 86 MCP tools': 'post17',
+  'Wczoraj moj post na LinkedIn opublikowal sie sam': 'post0',
   'Gmail: 25 000 maili. Drive: luzne pliki wszedzie': 'post19',
   'Twoj Gmail ma 25 000 maili': 'post18-mcp',
   'Posprzatalem Gmail i Google Drive w 30 minut': 'post18',
