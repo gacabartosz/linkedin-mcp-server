@@ -21,9 +21,10 @@ const VIDEO_MIME: Record<string, string> = {
 
 interface InitializeUploadResponse {
   value: {
-    uploadUrl: string;
+    uploadUrl?: string;
     image?: string;
     video?: string;
+    uploadInstructions?: Array<{ uploadUrl: string; firstByte: number; lastByte: number }>;
   };
 }
 
@@ -76,7 +77,8 @@ async function uploadImage(
     { initializeUploadRequest: { owner: personUrn } },
   );
 
-  const uploadUrl = init.value.uploadUrl;
+  const uploadUrl = init.value.uploadUrl || init.value.uploadInstructions?.[0]?.uploadUrl;
+  if (!uploadUrl) throw new Error("No upload URL returned from LinkedIn image API");
   const imageUrn = init.value.image || "";
 
   // Step 2: PUT binary
@@ -92,12 +94,85 @@ async function uploadImage(
   };
 }
 
+interface RegisterUploadResponse {
+  value: {
+    asset: string;
+    mediaArtifact?: string;
+    uploadMechanism: {
+      "com.linkedin.digitalmedia.uploading.MediaUploadHttpRequest": {
+        uploadUrl: string;
+        headers: Record<string, string>;
+      };
+    };
+  };
+}
+
 async function uploadVideo(
   personUrn: string,
   buffer: Buffer,
   ext: string,
 ): Promise<{ media_urn: string; media_type: string; upload_status: string }> {
-  // Step 1: Initialize upload
+  // Use v2/assets API (compatible with v2/ugcPosts for publishing)
+  // The /rest/videos API returns urn:li:video: URNs which do NOT work with ugcPosts
+  try {
+    return await uploadVideoV2Assets(personUrn, buffer, ext);
+  } catch (err) {
+    log("warn", `v2/assets video upload failed: ${err}, trying /rest/videos`);
+    return await uploadVideoRest(personUrn, buffer, ext);
+  }
+}
+
+/** v2/assets flow — compatible with v2/ugcPosts (w_member_social scope) */
+async function uploadVideoV2Assets(
+  personUrn: string,
+  buffer: Buffer,
+  ext: string,
+): Promise<{ media_urn: string; media_type: string; upload_status: string }> {
+  // Step 1: Register upload via v2/assets
+  const register = await linkedinRequest<RegisterUploadResponse>(
+    "POST",
+    "/assets?action=registerUpload",
+    {
+      registerUploadRequest: {
+        recipes: ["urn:li:digitalmediaRecipe:feedshare-video"],
+        owner: personUrn,
+        serviceRelationships: [
+          {
+            relationshipType: "OWNER",
+            identifier: "urn:li:userGeneratedContent",
+          },
+        ],
+        supportedUploadMechanism: ["SYNCHRONOUS_UPLOAD"],
+      },
+    },
+    { apiBase: "v2" },
+  );
+
+  const uploadMech = register.value.uploadMechanism?.["com.linkedin.digitalmedia.uploading.MediaUploadHttpRequest"];
+  if (!uploadMech?.uploadUrl) throw new Error("No upload URL returned from v2/assets");
+  const assetUrn = register.value.asset || "";
+
+  log("info", `Video registered: ${assetUrn}, uploading binary...`);
+
+  // Step 2: PUT binary to upload URL
+  const contentType = VIDEO_MIME[ext] || "video/mp4";
+  await linkedinUploadBinary(uploadMech.uploadUrl, buffer, contentType);
+
+  log("info", `Video uploaded via v2/assets: ${assetUrn}`);
+
+  return {
+    media_urn: assetUrn,
+    media_type: "VIDEO",
+    upload_status: "READY",
+  };
+}
+
+/** /rest/videos flow — for use with /rest/posts API (requires Community Management) */
+async function uploadVideoRest(
+  personUrn: string,
+  buffer: Buffer,
+  ext: string,
+): Promise<{ media_urn: string; media_type: string; upload_status: string }> {
   const init = await linkedinRequest<InitializeUploadResponse>(
     "POST",
     "/videos?action=initializeUpload",
@@ -111,14 +186,14 @@ async function uploadVideo(
     },
   );
 
-  const uploadUrl = init.value.uploadUrl;
+  const uploadUrl = init.value.uploadUrl || init.value.uploadInstructions?.[0]?.uploadUrl;
+  if (!uploadUrl) throw new Error("No upload URL returned from LinkedIn video API");
   const videoUrn = init.value.video || "";
 
-  // Step 2: PUT binary
   const contentType = VIDEO_MIME[ext] || "video/mp4";
   await linkedinUploadBinary(uploadUrl, buffer, contentType);
 
-  log("info", `Video uploaded: ${videoUrn}`);
+  log("info", `Video uploaded via /rest/videos: ${videoUrn}`);
 
   return {
     media_urn: videoUrn,

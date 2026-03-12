@@ -67,17 +67,26 @@ const AUTO_COMMENTS = {
 
   'post15': 'Technical detail: the auto-publish daemon is a simple setInterval loop checking SQLite every 60 seconds. No cron, no cloud functions, no message queue. If the machine was off, it catches up on ALL overdue posts when it restarts — no time limit. Sometimes boring infrastructure is the most reliable. Source: https://github.com/gacabartosz/linkedin-mcp-server/blob/main/auto-publish.mjs',
 
-  'post16': 'Ciekawostka o RODO: kary za wyciek danych osobowych siegaja 20 mln EUR lub 4% rocznego obrotu firmy. A wystarczy jedno wklejenie danych klienta do ChatGPT aby stracic kontrole nad danymi. Presidio Anonymizer przechwytuje Ctrl+V i anonimizuje dane PRZED wyslaniem. 100% offline: https://github.com/gacabartosz/presidio-browser-anonymizer',
+  'post16': 'Ciekawostka o RODO: kary za wyciek danych osobowych siegaja 20 mln EUR lub 4% rocznego obrotu firmy. A wystarczy jedno wklejenie danych klienta do ChatGPT aby stracic kontrole nad danymi. Presidio Anonymizer przechwytuje Ctrl+V i anonimizuje dane PRZED wyslaniem. 100% offline: https://github.com/gacabartosz/presidio-local-anonymizer',
 
   'post17': 'MCP ecosystem insight: the Model Context Protocol is transport-agnostic — stdio, SSE, or WebSocket. This means one MCP server works identically with Claude Code, Claude Desktop, Cursor, Windsurf, and any future MCP-compatible client. Build once, use everywhere. LinkedIn MCP: https://github.com/gacabartosz/linkedin-mcp-server | SEO MCP: https://github.com/gacabartosz/seo-gaca-mcp',
 
   'post0': 'Fun fact: LinkedIn oficjalnie nie ma API do schedulowania postow — nawet dla kont premium. Jedyny sposob to zbudowac wlasny daemon ktory odpytuje baze co 60 sekund. Ten post tez opublikowal sie sam. Kod: https://github.com/gacabartosz/linkedin-mcp-server',
 
-  'post19': 'Ciekawostka: przecietny uzytkownik Google ma ponad 17 000 maili i 2 GB plikow na Dysku bez zadnej struktury. Google Workspace MCP pozwala AI tworzyc foldery, etykiety i filtry bezposrednio — bez eksportu danych. 30 minut vs pol dnia recznej pracy. Open source i dziala lokalnie: https://github.com/gacabartosz/linkedin-mcp-server',
+  'post19': 'Ciekawostka: przecietny uzytkownik Google ma ponad 17 000 maili i 2 GB plikow na Dysku bez zadnej struktury. Google Workspace MCP pozwala AI tworzyc foldery, etykiety i filtry bezposrednio — bez eksportu danych. 30 minut vs pol dnia recznej pracy. Open source: https://github.com/taylorwilsdon/google_workspace_mcp | Instalacja: uvx workspace-mcp',
 
-  'post18-mcp': 'Ciekawostka: Google Workspace MCP nie wymaga eksportu danych — AI dziala bezposrednio na Gmail i Drive API. Tworzy foldery, przenosi pliki, ustawia filtry. Wszystko w jednym prompcie, bez opuszczania Twojego konta Google. Open source: https://github.com/gacabartosz/linkedin-mcp-server',
+  'post18-mcp': 'Ciekawostka: Google Workspace MCP nie wymaga eksportu danych — AI dziala bezposrednio na Gmail i Drive API. Tworzy foldery, przenosi pliki, ustawia filtry. Wszystko w jednym prompcie, bez opuszczania Twojego konta Google. Open source: https://github.com/taylorwilsdon/google_workspace_mcp | Instalacja: uvx workspace-mcp',
 
-  'post18': 'Google Workspace MCP to open source — dziala z Claude, Cursor i kazdym klientem MCP. Jeden prompt moze stworzyc foldery, przeniesc pliki, ustawic etykiety Gmail i filtry. Cala organizacja zajela 30 minut zamiast pol dnia recznego klikania. Wiecej o MCP: https://github.com/gacabartosz/linkedin-mcp-server',
+  'post18': 'Google Workspace MCP to open source — dziala z Claude, Cursor i kazdym klientem MCP. Jeden prompt moze stworzyc foldery, przeniesc pliki, ustawic etykiety Gmail i filtry. Cala organizacja zajela 30 minut zamiast pol dnia recznego klikania. Repo: https://github.com/taylorwilsdon/google_workspace_mcp | Instalacja: uvx workspace-mcp',
+
+  // KSeF MCP series (10-12.03)
+  'ksef1': 'Cała historia zaczęła się od jednego kliknięcia w @Fakturownia (https://www.linkedin.com/company/fakturownia/). Faktury wystawione przed integracją z KSeF mają pełną moc prawną — nie trzeba ich wysyłać do KSeF. Art. 106na to kluczowy przepis, który warto znać. Mój MCP do KSeF: https://github.com/gacabartosz/ksef-mcp',
+
+  'ksef2': 'Kod źródłowy: https://github.com/gacabartosz/ksef-mcp — 30 narzędzi MCP do Krajowego Systemu e-Faktur. Drafty, korekty, batch, walidacja FA(3), szyfrowanie RSA-OAEP + AES-256-CBC. Zbudowane z Claude Code. MIT license. Pierwszy publiczny MCP server do KSeF.',
+
+  'ksef3': 'Full source: https://github.com/gacabartosz/ksef-mcp — 30 tools for KSeF (Polish e-invoicing). Auth, drafts, corrections, batch, encryption, audit trail. Works with Claude Code and Claude Desktop. MIT licensed. The first public MCP server for KSeF by @Ministerstwo Finansów (https://www.linkedin.com/company/ministerstwo-finansow/).',
+
+  'ksef4': 'Pole P_14_xW (VAT w PLN) jest opcjonalne w schemacie FA(3), ale art. 106e ust. 11 UoVAT mówi: "Kwoty podatku wykazuje się w złotych." Zgłosiłem to do Ministerstwa Finansów (https://www.linkedin.com/company/ministerstwo-finansow/). Walidacja semantyczna w ksef-mcp już to łapie: https://github.com/gacabartosz/ksef-mcp',
 
   'default': 'MCP tip: every MCP tool is composable — schedule a post, generate an image, add a comment, check algorithm guidelines — all in one natural language conversation with your AI assistant. Source: https://github.com/gacabartosz/linkedin-mcp-server',
 };
@@ -103,10 +112,20 @@ const POST_IDENTIFIERS = {
   'Gmail: 25 000 maili. Drive: luzne pliki wszedzie': 'post19',
   'Twoj Gmail ma 25 000 maili': 'post18-mcp',
   'Posprzatalem Gmail i Google Drive w 30 minut': 'post18',
+  // KSeF MCP series
+  'Wyslalem stare faktury do KSeF': 'ksef1',
+  'Wysłałem stare faktury do KSeF': 'ksef1',
+  '15 minut na jedna korekte w KSeF': 'ksef2',
+  '15 minut na jedną korektę w KSeF': 'ksef2',
+  'I built 30 MCP tools for Poland': 'ksef3',
+  'Wyslalem fakture korygujaca w EUR do KSeF': 'ksef4',
+  'Wysłałem fakturę korygującą w EUR do KSeF': 'ksef4',
 };
 
 // Map post keys → image file paths
 const POST_IMAGES = {
+  'post3': join(IMG_DIR, 'post3-banner.png'),
+  'post4': join(IMG_DIR, 'post4-banner.png'),
   'post5': join(IMG_DIR, 'post5-banner.png'),
   'post6': join(IMG_DIR, 'post6-github.png'),
   'post7': join(IMG_DIR, 'post7-banner.png'),
@@ -121,6 +140,11 @@ const POST_IMAGES = {
   'post16': join(IMG_DIR, 'post16-banner.png'),
   'post17': join(IMG_DIR, 'post17-banner.png'),
   'post19': join(IMG_DIR, 'post19-google-mcp-before-after.mp4'),
+  // KSeF MCP series
+  'ksef1': join(IMG_DIR, 'ksef-banner.png'),
+  'ksef2': join(IMG_DIR, 'ksef-banner.png'),
+  'ksef3': join(IMG_DIR, 'ksef-banner.png'),
+  'ksef4': join(IMG_DIR, 'ksef-banner.png'),
 };
 
 // Map post keys → carousel PDF paths (uploaded as documents, 303% more engagement)
@@ -128,7 +152,7 @@ const POST_CAROUSELS = {
   'post10': join(IMG_DIR, 'post10-carousel.pdf'),
   'post13': join(IMG_DIR, 'post13-carousel.pdf'),
   'post15': join(IMG_DIR, 'post15-carousel.pdf'),
-  'post18-mcp': join(IMG_DIR, 'post18-carousel.pdf'),
+  'post18-mcp': join(IMG_DIR, 'post19-google-mcp-before-after.mp4'),
   'post18': join(IMG_DIR, 'post18-carousel.pdf'),
 };
 
@@ -151,27 +175,45 @@ async function callMCP(toolName, args) {
   return new Promise((resolve, reject) => {
     const proc = spawn('node', ['dist/index.js'], {
       cwd: MCP_DIR,
-      env: { ...process.env, LINKEDIN_PERSON_URN: 'urn:li:person:FihAwG4y_B' },
+      env: {
+        ...process.env,
+        LINKEDIN_PERSON_URN: process.env.LINKEDIN_PERSON_URN || 'urn:li:person:FihAwG4y_B',
+        LINKEDIN_CLIENT_ID: process.env.LINKEDIN_CLIENT_ID || '',
+        LINKEDIN_CLIENT_SECRET: process.env.LINKEDIN_CLIENT_SECRET || '',
+      },
       stdio: ['pipe', 'pipe', 'pipe'],
     });
 
-    let out = '';
+    let stdoutBuf = '';
+    let stderrBuf = '';
     let resolved = false;
     let initialized = false;
 
-    function tryParse(buffer) {
-      for (const line of buffer.split('\n')) {
+    function processLines(buffer) {
+      // Only process complete lines (ending with \n)
+      const lines = buffer.split('\n');
+      const incomplete = lines.pop(); // last element is incomplete (no trailing \n)
+      for (const line of lines) {
+        if (!line.trim()) continue;
         try {
           const msg = JSON.parse(line.trim());
           // Wait for initialize response before sending tools/call
           if (msg.id === 1 && !initialized) {
             initialized = true;
-            proc.stdin.write(JSON.stringify({jsonrpc:'2.0',method:'notifications/initialized'}) + '\n');
-            proc.stdin.write(JSON.stringify({jsonrpc:'2.0',id:2,method:'tools/call',params:{name:toolName,arguments:args}}) + '\n');
+            const notif = JSON.stringify({jsonrpc:'2.0',method:'notifications/initialized'}) + '\n';
+            const toolCall = JSON.stringify({jsonrpc:'2.0',id:2,method:'tools/call',params:{name:toolName,arguments:args}}) + '\n';
+            // Write sequentially, wait for drain if needed
+            const ok = proc.stdin.write(notif);
+            if (!ok) {
+              proc.stdin.once('drain', () => proc.stdin.write(toolCall));
+            } else {
+              proc.stdin.write(toolCall);
+            }
           }
           if (msg.id === 2 && !resolved) {
             resolved = true;
-            proc.kill();
+            // Give process time to cleanup before killing
+            setTimeout(() => proc.kill(), 500);
             if (msg.result?.isError) {
               reject(new Error(msg.result.content?.[0]?.text || 'MCP tool error'));
               return;
@@ -186,27 +228,41 @@ async function callMCP(toolName, args) {
           }
         } catch {}
       }
+      return incomplete; // return unprocessed remainder
     }
 
-    proc.stdout.on('data', d => { out += d.toString(); tryParse(out); });
-    proc.stderr.on('data', d => { tryParse(d.toString()); });
+    proc.stdout.on('data', d => {
+      stdoutBuf += d.toString();
+      const remainder = processLines(stdoutBuf);
+      stdoutBuf = remainder ?? '';
+    });
 
-    proc.on('close', () => {
+    proc.stderr.on('data', d => {
+      stderrBuf += d.toString();
+      const remainder = processLines(stderrBuf);
+      stderrBuf = remainder ?? '';
+    });
+
+    proc.on('close', (code) => {
+      // Process any remaining buffer on close
+      if (stdoutBuf.trim()) processLines(stdoutBuf + '\n');
+      if (stderrBuf.trim()) processLines(stderrBuf + '\n');
       if (!resolved) {
-        reject(new Error('No response from MCP'));
+        reject(new Error(`No response from MCP (exit code: ${code})`));
       }
     });
 
     // Send initialize first
     proc.stdin.write(JSON.stringify({jsonrpc:'2.0',id:1,method:'initialize',params:{protocolVersion:'2024-11-05',capabilities:{},clientInfo:{name:'auto-pub',version:'1.0'}}}) + '\n');
 
+    // 3 min timeout (media upload can be slow)
     setTimeout(() => {
       if (!resolved) {
         resolved = true;
         proc.kill();
-        reject(new Error('Timeout'));
+        reject(new Error('Timeout (180s)'));
       }
-    }, 90000);
+    }, 180000);
   });
 }
 
@@ -358,8 +414,14 @@ async function checkAndPublish() {
       commentQueue.splice(commentQueue.indexOf(c), 1);
     } catch (err) {
       console.error(`  Comment failed for ${c.post_urn}:`, err.message);
-      c.comment_at = new Date(Date.now() + 5 * 60 * 1000);
-      console.log(`  Retrying in 5 min`);
+      c.retries = (c.retries || 0) + 1;
+      if (c.retries >= 5) {
+        console.error(`  Max retries (5) reached for comment on ${c.post_urn} — giving up`);
+        commentQueue.splice(commentQueue.indexOf(c), 1);
+      } else {
+        c.comment_at = new Date(Date.now() + 5 * 60 * 1000);
+        console.log(`  Retrying in 5 min (attempt ${c.retries}/5)`);
+      }
     }
   }
 }

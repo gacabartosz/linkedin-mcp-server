@@ -95,7 +95,11 @@ async function createPostUgc(options: PostCreateOptions): Promise<{
   };
 
   if (options.media_ids && options.media_ids.length > 0) {
-    shareContent.shareMediaCategory = "IMAGE";
+    // urn:li:video: from /rest/videos, urn:li:digitalmediaAsset: from v2/assets (feedshare-video)
+    const hasVideo = options.media_ids.some((id) =>
+      id.includes(":video:") || id.includes(":digitalmediaAsset:")
+    );
+    shareContent.shareMediaCategory = hasVideo ? "VIDEO" : "IMAGE";
     shareContent.media = options.media_ids.map((id) => ({
       status: "READY",
       media: id,
