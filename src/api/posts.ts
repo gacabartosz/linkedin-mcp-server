@@ -6,6 +6,7 @@ interface PostCreateOptions {
   text: string;
   visibility?: "PUBLIC" | "CONNECTIONS";
   media_ids?: string[];
+  media_category?: "IMAGE" | "VIDEO" | "ARTICLE" | "NONE";
   article_url?: string;
   article_title?: string;
   article_description?: string;
@@ -95,11 +96,13 @@ async function createPostUgc(options: PostCreateOptions): Promise<{
   };
 
   if (options.media_ids && options.media_ids.length > 0) {
-    // urn:li:video: from /rest/videos, urn:li:digitalmediaAsset: from v2/assets (feedshare-video)
-    const hasVideo = options.media_ids.some((id) =>
-      id.includes(":video:") || id.includes(":digitalmediaAsset:")
-    );
-    shareContent.shareMediaCategory = hasVideo ? "VIDEO" : "IMAGE";
+    // Use explicit media_category if provided, otherwise detect from URN
+    if (options.media_category) {
+      shareContent.shareMediaCategory = options.media_category;
+    } else {
+      const hasVideo = options.media_ids.some((id) => id.includes(":video:"));
+      shareContent.shareMediaCategory = hasVideo ? "VIDEO" : "IMAGE";
+    }
     shareContent.media = options.media_ids.map((id) => ({
       status: "READY",
       media: id,
