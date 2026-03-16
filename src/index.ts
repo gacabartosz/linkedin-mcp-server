@@ -26,6 +26,11 @@ import { loadGuidelines } from "./content/guidelines.js";
 import { generateImage, generateText } from "./gemini/client.js";
 import { generateBanner, generateCarousel, captureScreenshot, listPresets, GRADIENTS } from "./banner/index.js";
 import { generateCaseStudy } from "./casestudy/index.js";
+import { loadScraperAuth, saveScraperAuth, getRateLimitStats, COMPLIANCE_DISCLAIMER } from "./scraper/voyager.js";
+import { searchPeople, searchCompanies, getCompanyPeople, getCompanyInfo, extractCompanyId } from "./scraper/search.js";
+import { getPersonPosts, getPersonComments, extractPublicId } from "./scraper/activity.js";
+import { addCompany, listCompanies, removeCompany, addProspect, listProspects, getProspect, removeProspect, updateProspectScanTime, addActivity, getNewActivities, markActivitiesReviewed, getStats } from "./scraper/store.js";
+import { classifyIntent, quickClassify } from "./scraper/classify.js";
 
 // ─── Zod Schemas ─────────────────────────────────────────────────────────────
 
@@ -252,6 +257,87 @@ const BrandVoiceInput = z.object({
     golden_hour_minutes: z.number().optional(),
     first_comment_delay_minutes: z.number().optional(),
   }).optional(),
+});
+
+// ─── Scraper Zod Schemas ─────────────────────────────────────────────────────
+
+const ScraperAuthInput = z.object({
+  li_at: z.string().describe("Your LinkedIn li_at session cookie from browser DevTools"),
+});
+
+const SearchPeopleInput = z.object({
+  keywords: z.string().optional().describe("Search keywords (e.g., 'e-commerce manager')"),
+  title: z.string().optional().describe("Job title filter (e.g., 'Head of Growth')"),
+  company_id: z.string().optional().describe("LinkedIn company ID or universal name"),
+  location: z.string().optional().describe("Location filter (e.g., 'poland', 'warsaw', or geo URN)"),
+  count: z.number().int().min(1).max(25).optional().describe("Results per page (default: 10, max: 25)"),
+  start: z.number().int().min(0).optional().describe("Pagination offset"),
+});
+
+const SearchCompaniesInput = z.object({
+  keywords: z.string().describe("Company name or keywords"),
+  count: z.number().int().min(1).max(25).optional(),
+  start: z.number().int().min(0).optional(),
+});
+
+const CompanyPeopleInput = z.object({
+  company: z.string().describe("Company URL (linkedin.com/company/...) or company ID/name"),
+  role_keywords: z.string().optional().describe("Filter by role (e.g., 'sales', 'growth', 'business development')"),
+  count: z.number().int().min(1).max(25).optional(),
+  start: z.number().int().min(0).optional(),
+});
+
+const PersonActivityInput = z.object({
+  profile: z.string().describe("LinkedIn profile URL (linkedin.com/in/...) or public ID"),
+  type: z.enum(["posts", "comments", "all"]).optional().describe("Activity type to fetch (default: all)"),
+  count: z.number().int().min(1).max(20).optional(),
+  start: z.number().int().min(0).optional(),
+});
+
+const IntentClassifyInput = z.object({
+  text: z.string().describe("Text to classify (post or comment content)"),
+  person_name: z.string().optional(),
+  person_headline: z.string().optional(),
+  activity_type: z.enum(["post", "comment"]).optional(),
+  original_post: z.string().optional().describe("If classifying a comment, the original post text"),
+});
+
+const ProspectSaveInput = z.object({
+  name: z.string(),
+  public_id: z.string().describe("LinkedIn public ID (from URL)"),
+  headline: z.string().optional(),
+  profile_url: z.string().optional(),
+  company_name: z.string().optional(),
+  category: z.enum(["competitor_sales", "target_buyer", "influencer", "other"]).optional(),
+  tags: z.array(z.string()).optional(),
+  notes: z.string().optional(),
+  source_company_id: z.string().optional(),
+});
+
+const ProspectListInput = z.object({
+  category: z.enum(["competitor_sales", "target_buyer", "influencer", "other"]).optional(),
+  source_company_id: z.string().optional(),
+  has_new_activity: z.boolean().optional(),
+});
+
+const CompanySaveInput = z.object({
+  name: z.string(),
+  company: z.string().describe("Company URL or ID"),
+  type: z.enum(["direct_competitor", "indirect_competitor", "target_segment", "other"]).optional(),
+  notes: z.string().optional(),
+});
+
+const ProspectScanInput = z.object({
+  prospect_id: z.string().optional().describe("Scan specific prospect (public_id or ID). Omit to scan all."),
+  category: z.enum(["competitor_sales", "target_buyer", "influencer", "other"]).optional(),
+  classify: z.boolean().optional().describe("Run AI classification on new activities (default: true)"),
+});
+
+const ActivitiesListInput = z.object({
+  classification: z.enum(["sales_pitch", "buying_signal", "job_posting", "networking", "irrelevant"]).optional(),
+  prospect_id: z.string().optional(),
+  limit: z.number().int().min(1).max(100).optional(),
+  mark_reviewed: z.boolean().optional().describe("Mark returned activities as reviewed (default: false)"),
 });
 
 // ─── MCP Server ──────────────────────────────────────────────────────────────
@@ -744,6 +830,175 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ["name", "body"],
       },
     },
+
+    // ── Scraper & Monitoring Tools ─────────────────────────────────────
+    {
+      name: "linkedin_scraper_auth",
+      description: "Set LinkedIn research authentication. Requires li_at cookie from YOUR browser (your own account, no fake accounts). Uses LinkedIn's internal API for sales research — technically against LinkedIn ToS but protected by hiQ v. LinkedIn ruling for public data. Conservative rate limits (30/hr, 150/day). You acknowledge the risk to your account by using this.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          li_at: { type: "string", description: "Your LinkedIn li_at session cookie" },
+        },
+        required: ["li_at"],
+      },
+    },
+    {
+      name: "linkedin_search_people",
+      description: "Search LinkedIn for people by keywords, job title, company, and location. Uses LinkedIn's internal search API. Requires scraper auth (li_at cookie). Rate-limited for safety.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          keywords: { type: "string", description: "Search keywords (e.g., 'e-commerce manager')" },
+          title: { type: "string", description: "Job title filter" },
+          company_id: { type: "string", description: "LinkedIn company ID or universal name" },
+          location: { type: "string", description: "Location: 'poland', 'warsaw', 'europe', etc." },
+          count: { type: "number", description: "Results per page (default: 10, max: 25)" },
+          start: { type: "number", description: "Pagination offset" },
+        },
+      },
+    },
+    {
+      name: "linkedin_search_companies",
+      description: "Search for companies on LinkedIn by name or keywords. Returns company name, ID, description, and URL.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          keywords: { type: "string", description: "Company name or keywords" },
+          count: { type: "number", description: "Results (default: 10, max: 25)" },
+          start: { type: "number" },
+        },
+        required: ["keywords"],
+      },
+    },
+    {
+      name: "linkedin_company_people",
+      description: "List people at a specific company. Optionally filter by role keywords (e.g., 'sales', 'growth', 'business development'). Great for finding competitor salespeople.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          company: { type: "string", description: "Company URL (linkedin.com/company/...) or company ID" },
+          role_keywords: { type: "string", description: "Filter by role (e.g., 'sales growth business development')" },
+          count: { type: "number", description: "Results (default: 10)" },
+          start: { type: "number" },
+        },
+        required: ["company"],
+      },
+    },
+    {
+      name: "linkedin_person_activity",
+      description: "Get a person's recent LinkedIn activity — posts, comments, shares. Critical for monitoring competitor salespeople (their COMMENTS reveal RFPs) and target buyers (their POSTS reveal buying intent).",
+      inputSchema: {
+        type: "object",
+        properties: {
+          profile: { type: "string", description: "Profile URL (linkedin.com/in/...) or public ID" },
+          type: { type: "string", enum: ["posts", "comments", "all"], description: "Activity type (default: all)" },
+          count: { type: "number", description: "Number of activities (default: 10, max: 20)" },
+          start: { type: "number" },
+        },
+        required: ["profile"],
+      },
+    },
+    {
+      name: "linkedin_intent_classify",
+      description: "AI-powered classification of LinkedIn activity text. Categories: sales_pitch (competitor offering services), buying_signal (potential client seeking vendor), job_posting (hiring = growth signal), networking, irrelevant. Uses keyword matching + Gemini AI.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          text: { type: "string", description: "Post or comment text to classify" },
+          person_name: { type: "string" },
+          person_headline: { type: "string" },
+          activity_type: { type: "string", enum: ["post", "comment"] },
+          original_post: { type: "string", description: "Original post text (if classifying a comment)" },
+        },
+        required: ["text"],
+      },
+    },
+    {
+      name: "linkedin_prospect_save",
+      description: "Save a person to the prospect monitoring database. Categories: competitor_sales (monitor their comments for RFPs), target_buyer (monitor their posts for buying intent), influencer, other.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          name: { type: "string" },
+          public_id: { type: "string", description: "LinkedIn public ID (from URL)" },
+          headline: { type: "string" },
+          profile_url: { type: "string" },
+          company_name: { type: "string" },
+          category: { type: "string", enum: ["competitor_sales", "target_buyer", "influencer", "other"] },
+          tags: { type: "array", items: { type: "string" } },
+          notes: { type: "string" },
+          source_company_id: { type: "string" },
+        },
+        required: ["name", "public_id"],
+      },
+    },
+    {
+      name: "linkedin_prospect_list",
+      description: "List saved prospects with optional filters. Shows all monitored people from the prospect database.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          category: { type: "string", enum: ["competitor_sales", "target_buyer", "influencer", "other"] },
+          source_company_id: { type: "string" },
+          has_new_activity: { type: "boolean", description: "Only show prospects with unreviewed activities" },
+        },
+      },
+    },
+    {
+      name: "linkedin_company_save",
+      description: "Add a company to the monitoring list. Types: direct_competitor, indirect_competitor, target_segment, other.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          name: { type: "string", description: "Company display name" },
+          company: { type: "string", description: "Company LinkedIn URL or ID" },
+          type: { type: "string", enum: ["direct_competitor", "indirect_competitor", "target_segment", "other"] },
+          notes: { type: "string" },
+        },
+        required: ["name", "company"],
+      },
+    },
+    {
+      name: "linkedin_company_list",
+      description: "List all monitored companies.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          type: { type: "string", enum: ["direct_competitor", "indirect_competitor", "target_segment", "other"] },
+        },
+      },
+    },
+    {
+      name: "linkedin_prospect_scan",
+      description: "Scan prospects for new activity. Fetches latest posts/comments from LinkedIn and optionally classifies them with AI. Can scan all prospects or a specific one. Rate-limited.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          prospect_id: { type: "string", description: "Scan specific prospect (public_id). Omit to scan all." },
+          category: { type: "string", enum: ["competitor_sales", "target_buyer", "influencer", "other"], description: "Filter which category to scan" },
+          classify: { type: "boolean", description: "Run AI classification (default: true)" },
+        },
+      },
+    },
+    {
+      name: "linkedin_activities_feed",
+      description: "Get classified activities feed — new RFPs, buying signals, sales pitches detected by the monitoring system. Filter by classification type. Mark as reviewed.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          classification: { type: "string", enum: ["sales_pitch", "buying_signal", "job_posting", "networking", "irrelevant"] },
+          prospect_id: { type: "string" },
+          limit: { type: "number", description: "Max results (default: 50)" },
+          mark_reviewed: { type: "boolean", description: "Mark returned items as reviewed (default: false)" },
+        },
+      },
+    },
+    {
+      name: "linkedin_monitor_stats",
+      description: "Get monitoring system statistics — total prospects, companies, activities, classification breakdown.",
+      inputSchema: { type: "object", properties: {} },
+    },
   ],
 }));
 
@@ -1185,6 +1440,290 @@ ${input.sentiment === "neutral" ? "Engage if substance, invite discussion." : ""
         const input = TemplateSaveInput.parse(args);
         const result = saveTemplate(input);
         return toolResult(result);
+      }
+
+      // ── Scraper & Monitoring ────────────────────────────────────────
+      case "linkedin_scraper_auth": {
+        const input = ScraperAuthInput.parse(args);
+        saveScraperAuth({ li_at: input.li_at, tos_acknowledged: true });
+        return toolResult({
+          authenticated: true,
+          disclaimer: COMPLIANCE_DISCLAIMER,
+          message: "Scraper auth saved. ToS risk acknowledged. You can now use search, company, and activity tools.",
+          safety: {
+            max_requests_per_hour: 30,
+            max_requests_per_day: 150,
+            delay_between_requests: "3-7 seconds (randomized)",
+            backoff_on_429: "exponential (60s, 120s, 240s...)",
+          },
+          rate_limit: getRateLimitStats(),
+        });
+      }
+
+      case "linkedin_search_people": {
+        const input = SearchPeopleInput.parse(args);
+        const result = await searchPeople({
+          keywords: input.keywords,
+          title: input.title,
+          company_id: input.company_id,
+          location: input.location,
+          count: input.count,
+          start: input.start,
+        });
+        return toolResult({
+          ...result,
+          rate_limit: getRateLimitStats(),
+        });
+      }
+
+      case "linkedin_search_companies": {
+        const input = SearchCompaniesInput.parse(args);
+        const result = await searchCompanies({
+          keywords: input.keywords,
+          count: input.count,
+          start: input.start,
+        });
+        return toolResult({
+          ...result,
+          rate_limit: getRateLimitStats(),
+        });
+      }
+
+      case "linkedin_company_people": {
+        const input = CompanyPeopleInput.parse(args);
+        const companyId = extractCompanyId(input.company);
+        const result = await getCompanyPeople({
+          company_id: companyId,
+          role_keywords: input.role_keywords,
+          count: input.count,
+          start: input.start,
+        });
+        return toolResult({
+          ...result,
+          rate_limit: getRateLimitStats(),
+        });
+      }
+
+      case "linkedin_person_activity": {
+        const input = PersonActivityInput.parse(args);
+        const publicId = extractPublicId(input.profile);
+        const actType = input.type || "all";
+
+        let result;
+        if (actType === "comments") {
+          result = await getPersonComments({ public_id: publicId, count: input.count, start: input.start });
+        } else if (actType === "posts") {
+          result = await getPersonPosts({ public_id: publicId, count: input.count, start: input.start });
+        } else {
+          result = await getPersonPosts({ public_id: publicId, count: input.count, start: input.start });
+        }
+
+        return toolResult({
+          profile: publicId,
+          activity_type: actType,
+          ...result,
+          rate_limit: getRateLimitStats(),
+        });
+      }
+
+      case "linkedin_intent_classify": {
+        const input = IntentClassifyInput.parse(args);
+        const result = await classifyIntent(input.text, {
+          person_name: input.person_name,
+          person_headline: input.person_headline,
+          activity_type: input.activity_type,
+          original_post: input.original_post,
+        });
+        return toolResult(result);
+      }
+
+      case "linkedin_prospect_save": {
+        const input = ProspectSaveInput.parse(args);
+        const prospect = addProspect({
+          name: input.name,
+          public_id: input.public_id,
+          headline: input.headline,
+          profile_url: input.profile_url,
+          company_name: input.company_name,
+          category: input.category,
+          tags: input.tags,
+          notes: input.notes,
+          source_company_id: input.source_company_id,
+        });
+        return toolResult({ saved: true, prospect });
+      }
+
+      case "linkedin_prospect_list": {
+        const input = ProspectListInput.parse(args);
+        const prospects = listProspects({
+          category: input.category,
+          source_company_id: input.source_company_id,
+          has_new_activity: input.has_new_activity,
+        });
+        return toolResult({ prospects, total: prospects.length });
+      }
+
+      case "linkedin_company_save": {
+        const input = CompanySaveInput.parse(args);
+        const companyId = extractCompanyId(input.company);
+        const company = addCompany({
+          name: input.name,
+          company_id: companyId,
+          company_url: input.company.includes("linkedin.com") ? input.company : `https://www.linkedin.com/company/${companyId}`,
+          type: input.type,
+          notes: input.notes,
+        });
+        return toolResult({ saved: true, company });
+      }
+
+      case "linkedin_company_list": {
+        const typeFilter = (args as Record<string, unknown>).type as string | undefined;
+        const companies = listCompanies(typeFilter);
+        return toolResult({ companies, total: companies.length });
+      }
+
+      case "linkedin_prospect_scan": {
+        const input = ProspectScanInput.parse(args);
+        const shouldClassify = input.classify !== false;
+
+        // Get prospects to scan
+        let prospects;
+        if (input.prospect_id) {
+          const p = getProspect(input.prospect_id);
+          prospects = p ? [p] : [];
+        } else {
+          prospects = listProspects({ category: input.category });
+        }
+
+        if (prospects.length === 0) {
+          return toolResult({ message: "No prospects to scan.", scanned: 0 });
+        }
+
+        const scanResults: Array<{
+          prospect_name: string;
+          public_id: string;
+          new_activities: number;
+          actionable: number;
+        }> = [];
+
+        for (const prospect of prospects) {
+          try {
+            // Fetch based on category
+            const isSales = prospect.category === "competitor_sales";
+            const activityResult = isSales
+              ? await getPersonComments({ public_id: prospect.public_id, count: 10 })
+              : await getPersonPosts({ public_id: prospect.public_id, count: 10 });
+
+            let newCount = 0;
+            let actionableCount = 0;
+
+            for (const activity of activityResult.activities) {
+              if (!activity.text) continue;
+
+              let classification = "irrelevant";
+              let confidence = 0;
+              let reasoning = "";
+
+              if (shouldClassify) {
+                const classResult = await classifyIntent(activity.text, {
+                  person_name: prospect.name,
+                  person_headline: prospect.headline,
+                  activity_type: activity.type,
+                  original_post: activity.original_post_text,
+                });
+                classification = classResult.classification;
+                confidence = classResult.confidence;
+                reasoning = classResult.reasoning;
+                if (classResult.is_actionable) actionableCount++;
+              }
+
+              addActivity({
+                prospect_id: prospect.id,
+                type: activity.type,
+                text: activity.text,
+                post_url: activity.post_url,
+                post_urn: activity.post_urn || "",
+                date: activity.date,
+                classification,
+                confidence,
+                reasoning,
+              });
+              newCount++;
+            }
+
+            updateProspectScanTime(prospect.public_id);
+
+            scanResults.push({
+              prospect_name: prospect.name,
+              public_id: prospect.public_id,
+              new_activities: newCount,
+              actionable: actionableCount,
+            });
+          } catch (err) {
+            log("warn", `Failed to scan ${prospect.name}: ${(err as Error).message}`);
+            scanResults.push({
+              prospect_name: prospect.name,
+              public_id: prospect.public_id,
+              new_activities: 0,
+              actionable: 0,
+            });
+          }
+        }
+
+        const totalNew = scanResults.reduce((s, r) => s + r.new_activities, 0);
+        const totalActionable = scanResults.reduce((s, r) => s + r.actionable, 0);
+
+        return toolResult({
+          scanned: scanResults.length,
+          total_new_activities: totalNew,
+          total_actionable: totalActionable,
+          results: scanResults,
+          rate_limit: getRateLimitStats(),
+        });
+      }
+
+      case "linkedin_activities_feed": {
+        const input = ActivitiesListInput.parse(args);
+        const activities = getNewActivities({
+          classification: input.classification,
+          prospect_id: input.prospect_id,
+          limit: input.limit,
+        });
+
+        // Enrich with prospect info
+        const enriched = activities.map((a) => {
+          const prospect = getProspect(a.prospect_id);
+          return {
+            ...a,
+            prospect_name: prospect?.name,
+            prospect_headline: prospect?.headline,
+            prospect_category: prospect?.category,
+            prospect_company: prospect?.company_name,
+          };
+        });
+
+        if (input.mark_reviewed && activities.length > 0) {
+          markActivitiesReviewed(activities.map((a) => a.id));
+        }
+
+        return toolResult({
+          activities: enriched,
+          total: enriched.length,
+          unreviewed_remaining: input.mark_reviewed
+            ? getNewActivities({}).length
+            : undefined,
+        });
+      }
+
+      case "linkedin_monitor_stats": {
+        const stats = getStats();
+        const scraperAuth = loadScraperAuth();
+        return toolResult({
+          ...stats,
+          scraper_authenticated: !!scraperAuth?.li_at,
+          scraper_auth_updated: scraperAuth?.updated_at,
+          rate_limit: getRateLimitStats(),
+        });
       }
 
       default:
