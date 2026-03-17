@@ -406,6 +406,8 @@ const AUTO_COMMENTS = {
 
   'sprawdznotariusza': 'SprawdzNotariusza.pl to side project zbudowany z Claude Code. Dane: Rejestr Cen Nieruchomości (publiczny, Ministerstwo Sprawiedliwości). 1745 miast, 10 341 notariuszy, wszystkie transakcje od 2013 roku. Mapa cen, ranking, wyszukiwarka. Sprawdź mediany cen w swoim mieście: https://sprawdznotariusza.pl',
 
+  'sprawdznotariusza2': 'Dane: Rejestr Cen Nieruchomości — publiczna baza Ministerstwa Sprawiedliwości. 1745 miast, 10 341 notariuszy, transakcje od 2013 roku. Zbudowane z Claude Code w weekend. Sprawdź ceny w swoim mieście: https://sprawdznotariusza.pl',
+
   'default': 'MCP tip: every MCP tool is composable — schedule a post, generate an image, add a comment, check algorithm guidelines — all in one natural language conversation with your AI assistant. Source: https://github.com/gacabartosz/linkedin-mcp-server',
 };
 
@@ -437,6 +439,7 @@ const POST_IDENTIFIERS = {
   '15 minut na jedną korektę w KSeF': 'ksef2',
   'I built 30 MCP tools for Poland': 'ksef3',
   'Kuzyn z biura nieruchomości': 'sprawdznotariusza',
+  'Rejestr Cen Nieruchomości to baza': 'sprawdznotariusza2',
   'Wyslalem fakture korygujaca w EUR do KSeF': 'ksef4',
   'Wysłałem fakturę korygującą w EUR do KSeF': 'ksef4',
 };
@@ -464,6 +467,7 @@ const POST_IMAGES = {
   'ksef2': join(IMG_DIR, 'ksef-banner.png'),
   'ksef3': join(IMG_DIR, 'ksef-banner.png'),
   'ksef4': join(IMG_DIR, 'ksef-banner.png'),
+  'sprawdznotariusza2': join(IMG_DIR, 'sprawdznotariusza-slideshow.mp4'),
 };
 
 // Map post keys → carousel PDF paths (uploaded as documents, 303% more engagement)
@@ -566,10 +570,16 @@ async function checkAndPublish() {
             }
           }
         } else if (mediaUrns.length > 0) {
-          // Pre-loaded media_ids from SQLite — determine category from URN content
-          // Default to IMAGE; caller should have set appropriate URNs
-          mediaCategory = 'IMAGE';
-          log(`  Using ${mediaUrns.length} pre-loaded media URN(s) from DB`);
+          // Pre-loaded media_ids from SQLite — detect category from post config or default
+          const postImagePath = postKey && POST_IMAGES[postKey];
+          const postCarouselPath = postKey && POST_CAROUSELS[postKey];
+          const hintPath = postCarouselPath || postImagePath;
+          if (hintPath && isVideoFile(hintPath)) {
+            mediaCategory = 'VIDEO';
+          } else {
+            mediaCategory = 'IMAGE';
+          }
+          log(`  Using ${mediaUrns.length} pre-loaded media URN(s) from DB (category=${mediaCategory})`);
         }
 
         // Create post (with or without media)
