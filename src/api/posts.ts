@@ -25,11 +25,19 @@ export async function createPost(options: PostCreateOptions): Promise<{
   post_urn: string;
   created_at: string;
 }> {
+  // If media_ids contain digitalmediaAsset URNs, go straight to ugcPosts
+  // (the /rest/posts API only accepts urn:li:image/video/document URNs)
+  const hasAssetUrns = options.media_ids?.some((id) => id.includes(":digitalmediaAsset:"));
+  if (hasAssetUrns) {
+    log("info", "Media contains digitalmediaAsset URNs — using v2/ugcPosts directly");
+    return await createPostUgc(options);
+  }
+
   try {
     return await createPostRest(options);
   } catch (err) {
-    if (err instanceof LinkedInApiError && err.status === 403) {
-      log("info", "Falling back to v2/ugcPosts API");
+    if (err instanceof LinkedInApiError && (err.status === 403 || err.status === 422)) {
+      log("info", `Falling back to v2/ugcPosts API (REST returned ${err.status})`);
       return await createPostUgc(options);
     }
     throw err;
