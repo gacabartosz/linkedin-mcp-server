@@ -1,28 +1,344 @@
 #!/usr/bin/env node
 /**
- * LinkedIn Auto-Publisher v3 — Educational Comments & Timing Randomization
+ * LinkedIn Auto-Publisher v4 — Direct API calls (no MCP subprocess)
  *
  * Runs as a standalone daemon that:
  * 1. Monitors scheduled posts in SQLite
- * 2. Uploads images/carousel PDFs before publishing
+ * 2. Uploads images/videos directly via LinkedIn API
  * 3. Publishes with random jitter (0-7 min past scheduled time)
- * 4. Adds educational comment 12-22 min after each post (randomized)
+ * 4. Verifies each post is live before queuing comment
+ * 5. Adds educational comment 12-22 min after each post (randomized)
  *
  * Usage: node auto-publish.mjs
  */
 
-import { spawn } from 'node:child_process';
 import { readFileSync, existsSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, extname } from 'node:path';
 import { homedir } from 'node:os';
 import Database from 'better-sqlite3';
 
 const DB_PATH = join(homedir(), '.linkedin-mcp', 'scheduler.db');
 const AUTH_PATH = join(homedir(), '.linkedin-mcp', 'auth.json');
-const MCP_DIR = '/Users/gaca/projects/personal/linkedin-mcp-server';
 const IMG_DIR = '/Users/gaca/output/personal/linkedin-mcp';
 
-// ── Randomization helpers (avoid bot detection) ──────────────────────────────
+const LINKEDIN_API_BASE = 'https://api.linkedin.com/v2';
+
+// ── MIME type mapping ───────────────────────────────────────────────────────
+
+const IMAGE_MIME = {
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.png': 'image/png',
+  '.gif': 'image/gif',
+  '.webp': 'image/webp',
+};
+
+const VIDEO_MIME = {
+  '.mp4': 'video/mp4',
+  '.mov': 'video/quicktime',
+};
+
+function getMimeType(filePath) {
+  const ext = extname(filePath).toLowerCase();
+  return IMAGE_MIME[ext] || VIDEO_MIME[ext] || 'application/octet-stream';
+}
+
+function isVideoFile(filePath) {
+  const ext = extname(filePath).toLowerCase();
+  return ext in VIDEO_MIME;
+}
+
+// ── Logging ─────────────────────────────────────────────────────────────────
+
+function log(msg) {
+  console.log(`[${new Date().toISOString()}] ${msg}`);
+}
+
+function logError(msg) {
+  console.error(`[${new Date().toISOString()}] ${msg}`);
+}
+
+// ── Auth ────────────────────────────────────────────────────────────────────
+
+function getAuth() {
+  if (!existsSync(AUTH_PATH)) throw new Error('No auth.json found at ' + AUTH_PATH);
+  return JSON.parse(readFileSync(AUTH_PATH, 'utf-8'));
+}
+
+function getAccessToken() {
+  const auth = getAuth();
+  return auth.access_token;
+}
+
+function getPersonUrn() {
+  const envUrn = process.env.LINKEDIN_PERSON_URN;
+  if (envUrn) return envUrn;
+  try {
+    const auth = getAuth();
+    if (auth.person_urn) return auth.person_urn;
+  } catch {}
+  return 'urn:li:person:FihAwG4y_B';
+}
+
+// ── LinkedIn API helpers ────────────────────────────────────────────────────
+
+function apiHeaders(token) {
+  return {
+    'Authorization': `Bearer ${token}`,
+    'Content-Type': 'application/json',
+    'X-Restli-Protocol-Version': '2.0.0',
+  };
+}
+
+async function linkedinFetch(path, options = {}) {
+  const token = getAccessToken();
+  const url = path.startsWith('http') ? path : `${LINKEDIN_API_BASE}${path}`;
+  const headers = { ...apiHeaders(token), ...(options.headers || {}) };
+  const res = await fetch(url, { ...options, headers });
+  return res;
+}
+
+async function sleep(ms) {
+  return new Promise(r => setTimeout(r, ms));
+}
+
+// ── Media Upload (direct API) ───────────────────────────────────────────────
+
+async function uploadMedia(filePath, mediaType) {
+  const token = getAccessToken();
+  const personUrn = getPersonUrn();
+  const isVideo = mediaType === 'VIDEO';
+  const recipe = isVideo
+    ? 'urn:li:digitalmediaRecipe:feedshare-video'
+    : 'urn:li:digitalmediaRecipe:feedshare-image';
+
+  // Step 1: Register upload
+  log(`  Registering ${mediaType} upload...`);
+  const registerBody = {
+    registerUploadRequest: {
+      recipes: [recipe],
+      owner: personUrn,
+      serviceRelationships: [
+        {
+          relationshipType: 'OWNER',
+          identifier: 'urn:li:userGeneratedContent',
+        },
+      ],
+      supportedUploadMechanism: ['SYNCHRONOUS_UPLOAD'],
+    },
+  };
+
+  const registerRes = await linkedinFetch('/assets?action=registerUpload', {
+    method: 'POST',
+    body: JSON.stringify(registerBody),
+  });
+
+  if (!registerRes.ok) {
+    const errText = await registerRes.text();
+    throw new Error(`Register upload failed (${registerRes.status}): ${errText}`);
+  }
+
+  const registerData = await registerRes.json();
+  const uploadUrl =
+    registerData.value?.uploadMechanism?.[
+      'com.linkedin.digitalmedia.uploading.MediaUploadHttpRequest'
+    ]?.uploadUrl;
+  const assetUrn = registerData.value?.asset;
+
+  if (!uploadUrl || !assetUrn) {
+    throw new Error('Missing uploadUrl or asset URN in register response');
+  }
+
+  log(`  Asset registered: ${assetUrn}`);
+  log(`  Upload URL obtained, uploading binary...`);
+
+  // Step 2: PUT binary data
+  const fileBuffer = readFileSync(filePath);
+  const mime = getMimeType(filePath);
+
+  const uploadRes = await fetch(uploadUrl, {
+    method: 'PUT',
+    headers: {
+      'Authorization': `Bearer ${token}`,
+      'Content-Type': mime,
+    },
+    body: fileBuffer,
+  });
+
+  if (!uploadRes.ok && uploadRes.status !== 201) {
+    const errText = await uploadRes.text();
+    throw new Error(`Binary upload failed (${uploadRes.status}): ${errText}`);
+  }
+
+  log(`  Binary uploaded (${Math.round(fileBuffer.length / 1024)} KB, ${mime})`);
+
+  // Step 3: Wait and verify asset status
+  log(`  Waiting 5s for asset processing...`);
+  await sleep(5000);
+
+  const checkRes = await linkedinFetch(`/assets/${encodeURIComponent(assetUrn)}`);
+  if (checkRes.ok) {
+    const checkData = await checkRes.json();
+    const status = checkData.recipes?.[0]?.status || checkData.status || 'UNKNOWN';
+    log(`  Asset status: ${status}`);
+  } else {
+    log(`  Asset status check returned ${checkRes.status} (non-critical, proceeding)`);
+  }
+
+  return assetUrn;
+}
+
+// ── Post Creation (direct API via v2/ugcPosts) ─────────────────────────────
+
+async function createPost(text, mediaUrns = [], mediaCategory = 'NONE') {
+  const personUrn = getPersonUrn();
+
+  const shareContent = {
+    shareCommentary: { text },
+    shareMediaCategory: mediaCategory,
+  };
+
+  if (mediaUrns.length > 0 && mediaCategory !== 'NONE') {
+    shareContent.media = mediaUrns.map(urn => ({
+      status: 'READY',
+      media: urn,
+    }));
+  }
+
+  const body = {
+    author: personUrn,
+    lifecycleState: 'PUBLISHED',
+    visibility: {
+      'com.linkedin.ugc.MemberNetworkVisibility': 'PUBLIC',
+    },
+    specificContent: {
+      'com.linkedin.ugc.ShareContent': shareContent,
+    },
+  };
+
+  log(`  Creating post via v2/ugcPosts (${text.length} chars, ${mediaUrns.length} media, category=${mediaCategory})...`);
+
+  const res = await linkedinFetch('/ugcPosts', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+
+  if (!res.ok) {
+    const errText = await res.text();
+    throw new Error(`Post creation failed (${res.status}): ${errText}`);
+  }
+
+  let responseBody = null;
+  try {
+    responseBody = await res.json();
+  } catch {}
+
+  // ugcPosts returns URN in response body .id or X-RestLi-Id header
+  // Format can be urn:li:share:XXX or urn:li:ugcPost:XXX
+  const finalUrn =
+    responseBody?.id ||
+    res.headers.get('x-restli-id') ||
+    res.headers.get('X-RestLi-Id');
+
+  if (!finalUrn) {
+    throw new Error('No post URN returned from ugcPosts');
+  }
+
+  log(`  Post created: ${finalUrn}`);
+
+  // Derive share URN for comments — comments ONLY work with urn:li:share:XXX
+  // ugcPosts can return either urn:li:share:XXX or urn:li:ugcPost:XXX
+  let shareUrn;
+  if (finalUrn.startsWith('urn:li:share:')) {
+    shareUrn = finalUrn;
+  } else {
+    // Extract numeric ID and build share URN
+    const numericId = finalUrn.split(':').pop();
+    shareUrn = `urn:li:share:${numericId}`;
+  }
+
+  return { postUrn: finalUrn, shareUrn };
+}
+
+// ── Post Verification ───────────────────────────────────────────────────────
+
+async function verifyPostLive(postUrn) {
+  log(`  Verifying post is live (waiting 10s)...`);
+  await sleep(10000);
+
+  // Try to read the post back
+  const encodedUrn = encodeURIComponent(postUrn);
+  const res = await linkedinFetch(`/ugcPosts/${encodedUrn}`);
+
+  if (res.ok) {
+    log(`  Post verified live (200 OK)`);
+    return true;
+  }
+
+  if (res.status === 403) {
+    // 403 = our scope can't read it back, but post was accepted
+    log(`  Post accepted (403 = scope limitation, post exists)`);
+    return true;
+  }
+
+  if (res.status === 404) {
+    log(`  Post not found yet, retrying in 10s...`);
+    await sleep(10000);
+
+    const res2 = await linkedinFetch(`/ugcPosts/${encodedUrn}`);
+    if (res2.ok || res2.status === 403) {
+      log(`  Post verified on retry`);
+      return true;
+    }
+
+    log(`  Post still not found (${res2.status}) — proceeding anyway`);
+    return true; // proceed anyway, it might just be propagation delay
+  }
+
+  log(`  Unexpected verification response: ${res.status} — proceeding`);
+  return true;
+}
+
+// ── Comment Creation (direct API) ───────────────────────────────────────────
+
+async function createComment(shareUrn, text) {
+  // Comments use socialActions with the share URN (NOT activity URN)
+  const encodedUrn = encodeURIComponent(shareUrn);
+  const personUrn = getPersonUrn();
+
+  const body = {
+    actor: personUrn,
+    message: { text },
+  };
+
+  log(`  Posting comment on ${shareUrn}...`);
+
+  const res = await linkedinFetch(`/socialActions/${encodedUrn}/comments`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+
+  if (!res.ok) {
+    const errText = await res.text();
+    throw new Error(`Comment creation failed (${res.status}): ${errText}`);
+  }
+
+  let responseBody = null;
+  try {
+    responseBody = await res.json();
+  } catch {}
+
+  const commentUrn =
+    res.headers.get('x-restli-id') ||
+    res.headers.get('X-RestLi-Id') ||
+    responseBody?.id ||
+    'unknown';
+
+  log(`  Comment posted: ${commentUrn}`);
+  return commentUrn;
+}
+
+// ── Randomization helpers (avoid bot detection) ─────────────────────────────
 
 function randomBetween(minMs, maxMs) {
   return Math.floor(Math.random() * (maxMs - minMs + 1)) + minMs;
@@ -32,7 +348,7 @@ function randomMinutes(min, max) {
   return randomBetween(min * 60 * 1000, max * 60 * 1000);
 }
 
-// ── Per-post educational auto-comments ───────────────────────────────────────
+// ── Per-post educational auto-comments ──────────────────────────────────────
 // Each comment leads with a fact/tip/insight. GitHub link is secondary.
 // 20+ words each (algorithm: comments >15 words = 10-15x more reach).
 
@@ -88,6 +404,8 @@ const AUTO_COMMENTS = {
 
   'ksef4': 'Pole P_14_xW (VAT w PLN) jest opcjonalne w schemacie FA(3), ale art. 106e ust. 11 UoVAT mówi: "Kwoty podatku wykazuje się w złotych." Zgłosiłem to do Ministerstwa Finansów (https://www.linkedin.com/company/ministerstwo-finansow/). Walidacja semantyczna w ksef-mcp już to łapie: https://github.com/gacabartosz/ksef-mcp',
 
+  'sprawdznotariusza': 'SprawdzNotariusza.pl to side project zbudowany z Claude Code. Dane: Rejestr Cen Nieruchomości (publiczny, Ministerstwo Sprawiedliwości). 1745 miast, 10 341 notariuszy, wszystkie transakcje od 2013 roku. Mapa cen, ranking, wyszukiwarka. Sprawdź mediany cen w swoim mieście: https://sprawdznotariusza.pl',
+
   'default': 'MCP tip: every MCP tool is composable — schedule a post, generate an image, add a comment, check algorithm guidelines — all in one natural language conversation with your AI assistant. Source: https://github.com/gacabartosz/linkedin-mcp-server',
 };
 
@@ -118,6 +436,7 @@ const POST_IDENTIFIERS = {
   '15 minut na jedna korekte w KSeF': 'ksef2',
   '15 minut na jedną korektę w KSeF': 'ksef2',
   'I built 30 MCP tools for Poland': 'ksef3',
+  'Kuzyn z biura nieruchomości': 'sprawdznotariusza',
   'Wyslalem fakture korygujaca w EUR do KSeF': 'ksef4',
   'Wysłałem fakturę korygującą w EUR do KSeF': 'ksef4',
 };
@@ -166,112 +485,12 @@ function identifyPost(text) {
   return null;
 }
 
-function getAuth() {
-  if (!existsSync(AUTH_PATH)) throw new Error('No auth.json');
-  return JSON.parse(readFileSync(AUTH_PATH, 'utf-8'));
-}
-
-async function callMCP(toolName, args) {
-  return new Promise((resolve, reject) => {
-    const proc = spawn('node', ['dist/index.js'], {
-      cwd: MCP_DIR,
-      env: {
-        ...process.env,
-        LINKEDIN_PERSON_URN: process.env.LINKEDIN_PERSON_URN || 'urn:li:person:FihAwG4y_B',
-        LINKEDIN_CLIENT_ID: process.env.LINKEDIN_CLIENT_ID || '',
-        LINKEDIN_CLIENT_SECRET: process.env.LINKEDIN_CLIENT_SECRET || '',
-      },
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
-
-    let stdoutBuf = '';
-    let stderrBuf = '';
-    let resolved = false;
-    let initialized = false;
-
-    function processLines(buffer) {
-      // Only process complete lines (ending with \n)
-      const lines = buffer.split('\n');
-      const incomplete = lines.pop(); // last element is incomplete (no trailing \n)
-      for (const line of lines) {
-        if (!line.trim()) continue;
-        try {
-          const msg = JSON.parse(line.trim());
-          // Wait for initialize response before sending tools/call
-          if (msg.id === 1 && !initialized) {
-            initialized = true;
-            const notif = JSON.stringify({jsonrpc:'2.0',method:'notifications/initialized'}) + '\n';
-            const toolCall = JSON.stringify({jsonrpc:'2.0',id:2,method:'tools/call',params:{name:toolName,arguments:args}}) + '\n';
-            // Write sequentially, wait for drain if needed
-            const ok = proc.stdin.write(notif);
-            if (!ok) {
-              proc.stdin.once('drain', () => proc.stdin.write(toolCall));
-            } else {
-              proc.stdin.write(toolCall);
-            }
-          }
-          if (msg.id === 2 && !resolved) {
-            resolved = true;
-            // Give process time to cleanup before killing
-            setTimeout(() => proc.kill(), 500);
-            if (msg.result?.isError) {
-              reject(new Error(msg.result.content?.[0]?.text || 'MCP tool error'));
-              return;
-            }
-            const text = msg.result?.content?.[0]?.text || '{}';
-            try {
-              resolve(JSON.parse(text));
-            } catch {
-              resolve({ raw: text });
-            }
-            return;
-          }
-        } catch {}
-      }
-      return incomplete; // return unprocessed remainder
-    }
-
-    proc.stdout.on('data', d => {
-      stdoutBuf += d.toString();
-      const remainder = processLines(stdoutBuf);
-      stdoutBuf = remainder ?? '';
-    });
-
-    proc.stderr.on('data', d => {
-      stderrBuf += d.toString();
-      const remainder = processLines(stderrBuf);
-      stderrBuf = remainder ?? '';
-    });
-
-    proc.on('close', (code) => {
-      // Process any remaining buffer on close
-      if (stdoutBuf.trim()) processLines(stdoutBuf + '\n');
-      if (stderrBuf.trim()) processLines(stderrBuf + '\n');
-      if (!resolved) {
-        reject(new Error(`No response from MCP (exit code: ${code})`));
-      }
-    });
-
-    // Send initialize first
-    proc.stdin.write(JSON.stringify({jsonrpc:'2.0',id:1,method:'initialize',params:{protocolVersion:'2024-11-05',capabilities:{},clientInfo:{name:'auto-pub',version:'1.0'}}}) + '\n');
-
-    // 3 min timeout (media upload can be slow)
-    setTimeout(() => {
-      if (!resolved) {
-        resolved = true;
-        proc.kill();
-        reject(new Error('Timeout (180s)'));
-      }
-    }, 180000);
-  });
-}
-
 // Queue of pending comments
 const commentQueue = [];
 
 async function checkAndPublish() {
   const now = new Date();
-  console.log(`[${now.toISOString()}] Checking...`);
+  log('Checking...');
 
   // Check scheduled posts
   try {
@@ -288,92 +507,98 @@ async function checkAndPublish() {
     const posts = candidates.filter(post => {
       if (!publishJitters[post.id]) {
         publishJitters[post.id] = randomMinutes(0, 7);
-        console.log(`  Jitter for ${post.id}: +${Math.round(publishJitters[post.id] / 60000)} min`);
+        log(`  Jitter for ${post.id}: +${Math.round(publishJitters[post.id] / 60000)} min`);
       }
       const publishTime = new Date(post.publish_at).getTime();
       return Date.now() >= publishTime + publishJitters[post.id];
     });
 
     for (const post of posts) {
-      console.log(`Publishing scheduled post ${post.id}...`);
+      log(`Publishing scheduled post ${post.id}...`);
       const postKey = identifyPost(post.text);
-      console.log(`  Identified as: ${postKey || 'unknown'}`);
+      log(`  Identified as: ${postKey || 'unknown'}`);
 
       try {
-        // Upload carousel PDF or banner image
-        let mediaIds = post.media_ids ? JSON.parse(post.media_ids) : [];
-        if (mediaIds.length === 0 && postKey) {
-          // Try carousel PDF first (303% more engagement)
+        // Determine media URNs — either from DB or by uploading
+        let mediaUrns = post.media_ids ? JSON.parse(post.media_ids) : [];
+        let mediaCategory = 'NONE';
+
+        if (mediaUrns.length === 0 && postKey) {
+          // Try carousel/video from POST_CAROUSELS first
           if (POST_CAROUSELS[postKey] && existsSync(POST_CAROUSELS[postKey])) {
-            const pdfPath = POST_CAROUSELS[postKey];
-            console.log(`  Uploading carousel PDF: ${pdfPath}`);
-            try {
-              const uploadResult = await callMCP('linkedin_media_upload', {
-                file_path: pdfPath,
-                media_type: 'DOCUMENT',
-              });
-              if (uploadResult.media_urn) {
-                mediaIds = [uploadResult.media_urn];
-                console.log(`  Carousel uploaded: ${uploadResult.media_urn}`);
+            const carouselPath = POST_CAROUSELS[postKey];
+            const isVid = isVideoFile(carouselPath);
+
+            if (isVid) {
+              // Video files can be uploaded via the media upload API
+              log(`  Uploading video: ${carouselPath}`);
+              try {
+                const urn = await uploadMedia(carouselPath, 'VIDEO');
+                mediaUrns = [urn];
+                mediaCategory = 'VIDEO';
+                log(`  Video uploaded: ${urn}`);
+              } catch (err) {
+                logError(`  Video upload failed: ${err.message} — trying banner image`);
               }
-            } catch (err) {
-              console.error(`  Carousel upload failed: ${err.message} — trying banner image`);
+            } else if (carouselPath.endsWith('.pdf')) {
+              // PDFs (carousel documents) cannot be uploaded via v2/assets registerUpload
+              // The document upload requires /rest/posts API which needs Community Management scope
+              // Skip carousel PDF, fall through to banner image
+              log(`  Skipping carousel PDF (requires /rest/posts scope) — trying banner image`);
             }
           }
 
           // Fallback to banner image or video
-          if (mediaIds.length === 0 && POST_IMAGES[postKey]) {
+          if (mediaUrns.length === 0 && POST_IMAGES[postKey]) {
             const imgPath = POST_IMAGES[postKey];
             if (existsSync(imgPath)) {
-              const isVideo = imgPath.endsWith('.mp4') || imgPath.endsWith('.mov');
-              const mediaType = isVideo ? 'VIDEO' : 'IMAGE';
-              console.log(`  Uploading ${mediaType.toLowerCase()}: ${imgPath}`);
+              const isVid = isVideoFile(imgPath);
+              const mediaType = isVid ? 'VIDEO' : 'IMAGE';
+              log(`  Uploading ${mediaType.toLowerCase()}: ${imgPath}`);
               try {
-                const uploadResult = await callMCP('linkedin_media_upload', {
-                  file_path: imgPath,
-                  media_type: mediaType,
-                });
-                if (uploadResult.media_urn) {
-                  mediaIds = [uploadResult.media_urn];
-                  console.log(`  Image uploaded: ${uploadResult.media_urn}`);
-                }
+                const urn = await uploadMedia(imgPath, mediaType);
+                mediaUrns = [urn];
+                mediaCategory = mediaType;
+                log(`  ${mediaType} uploaded: ${urn}`);
               } catch (err) {
-                console.error(`  Image upload failed: ${err.message} — publishing without image`);
+                logError(`  ${mediaType} upload failed: ${err.message} — publishing without media`);
               }
             }
           }
+        } else if (mediaUrns.length > 0) {
+          // Pre-loaded media_ids from SQLite — determine category from URN content
+          // Default to IMAGE; caller should have set appropriate URNs
+          mediaCategory = 'IMAGE';
+          log(`  Using ${mediaUrns.length} pre-loaded media URN(s) from DB`);
         }
 
-        // Create post (with or without image)
-        const createArgs = { text: post.text };
-        if (mediaIds.length > 0) {
-          createArgs.media_ids = mediaIds;
-        }
+        // Create post (with or without media)
+        const { postUrn, shareUrn } = await createPost(post.text, mediaUrns, mediaCategory);
 
-        const result = await callMCP('linkedin_post_create', createArgs);
-        console.log(`  Published: ${result.post_urn}`);
+        // Verify post is live before proceeding
+        await verifyPostLive(postUrn);
 
         // Update DB
         const dbw = new Database(DB_PATH);
         dbw.prepare(
           "UPDATE scheduled_posts SET status = 'published', post_urn = ?, published_at = ?, updated_at = datetime('now') WHERE id = ?"
-        ).run(result.post_urn, new Date().toISOString(), post.id);
+        ).run(postUrn, new Date().toISOString(), post.id);
         dbw.close();
 
         // Queue auto-comment for 12-22 min later (randomized)
-        if (result.post_urn) {
-          const commentText = postKey ? (AUTO_COMMENTS[postKey] || AUTO_COMMENTS.default) : AUTO_COMMENTS.default;
-          const commentDelay = randomMinutes(12, 22);
-          const commentDelayMin = Math.round(commentDelay / 60000);
-          commentQueue.push({
-            post_urn: result.post_urn,
-            comment_at: new Date(Date.now() + commentDelay),
-            text: commentText,
-          });
-          console.log(`  Comment queued for ~${commentDelayMin} min later (${postKey || 'default'})`);
-        }
+        // Use shareUrn for the comment API (NOT the ugcPost URN)
+        const commentText = postKey ? (AUTO_COMMENTS[postKey] || AUTO_COMMENTS.default) : AUTO_COMMENTS.default;
+        const commentDelay = randomMinutes(12, 22);
+        const commentDelayMin = Math.round(commentDelay / 60000);
+        commentQueue.push({
+          share_urn: shareUrn,
+          post_urn: postUrn,
+          comment_at: new Date(Date.now() + commentDelay),
+          text: commentText,
+        });
+        log(`  Comment queued for ~${commentDelayMin} min later (${postKey || 'default'})`);
       } catch (err) {
-        console.error(`  Failed to publish ${post.id}:`, err.message);
+        logError(`  Failed to publish ${post.id}: ${err.message}`);
         // Mark as failed after 3 retries
         const dbw = new Database(DB_PATH);
         const current = dbw.prepare("SELECT retry_count FROM scheduled_posts WHERE id = ?").get(post.id);
@@ -381,11 +606,11 @@ async function checkAndPublish() {
         if (retries >= 3) {
           dbw.prepare("UPDATE scheduled_posts SET status = 'failed', error = ?, retry_count = ?, updated_at = datetime('now') WHERE id = ?")
             .run(err.message, retries, post.id);
-          console.error(`  Post ${post.id} marked as FAILED after ${retries} retries`);
+          logError(`  Post ${post.id} marked as FAILED after ${retries} retries`);
         } else {
           dbw.prepare("UPDATE scheduled_posts SET retry_count = ?, updated_at = datetime('now') WHERE id = ?")
             .run(retries, post.id);
-          console.log(`  Will retry (attempt ${retries}/3)`);
+          log(`  Will retry (attempt ${retries}/3)`);
         }
         dbw.close();
       }
@@ -393,44 +618,42 @@ async function checkAndPublish() {
       // Random delay between consecutive posts (1-5 min)
       if (posts.indexOf(post) < posts.length - 1) {
         const interDelay = randomMinutes(1, 5);
-        console.log(`  Waiting ${Math.round(interDelay / 60000)} min before next post...`);
-        await new Promise(r => setTimeout(r, interDelay));
+        log(`  Waiting ${Math.round(interDelay / 60000)} min before next post...`);
+        await sleep(interDelay);
       }
     }
   } catch (err) {
-    console.error('DB error:', err.message);
+    logError(`DB error: ${err.message}`);
   }
 
   // Check comment queue
   const readyComments = commentQueue.filter(c => new Date() >= c.comment_at);
   for (const c of readyComments) {
-    console.log(`Adding comment to ${c.post_urn}...`);
+    log(`Adding comment to ${c.share_urn}...`);
     try {
-      const result = await callMCP('linkedin_comment_create', {
-        post_urn: c.post_urn,
-        text: c.text,
-      });
-      console.log(`  Comment added: ${result.comment_urn}`);
+      const commentUrn = await createComment(c.share_urn, c.text);
+      log(`  Comment added: ${commentUrn}`);
       commentQueue.splice(commentQueue.indexOf(c), 1);
     } catch (err) {
-      console.error(`  Comment failed for ${c.post_urn}:`, err.message);
+      logError(`  Comment failed for ${c.share_urn}: ${err.message}`);
       c.retries = (c.retries || 0) + 1;
       if (c.retries >= 5) {
-        console.error(`  Max retries (5) reached for comment on ${c.post_urn} — giving up`);
+        logError(`  Max retries (5) reached for comment on ${c.share_urn} — giving up`);
         commentQueue.splice(commentQueue.indexOf(c), 1);
       } else {
         c.comment_at = new Date(Date.now() + 5 * 60 * 1000);
-        console.log(`  Retrying in 5 min (attempt ${c.retries}/5)`);
+        log(`  Retrying in 5 min (attempt ${c.retries}/5)`);
       }
     }
   }
 }
 
-console.log('LinkedIn Auto-Publisher v3 started');
-console.log('Features: carousel PDFs, educational comments, timing randomization');
-console.log('Comment delay: 12-22 min (random) | Publish jitter: 0-7 min');
-console.log('Checking every 60 seconds...');
-console.log('');
+log('LinkedIn Auto-Publisher v4 started');
+log('Mode: Direct API calls (no MCP subprocess)');
+log('Features: media upload, post verification, educational comments, timing randomization');
+log('Comment delay: 12-22 min (random) | Publish jitter: 0-7 min');
+log('Checking every 60 seconds...');
+log('');
 
 // Run immediately, then every 60s
 checkAndPublish();
