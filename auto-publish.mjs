@@ -412,7 +412,20 @@ const AUTO_COMMENTS = {
 
   'sprawdznotariusza2': 'Dane: Rejestr Cen Nieruchomości — publiczna baza Ministerstwa Sprawiedliwości. 1745 miast, 10 341 notariuszy, transakcje od 2013 roku. Zbudowane z Claude Code w weekend. Sprawdź ceny w swoim mieście: https://sprawdznotariusza.pl',
 
-  'default': 'MCP tip: every MCP tool is composable — schedule a post, generate an image, add a comment, check algorithm guidelines — all in one natural language conversation with your AI assistant. Source: https://github.com/gacabartosz/linkedin-mcp-server',
+  // v2 rewritten posts (storytelling, no spam links)
+  'mcp-tutorial': 'MCP to standard integracji AI z narzędziami. Stdio transport = zero latencji. Zod walidacja = bezpieczne parametry. Handler to 20 linii kodu. Budujesz raz — działa z Claude Code, Cursor, Windsurf, dowolnym klientem MCP. Jeśli chcesz zobaczyć jak wygląda pełny serwer: github.com/gacabartosz/linkedin-mcp-server',
+
+  'ksef-mcp-v2': 'KSeF to system Ministerstwa Finansów. Każda firma w Polsce musi przez niego wysyłać faktury. API jest skomplikowane — RSA-OAEP + AES-256-CBC szyfrowanie, batche w ZIP, weryfikacja UPO. ksef-mcp opakowuje to w 30 narzędzi MCP. MIT license: github.com/gacabartosz/ksef-mcp',
+
+  '3weeks-results': 'Dane z 3 tygodni automatycznego postowania: posty po polsku miały 2x więcej komentarzy niż angielskie. Posty o porażkach — 3x więcej niż o sukcesach. Screenshoty z terminala > generowane bannery. Listicle ("5 tips") = zero engagement. Wnioski z realnych danych, nie z poradników.',
+
+  'rodo-presidio': 'Presidio to silnik NER od Microsoftu — rozpoznaje 50+ typów danych osobowych w tekście. Moje rozszerzenie Chrome uruchamia go lokalnie w przeglądarce, przechwytuje schowek i anonimizuje dane PRZED wklejeniem. Zero chmury, zero transferu danych. Działa offline: github.com/gacabartosz/presidio-local-anonymizer',
+
+  'gmail-cleanup': 'Google Workspace MCP to open source serwer do Gmail i Drive. Działa z Claude Code i każdym klientem MCP. Jeden prompt tworzy foldery, przenosi pliki, ustawia etykiety i filtry. Nie eksportuje danych — operuje bezpośrednio na API. Repo: github.com/taylorwilsdon/google_workspace_mcp',
+
+  'mcp-intro': 'MCP (Model Context Protocol) to standard od Anthropic. Transport: stdio, SSE, WebSocket. Format: JSON-RPC 2.0. Budowa narzędzia: 20-50 linii TypeScript. Zero frontendu, zero deploy. Narzędzia komponują się automatycznie — AI decyduje które i w jakiej kolejności użyć. Moje serwery MCP: github.com/gacabartosz',
+
+  'default': 'MCP tip: każde narzędzie MCP jest komponowalne — AI samo decyduje które użyć i w jakiej kolejności. Budujesz raz, działa z każdym klientem MCP.',
 };
 
 // Map post text snippets → post keys for comment lookup
@@ -445,6 +458,13 @@ const POST_IDENTIFIERS = {
   'Kuzyn z biura nieruchomości': 'sprawdznotariusza',
   'Rejestr Cen Nieruchomości to baza': 'sprawdznotariusza2',
   'Wyslalem fakture korygujaca w EUR do KSeF': 'ksef4',
+  // v2 rewritten posts
+  'MCP server w 2 godziny': 'mcp-tutorial',
+  'Przez pomyłkę wysłałem duplikat faktury do KSeF': 'ksef-mcp-v2',
+  'Przez 3 tygodnie publikowałem na LinkedIn': '3weeks-results',
+  'Kopiujesz dane klientów do ChatGPT': 'rodo-presidio',
+  'Mój Gmail miał 25 000 maili': 'gmail-cleanup',
+  'Napisałem w Claude': 'mcp-intro',
   'Wysłałem fakturę korygującą w EUR do KSeF': 'ksef4',
 };
 

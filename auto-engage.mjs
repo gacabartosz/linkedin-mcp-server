@@ -244,25 +244,30 @@ function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 async function callMCP(toolName, args) {
   return new Promise((resolve, reject) => {
-    const msgs = [
-      JSON.stringify({jsonrpc:'2.0',id:1,method:'initialize',params:{protocolVersion:'2024-11-05',capabilities:{},clientInfo:{name:'auto-engage',version:'2.0'}}}),
-      JSON.stringify({jsonrpc:'2.0',id:2,method:'tools/call',params:{name:toolName,arguments:args}}),
-    ].join('\n');
-
     const proc = spawn('node', ['dist/index.js'], {
       cwd: MCP_DIR,
-      env: { ...process.env, LINKEDIN_PERSON_URN: PERSON_URN },
+      env: {
+        ...process.env,
+        LINKEDIN_PERSON_URN: PERSON_URN,
+        LINKEDIN_CLIENT_ID: process.env.LINKEDIN_CLIENT_ID || '',
+        LINKEDIN_CLIENT_SECRET: process.env.LINKEDIN_CLIENT_SECRET || '',
+      },
       stdio: ['pipe', 'pipe', 'pipe'],
     });
 
     let out = '';
     let resolved = false;
+    let initialized = false;
 
-    proc.stdout.on('data', d => {
-      out += d.toString();
-      for (const line of out.split('\n')) {
+    function tryParse(buffer) {
+      for (const line of buffer.split('\n')) {
         try {
           const msg = JSON.parse(line.trim());
+          if (msg.id === 1 && !initialized) {
+            initialized = true;
+            proc.stdin.write(JSON.stringify({jsonrpc:'2.0',method:'notifications/initialized'}) + '\n');
+            proc.stdin.write(JSON.stringify({jsonrpc:'2.0',id:2,method:'tools/call',params:{name:toolName,arguments:args}}) + '\n');
+          }
           if (msg.id === 2 && !resolved) {
             resolved = true;
             proc.kill();
@@ -277,16 +282,17 @@ async function callMCP(toolName, args) {
           }
         } catch {}
       }
-    });
+    }
 
-    proc.stderr.on('data', d => process.stderr.write(d));
+    proc.stdout.on('data', d => { out += d.toString(); tryParse(out); });
+    proc.stderr.on('data', d => { tryParse(d.toString()); });
 
     proc.on('close', () => {
       if (!resolved) reject(new Error('No response from MCP'));
     });
 
-    proc.stdin.write(msgs);
-    proc.stdin.end();
+    // Send initialize first, wait for response before tools/call
+    proc.stdin.write(JSON.stringify({jsonrpc:'2.0',id:1,method:'initialize',params:{protocolVersion:'2024-11-05',capabilities:{},clientInfo:{name:'auto-engage',version:'2.0'}}}) + '\n');
 
     setTimeout(() => {
       if (!resolved) {

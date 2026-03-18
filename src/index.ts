@@ -48,6 +48,11 @@ const PostCreateInput = z.object({
   article_description: z.string().optional(),
   template_id: z.string().optional(),
   template_vars: z.record(z.string()).optional(),
+  mentions: z.array(z.object({
+    type: z.enum(["company", "person"]),
+    name: z.string().describe("Exact text as it appears in the post body"),
+    urn: z.string().describe("LinkedIn URN: urn:li:organization:XXX or urn:li:person:XXX"),
+  })).optional().describe("@mentions — name must match exact text in post for position calculation"),
 });
 
 const PostUrnInput = z.object({ post_urn: z.string() });
@@ -415,6 +420,19 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           article_description: { type: "string", description: "Article description" },
           template_id: { type: "string", description: "Content template ID to apply" },
           template_vars: { type: "object", description: "Variables for template substitution" },
+          mentions: {
+            type: "array",
+            description: "@mentions — name must match exact text in post for position calculation",
+            items: {
+              type: "object",
+              properties: {
+                type: { type: "string", enum: ["company", "person"], description: "Mention type" },
+                name: { type: "string", description: "Exact text as it appears in the post body" },
+                urn: { type: "string", description: "LinkedIn URN: urn:li:organization:XXX or urn:li:person:XXX" },
+              },
+              required: ["type", "name", "urn"],
+            },
+          },
         },
         required: ["text"],
       },
@@ -1071,6 +1089,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           article_url: input.article_url,
           article_title: input.article_title,
           article_description: input.article_description,
+          mentions: input.mentions,
         });
         return toolResult(result);
       }

@@ -1,18 +1,25 @@
 #!/bin/bash
 # LaunchAgent wrapper for auto-publish daemon
-# Logs everything to help debug launchd issues
+# Self-restarting loop — survives crashes, terminal close, reboot
+# launchd handles the initial launch; this script handles restarts
 
-LOG="/Users/gaca/Library/Logs/linkedin-autopublish.log"
-ERRLOG="/Users/gaca/Library/Logs/linkedin-autopublish.error.log"
+LOG_DIR="/Users/gaca/output/personal/linkedin-mcp"
+LOG="$LOG_DIR/auto-publish.log"
+mkdir -p "$LOG_DIR"
 
 export PATH="/Users/gaca/.nvm/versions/node/v22.22.0/bin:$PATH"
 export HOME="/Users/gaca"
-export LINKEDIN_PERSON_URN="urn:li:person:FihAwG4y_B"
-
-echo "[$(date -u +%FT%TZ)] Wrapper starting..." >> "$LOG"
-echo "[$(date -u +%FT%TZ)] CWD: $(pwd)" >> "$LOG"
-echo "[$(date -u +%FT%TZ)] Node: $(which node)" >> "$LOG"
+# Load secrets from .env (not committed to git)
+set -a
+source /Users/gaca/projects/personal/linkedin-mcp-server/.env
+set +a
 
 cd /Users/gaca/projects/personal/linkedin-mcp-server || exit 1
 
-exec /Users/gaca/.nvm/versions/node/v22.22.0/bin/node auto-publish.mjs >> "$LOG" 2>> "$ERRLOG"
+while true; do
+  echo "[$(date -u +%FT%TZ)] Daemon starting (PID $$)..." >> "$LOG"
+  /Users/gaca/.nvm/versions/node/v22.22.0/bin/node auto-publish.mjs >> "$LOG" 2>&1
+  EXIT_CODE=$?
+  echo "[$(date -u +%FT%TZ)] Process exited with code $EXIT_CODE. Restarting in 30s..." >> "$LOG"
+  sleep 30
+done

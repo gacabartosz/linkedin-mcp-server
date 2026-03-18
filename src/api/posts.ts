@@ -2,6 +2,12 @@ import { linkedinRequest, getPersonUrn } from "./client.js";
 import { LinkedInApiError } from "../utils/errors.js";
 import { log } from "../utils/logger.js";
 
+interface PostMention {
+  type: "company" | "person";
+  name: string;  // exact text as it appears in post text
+  urn: string;   // urn:li:organization:XXX or urn:li:person:XXX
+}
+
 interface PostCreateOptions {
   text: string;
   visibility?: "PUBLIC" | "CONNECTIONS";
@@ -10,11 +16,40 @@ interface PostCreateOptions {
   article_url?: string;
   article_title?: string;
   article_description?: string;
+  mentions?: PostMention[];
 }
 
 interface LinkedInPostResponse {
   id?: string;
   "x-restli-id"?: string;
+}
+
+/**
+ * Build LinkedIn mention attributes from post text and mentions array.
+ * Each mention name must appear verbatim in the text for position calculation.
+ */
+function buildMentionAttributes(
+  text: string,
+  mentions?: PostMention[],
+): Array<Record<string, unknown>> {
+  if (!mentions || mentions.length === 0) return [];
+  const attributes: Array<Record<string, unknown>> = [];
+  for (const mention of mentions) {
+    const index = text.indexOf(mention.name);
+    if (index === -1) {
+      log("warn", `Mention name "${mention.name}" not found in post text — skipping`);
+      continue;
+    }
+    attributes.push({
+      start: index,
+      length: mention.name.length,
+      value:
+        mention.type === "company"
+          ? { "com.linkedin.common.CompanyAttributedEntity": { company: mention.urn } }
+          : { "com.linkedin.common.MemberAttributedEntity": { member: mention.urn } },
+    });
+  }
+  return attributes;
 }
 
 /**
@@ -98,8 +133,14 @@ async function createPostUgc(options: PostCreateOptions): Promise<{
 }> {
   const personUrn = getPersonUrn();
 
+  const mentionAttrs = buildMentionAttributes(options.text, options.mentions);
+  const shareCommentary: Record<string, unknown> =
+    mentionAttrs.length > 0
+      ? { text: options.text, attributes: mentionAttrs }
+      : { text: options.text };
+
   const shareContent: Record<string, unknown> = {
-    shareCommentary: { text: options.text },
+    shareCommentary,
     shareMediaCategory: "NONE",
   };
 
