@@ -301,41 +301,45 @@ async function verifyPostLive(postUrn) {
 
 // ── Comment Creation (direct API) ───────────────────────────────────────────
 
-async function createComment(shareUrn, text) {
-  // Comments use socialActions with the share URN (NOT activity URN)
-  const encodedUrn = encodeURIComponent(shareUrn);
+async function createComment(shareUrn, postUrn, text) {
+  // Try multiple URN formats — LinkedIn is inconsistent about which one works
   const personUrn = getPersonUrn();
+  const urnsToTry = [shareUrn, postUrn].filter(Boolean);
+  // Deduplicate
+  const uniqueUrns = [...new Set(urnsToTry)];
 
-  const body = {
-    actor: personUrn,
-    message: { text },
-  };
+  for (const urn of uniqueUrns) {
+    const encodedUrn = encodeURIComponent(urn);
+    const body = {
+      actor: personUrn,
+      message: { text },
+    };
 
-  log(`  Posting comment on ${shareUrn}...`);
+    log(`  Trying comment on ${urn}...`);
 
-  const res = await linkedinFetch(`/socialActions/${encodedUrn}/comments`, {
-    method: 'POST',
-    body: JSON.stringify(body),
-  });
+    const res = await linkedinFetch(`/socialActions/${encodedUrn}/comments`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    });
 
-  if (!res.ok) {
+    if (res.ok) {
+      let responseBody = null;
+      try { responseBody = await res.json(); } catch {}
+      const commentUrn =
+        res.headers.get('x-restli-id') ||
+        res.headers.get('X-RestLi-Id') ||
+        responseBody?.id ||
+        responseBody?.$URN ||
+        'unknown';
+      log(`  Comment posted: ${commentUrn}`);
+      return commentUrn;
+    }
+
     const errText = await res.text();
-    throw new Error(`Comment creation failed (${res.status}): ${errText}`);
+    log(`  Comment failed on ${urn} (${res.status}): ${errText.slice(0, 150)}`);
   }
 
-  let responseBody = null;
-  try {
-    responseBody = await res.json();
-  } catch {}
-
-  const commentUrn =
-    res.headers.get('x-restli-id') ||
-    res.headers.get('X-RestLi-Id') ||
-    responseBody?.id ||
-    'unknown';
-
-  log(`  Comment posted: ${commentUrn}`);
-  return commentUrn;
+  throw new Error(`Comment creation failed on all URN formats: ${uniqueUrns.join(', ')}`);
 }
 
 // ── Randomization helpers (avoid bot detection) ─────────────────────────────
@@ -641,7 +645,7 @@ async function checkAndPublish() {
   for (const c of readyComments) {
     log(`Adding comment to ${c.share_urn}...`);
     try {
-      const commentUrn = await createComment(c.share_urn, c.text);
+      const commentUrn = await createComment(c.share_urn, c.post_urn, c.text);
       log(`  Comment added: ${commentUrn}`);
       commentQueue.splice(commentQueue.indexOf(c), 1);
     } catch (err) {
