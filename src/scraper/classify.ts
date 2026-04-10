@@ -23,16 +23,30 @@ export interface ClassificationResult {
 // ── E-commerce & IT Keywords ─────────────────────────────────────────────────
 
 const BUYING_KEYWORDS = [
+  // Ogólne sygnały zakupowe
   "szukam", "szukamy", "potrzebuję", "potrzebujemy",
   "polecicie", "polecacie", "kto zrobi", "ktoś poleci",
-  "wdrożenie", "wdrożyć", "upgrade", "migracja", "replatforming",
+  "kto mi zbuduje", "kto pomoże", "kto zna się na",
   "looking for", "searching for", "need help", "recommend",
   "anyone know", "suggestions for", "which platform",
-  "RFP", "zapytanie ofertowe", "brief", "przetarg",
+  // MVP / aplikacje / SaaS — usługi bartoszgaca.pl
+  "mvp", "zbudować aplikację", "zbudować mvp", "potrzebuję aplikacji",
+  "chcę zbudować saas", "potrzebuję systemu", "zbudować system",
+  "potrzebuję dashboardu", "zbudować narzędzie", "zrobić aplikację",
+  "build an app", "build mvp", "need an app", "need a developer",
+  // Automatyzacja / integracja API
+  "automatyzacja", "zautomatyzować", "potrzebuję automatyzacji",
+  "integracja api", "połączyć systemy", "integracja systemów",
+  "bot", "chatbot", "potrzebuję bota", "agent ai",
+  "mcp", "claude code", "ai w firmie", "wdrożenie ai",
+  // E-commerce / wdrożenia
+  "wdrożenie", "wdrożyć", "upgrade", "migracja", "replatforming",
   "magento", "shopify", "woocommerce", "prestashop", "salesforce commerce",
   "headless", "composable", "pim", "erp", "crm",
   "e-commerce", "ecommerce", "sklep internetowy", "platforma sprzedażowa",
-  "budżet", "budget", "wycena", "proposal",
+  // Sygnały budżetowe
+  "RFP", "zapytanie ofertowe", "brief", "przetarg",
+  "budżet", "budget", "wycena", "proposal", "ile kosztuje",
 ];
 
 const SALES_KEYWORDS = [

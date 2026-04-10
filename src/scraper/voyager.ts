@@ -249,8 +249,18 @@ export async function voyagerRequest<T>(
     method: options?.method || "GET",
     headers,
     body: options?.body ? JSON.stringify(options.body) : undefined,
+    redirect: "manual" as RequestRedirect, // Don't follow 302 → login redirects
     timeoutMs: 30_000,
   });
+
+  // 302 redirect = session expired (LinkedIn redirects to login page)
+  if (response.status === 302 || response.status === 301) {
+    rateLimit.consecutiveErrors++;
+    throw new Error(
+      `LinkedIn session expired (${response.status} redirect to login). ` +
+      "Please update your li_at cookie with linkedin_scraper_auth."
+    );
+  }
 
   // Handle rate limiting with exponential backoff
   if (response.status === 429) {

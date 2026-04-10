@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 
+import { join } from "node:path";
+import { homedir } from "node:os";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
@@ -31,8 +33,28 @@ import { searchPeople, searchCompanies, getCompanyPeople, getCompanyInfo, extrac
 import { getPersonPosts, getPersonComments, extractPublicId } from "./scraper/activity.js";
 import { addCompany, listCompanies, removeCompany, addProspect, listProspects, getProspect, removeProspect, updateProspectScanTime, addActivity, getNewActivities, markActivitiesReviewed, getStats } from "./scraper/store.js";
 import { classifyIntent, quickClassify } from "./scraper/classify.js";
+import { getPostMetrics, getPostMetricsBatch, getPostReactors } from "./api/social-metadata.js";
+import { getPostAnalytics, getPostFullAnalytics, getAggregatedAnalytics } from "./api/analytics.js";
+import { getNetworkInfo, getProfileViews } from "./scraper/network.js";
+import { getConversations, getConversationMessages, sendMessage, createConversation } from "./scraper/messaging.js";
+import { sendInvitation, getInvitations, respondInvitation, getConnections } from "./scraper/invitations.js";
+import { getFeed, getProfileDetail, getNotifications, getWhoViewed } from "./scraper/feed.js";
 
 // ─── Zod Schemas ─────────────────────────────────────────────────────────────
+
+const PostMetricsInput = z.object({ post_urn: z.string() });
+const PostMetricsBatchInput = z.object({ post_urns: z.array(z.string()).max(20) });
+const PostReactorsInput = z.object({ post_urn: z.string(), count: z.number().optional() });
+const PostAnalyticsInput = z.object({
+  post_urn: z.string(),
+  metric: z.enum(["IMPRESSION", "MEMBERS_REACHED", "RESHARE", "REACTION", "COMMENT"]).optional(),
+});
+const AggregatedAnalyticsInput = z.object({
+  metric: z.enum(["IMPRESSION", "MEMBERS_REACHED", "RESHARE", "REACTION", "COMMENT"]),
+  aggregation: z.enum(["DAILY", "TOTAL"]).optional(),
+  days: z.number().optional(),
+});
+const NetworkStatsInput = z.object({ public_id: z.string() });
 
 const AuthStartInput = z.object({
   scopes: z.array(z.string()).optional(),
@@ -1017,6 +1039,310 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       description: "Get monitoring system statistics — total prospects, companies, activities, classification breakdown.",
       inputSchema: { type: "object", properties: {} },
     },
+    // ── Analytics & Metrics ──────────────────────────────────────────────
+    {
+      name: "linkedin_post_metrics",
+      description: "Get reaction breakdown (LIKE/PRAISE/EMPATHY/INTEREST/APPRECIATION/ENTERTAINMENT) and comment count for a post. Uses existing w_member_social scope — no new permissions needed.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          post_urn: { type: "string", description: "Post URN (urn:li:share:... or urn:li:ugcPost:...)" },
+        },
+        required: ["post_urn"],
+      },
+    },
+    {
+      name: "linkedin_post_metrics_batch",
+      description: "Batch get reaction breakdown and comment counts for up to 20 posts at once.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          post_urns: { type: "array", items: { type: "string" }, description: "Array of post URNs (max 20)" },
+        },
+        required: ["post_urns"],
+      },
+    },
+    {
+      name: "linkedin_post_reactors",
+      description: "Get list of people who reacted to a post — identifies hot prospects from your audience.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          post_urn: { type: "string", description: "Post URN" },
+          count: { type: "number", description: "Max reactors to return (default 50)" },
+        },
+        required: ["post_urn"],
+      },
+    },
+    {
+      name: "linkedin_post_analytics",
+      description: "Get post analytics (impressions, members reached, reshares). Requires r_member_postAnalytics scope. Returns all 5 metrics if no specific metric given.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          post_urn: { type: "string", description: "Post URN" },
+          metric: { type: "string", enum: ["IMPRESSION", "MEMBERS_REACHED", "RESHARE", "REACTION", "COMMENT"], description: "Specific metric (optional — returns all if omitted)" },
+        },
+        required: ["post_urn"],
+      },
+    },
+    {
+      name: "linkedin_analytics_aggregated",
+      description: "Get aggregated analytics for ALL your posts — daily trend or total. Great for tracking growth over time.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          metric: { type: "string", enum: ["IMPRESSION", "MEMBERS_REACHED", "RESHARE", "REACTION", "COMMENT"], description: "Metric type" },
+          aggregation: { type: "string", enum: ["DAILY", "TOTAL"], description: "DAILY for trend chart, TOTAL for sum (default DAILY)" },
+          days: { type: "number", description: "Number of days back (default 30)" },
+        },
+        required: ["metric"],
+      },
+    },
+    {
+      name: "linkedin_network_stats",
+      description: "Get follower count, connection count for a LinkedIn profile. Uses Voyager API (scraper auth required).",
+      inputSchema: {
+        type: "object",
+        properties: {
+          public_id: { type: "string", description: "LinkedIn public ID (e.g. 'bartoszgaca')" },
+        },
+        required: ["public_id"],
+      },
+    },
+    {
+      name: "linkedin_profile_views",
+      description: "Get profile view statistics with daily breakdown. Uses Voyager API (scraper auth required).",
+      inputSchema: {
+        type: "object",
+        properties: {
+          public_id: { type: "string", description: "LinkedIn public ID" },
+        },
+        required: ["public_id"],
+      },
+    },
+    {
+      name: "linkedin_analytics_trends",
+      description: "Get daily analytics trends (followers, views, reactions, engagement rate) from local analytics.db. No API calls needed — uses cached data.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          days: { type: "number", description: "Number of days back (default 30, max 365)" },
+        },
+      },
+    },
+    {
+      name: "linkedin_content_analysis",
+      description: "Analyze content performance by type (text/image/article), length buckets, and hashtags. Uses local analytics.db cache.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          content_type: { type: "string", enum: ["text", "image", "article", "carousel"], description: "Filter by content type (optional)" },
+        },
+      },
+    },
+    {
+      name: "linkedin_network_growth",
+      description: "Get follower growth timeline with daily deltas from local analytics.db. Great for tracking growth momentum.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          days: { type: "number", description: "Number of days back (default 90)" },
+        },
+      },
+    },
+    {
+      name: "linkedin_top_engagers",
+      description: "Get list of people who engage most with your content (reactions + comments). Ranked by total engagement count.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          limit: { type: "number", description: "Max results (default 20)" },
+        },
+      },
+    },
+    {
+      name: "linkedin_lead_score",
+      description: "Get lead score breakdown for a prospect. Scores based on activity, buying signals, recency, and category match.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          public_id: { type: "string", description: "LinkedIn public ID of the prospect" },
+        },
+        required: ["public_id"],
+      },
+    },
+    {
+      name: "linkedin_lead_pipeline",
+      description: "Get sales pipeline summary and lead list. Optionally filter by pipeline stage.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          stage: { type: "string", enum: ["new", "contacted", "connected", "qualified", "proposal", "client", "lost"], description: "Filter by stage (optional)" },
+        },
+      },
+    },
+    {
+      name: "linkedin_lead_stage_update",
+      description: "Update a prospect's pipeline stage and optionally add a note to their timeline.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          public_id: { type: "string", description: "LinkedIn public ID" },
+          stage: { type: "string", enum: ["new", "contacted", "connected", "qualified", "proposal", "client", "lost"], description: "New pipeline stage" },
+          note: { type: "string", description: "Optional note to add to timeline" },
+        },
+        required: ["public_id", "stage"],
+      },
+    },
+    {
+      name: "linkedin_content_performance",
+      description: "Get all published posts with engagement metrics, content type, and hashtags. Sort by reactions or impressions.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          content_type: { type: "string", enum: ["text", "image", "article", "carousel"], description: "Filter by content type (optional)" },
+          days: { type: "number", description: "Only posts from last N days (optional)" },
+          sort: { type: "string", enum: ["reactions", "impressions", "comments", "engagement"], description: "Sort field (default: reactions)" },
+        },
+      },
+    },
+    // ── Messaging (Voyager) ──────────────────────────────────────────────
+    {
+      name: "linkedin_conversations",
+      description: "List your LinkedIn inbox conversations with participants, last message, and unread count. Uses Voyager API.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          count: { type: "number", description: "Number of conversations (default 20, max 40)" },
+        },
+      },
+    },
+    {
+      name: "linkedin_messages",
+      description: "Read messages in a specific LinkedIn conversation thread. Uses Voyager API.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          conversation_id: { type: "string", description: "Conversation ID" },
+          count: { type: "number", description: "Number of messages (default 20)" },
+        },
+        required: ["conversation_id"],
+      },
+    },
+    {
+      name: "linkedin_send_message",
+      description: "Send a message in an existing LinkedIn conversation. Uses Voyager API.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          conversation_id: { type: "string", description: "Conversation ID" },
+          text: { type: "string", description: "Message text" },
+        },
+        required: ["conversation_id", "text"],
+      },
+    },
+    {
+      name: "linkedin_start_conversation",
+      description: "Start a new LinkedIn conversation (DM) with one or more people. Uses Voyager API.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          recipient_urns: { type: "array", items: { type: "string" }, description: "Array of profile URNs (urn:li:fsd_profile:...)" },
+          text: { type: "string", description: "Message text" },
+        },
+        required: ["recipient_urns", "text"],
+      },
+    },
+    // ── Invitations & Connections (Voyager) ──────────────────────────────
+    {
+      name: "linkedin_send_invitation",
+      description: "Send a connection request to a LinkedIn user. Optional personal message (max 300 chars). Uses Voyager API.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          public_id: { type: "string", description: "LinkedIn public ID (e.g. 'bartoszgaca')" },
+          message: { type: "string", description: "Optional personal note (max 300 chars)" },
+        },
+        required: ["public_id"],
+      },
+    },
+    {
+      name: "linkedin_invitations",
+      description: "List pending LinkedIn connection invitations (received or sent). Uses Voyager API.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          type: { type: "string", enum: ["received", "sent"], description: "received or sent (default received)" },
+          count: { type: "number", description: "Number of invitations (default 20)" },
+        },
+      },
+    },
+    {
+      name: "linkedin_respond_invitation",
+      description: "Accept or ignore a pending connection invitation. Uses Voyager API.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          invitation_id: { type: "string", description: "Invitation ID" },
+          action: { type: "string", enum: ["accept", "ignore"], description: "Accept or ignore" },
+        },
+        required: ["invitation_id", "action"],
+      },
+    },
+    {
+      name: "linkedin_connections",
+      description: "List your LinkedIn connections with profile details. Uses Voyager API.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          count: { type: "number", description: "Number of connections (default 40)" },
+          start: { type: "number", description: "Pagination offset (default 0)" },
+        },
+      },
+    },
+    // ── Feed & Intelligence (Voyager) ────────────────────────────────────
+    {
+      name: "linkedin_feed",
+      description: "Get your LinkedIn home feed with posts, reactions, and comments. Great for finding engagement opportunities. Uses Voyager API.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          count: { type: "number", description: "Number of feed items (default 20)" },
+        },
+      },
+    },
+    {
+      name: "linkedin_profile_detail",
+      description: "Get full profile of any LinkedIn user — headline, about, experience, education, skills. Uses Voyager API.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          public_id: { type: "string", description: "LinkedIn public ID" },
+        },
+        required: ["public_id"],
+      },
+    },
+    {
+      name: "linkedin_notifications",
+      description: "Get your LinkedIn notifications (reactions, comments, mentions, connection requests). Uses Voyager API.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          count: { type: "number", description: "Number of notifications (default 20)" },
+        },
+      },
+    },
+    {
+      name: "linkedin_who_viewed",
+      description: "Get who viewed your LinkedIn profile — names, headlines, companies, view dates. Uses Voyager API.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          count: { type: "number", description: "Number of viewers (default 20)" },
+        },
+      },
+    },
   ],
 }));
 
@@ -1743,6 +2069,240 @@ ${input.sentiment === "neutral" ? "Engage if substance, invite discussion." : ""
           scraper_auth_updated: scraperAuth?.updated_at,
           rate_limit: getRateLimitStats(),
         });
+      }
+
+      // ── Analytics & Metrics ─────────────────────────────────────────
+      case "linkedin_post_metrics": {
+        const input = PostMetricsInput.parse(args);
+        const result = await getPostMetrics(input.post_urn);
+        return toolResult(result);
+      }
+      case "linkedin_post_metrics_batch": {
+        const input = PostMetricsBatchInput.parse(args);
+        const result = await getPostMetricsBatch(input.post_urns);
+        return toolResult({ posts: result, count: result.length });
+      }
+      case "linkedin_post_reactors": {
+        const input = PostReactorsInput.parse(args);
+        const result = await getPostReactors(input.post_urn, input.count);
+        return toolResult(result);
+      }
+      case "linkedin_post_analytics": {
+        const input = PostAnalyticsInput.parse(args);
+        if (input.metric) {
+          const result = await getPostAnalytics(input.post_urn, input.metric);
+          return toolResult({ post_urn: input.post_urn, metric: input.metric, data: result });
+        }
+        const result = await getPostFullAnalytics(input.post_urn);
+        return toolResult({ post_urn: input.post_urn, metrics: result });
+      }
+      case "linkedin_analytics_aggregated": {
+        const input = AggregatedAnalyticsInput.parse(args);
+        const days = input.days || 30;
+        const end = new Date();
+        const start = new Date();
+        start.setDate(start.getDate() - days);
+        const result = await getAggregatedAnalytics(input.metric, input.aggregation || "DAILY", { start, end });
+        return toolResult(result);
+      }
+      case "linkedin_network_stats": {
+        const input = NetworkStatsInput.parse(args);
+        const result = await getNetworkInfo(input.public_id);
+        return toolResult(result);
+      }
+      case "linkedin_profile_views": {
+        const input = NetworkStatsInput.parse(args);
+        const result = await getProfileViews(input.public_id);
+        return toolResult(result);
+      }
+
+      // ── Local Analytics DB tools (no API calls) ──────────────────────────
+      case "linkedin_analytics_trends": {
+        const days = Number((args as any).days) || 30;
+        const db = new (await import('better-sqlite3')).default(join(homedir(), '.linkedin-mcp', 'analytics.db'));
+        const rows = db.prepare(
+          "SELECT date, follower_count, total_impressions, total_reactions, total_comments, engagement_rate FROM daily_stats WHERE date >= date('now', '-' || ? || ' days') ORDER BY date ASC"
+        ).all(days);
+        db.close();
+        return toolResult({ days, rows, count: (rows as any[]).length });
+      }
+
+      case "linkedin_content_analysis": {
+        const contentType = (args as any).content_type;
+        const db = new (await import('better-sqlite3')).default(join(homedir(), '.linkedin-mcp', 'analytics.db'));
+        const whereClause = contentType ? "WHERE m.content_type = ?" : "";
+        const queryArgs = contentType ? [contentType] : [];
+        const byType = db.prepare(
+          `SELECT m.content_type, COUNT(*) as count, AVG(s.reactions) as avg_reactions, AVG(s.impressions) as avg_impressions, AVG(s.comments) as avg_comments FROM content_type_map m LEFT JOIN social_metadata s ON m.post_urn = s.post_urn ${whereClause} GROUP BY m.content_type ORDER BY avg_reactions DESC`
+        ).all(...queryArgs);
+        const hashtags = db.prepare(
+          "SELECT hashtag, usage_count, avg_reactions, avg_impressions FROM hashtag_performance ORDER BY avg_reactions DESC LIMIT 20"
+        ).all();
+        db.close();
+        return toolResult({ by_type: byType, top_hashtags: hashtags });
+      }
+
+      case "linkedin_network_growth": {
+        const days = Number((args as any).days) || 90;
+        const db = new (await import('better-sqlite3')).default(join(homedir(), '.linkedin-mcp', 'analytics.db'));
+        const rows = db.prepare(
+          "SELECT date, follower_count, delta FROM follower_deltas WHERE date >= date('now', '-' || ? || ' days') ORDER BY date ASC"
+        ).all(days);
+        db.close();
+        const arr = rows as any[];
+        const totalGrowth = arr.reduce((s: number, r: any) => s + (r.delta || 0), 0);
+        const avgDaily = arr.length > 0 ? (totalGrowth / arr.length).toFixed(1) : '0';
+        return toolResult({ days, rows: arr, total_growth: totalGrowth, avg_daily: parseFloat(avgDaily) });
+      }
+
+      case "linkedin_top_engagers": {
+        const limit = Number((args as any).limit) || 20;
+        const db = new (await import('better-sqlite3')).default(join(homedir(), '.linkedin-mcp', 'analytics.db'));
+        const rows = db.prepare(
+          "SELECT name, headline, public_id, reaction_count, comment_count, total_engagements, last_engagement_at FROM top_engagers ORDER BY total_engagements DESC LIMIT ?"
+        ).all(limit);
+        db.close();
+        return toolResult({ top_engagers: rows, count: (rows as any[]).length });
+      }
+
+      case "linkedin_lead_score": {
+        const publicId = String((args as any).public_id);
+        const db = new (await import('better-sqlite3')).default(join(homedir(), '.linkedin-mcp', 'prospects.db'));
+        const p = db.prepare("SELECT * FROM prospects WHERE public_id = ?").get(publicId) as any;
+        db.close();
+        if (!p) return toolError(`Prospect not found: ${publicId}`);
+        const actScore = Math.min((p.activity_count || 0) * 5, 25);
+        const buyScore = Math.min((p.buying_signal_count || 0) * 15, 45);
+        const jobScore = Math.min((p.job_posting_count || 0) * 5, 10);
+        const recencyScore = p.last_activity_at && (Date.now() - new Date(p.last_activity_at).getTime()) < 7*86400000 ? 10 : p.last_activity_at && (Date.now() - new Date(p.last_activity_at).getTime()) < 14*86400000 ? 5 : 0;
+        const catScore = p.category === 'target_buyer' ? 10 : 0;
+        const total = actScore + buyScore + jobScore + recencyScore + catScore;
+        return toolResult({ public_id: publicId, name: p.name, total_score: total, breakdown: { activities: actScore, buying_signals: buyScore, job_postings: jobScore, recency: recencyScore, category: catScore }, pipeline_stage: p.pipeline_stage || 'new' });
+      }
+
+      case "linkedin_lead_pipeline": {
+        const stage = (args as any).stage;
+        const db = new (await import('better-sqlite3')).default(join(homedir(), '.linkedin-mcp', 'prospects.db'));
+        const stages = ['new','contacted','connected','qualified','proposal','client','lost'];
+        const summary = stages.map((s: string) => ({
+          stage: s,
+          count: (db.prepare("SELECT COUNT(*) as c FROM prospects WHERE COALESCE(pipeline_stage,'new') = ?").get(s) as any)?.c || 0
+        }));
+        const whereClause = stage ? "WHERE COALESCE(pipeline_stage,'new') = ?" : "WHERE 1=1";
+        const leads = db.prepare(
+          `SELECT name, company_name, public_id, COALESCE(lead_score,0) as lead_score, COALESCE(pipeline_stage,'new') as pipeline_stage, last_activity_at FROM prospects ${whereClause} ORDER BY lead_score DESC LIMIT 50`
+        ).all(...(stage ? [stage] : []));
+        db.close();
+        return toolResult({ pipeline_summary: summary, leads, total: (leads as any[]).length });
+      }
+
+      case "linkedin_lead_stage_update": {
+        const publicId = String((args as any).public_id);
+        const newStage = String((args as any).stage);
+        const note = (args as any).note;
+        const db = new (await import('better-sqlite3')).default(join(homedir(), '.linkedin-mcp', 'prospects.db'));
+        try { db.exec("ALTER TABLE prospects ADD COLUMN pipeline_stage TEXT DEFAULT 'new'"); } catch {}
+        try { db.exec("CREATE TABLE IF NOT EXISTS lead_timeline (id TEXT PRIMARY KEY, prospect_id TEXT, event_type TEXT, from_value TEXT, to_value TEXT, note TEXT, created_at TEXT DEFAULT (datetime('now')))"); } catch {}
+        const p = db.prepare("SELECT id, pipeline_stage FROM prospects WHERE public_id = ?").get(publicId) as any;
+        if (!p) { db.close(); return toolError(`Prospect not found: ${publicId}`); }
+        const oldStage = p.pipeline_stage || 'new';
+        db.prepare("UPDATE prospects SET pipeline_stage = ? WHERE public_id = ?").run(newStage, publicId);
+        db.prepare("INSERT INTO lead_timeline (id, prospect_id, event_type, from_value, to_value, note) VALUES (?, ?, 'stage_change', ?, ?, ?)").run(
+          `${Date.now()}-${publicId}`, p.id, oldStage, newStage, note || null
+        );
+        db.close();
+        return toolResult({ ok: true, public_id: publicId, from: oldStage, to: newStage, note: note || null });
+      }
+
+      case "linkedin_content_performance": {
+        const contentType = (args as any).content_type;
+        const days = Number((args as any).days) || 0;
+        const sort = (args as any).sort || 'reactions';
+        const sortCol = ['reactions','impressions','comments','engagement'].includes(sort) ? sort : 'reactions';
+        const db = new (await import('better-sqlite3')).default(join(homedir(), '.linkedin-mcp', 'analytics.db'));
+        const conditions: string[] = [];
+        const params: any[] = [];
+        if (contentType) { conditions.push("m.content_type = ?"); params.push(contentType); }
+        if (days > 0) { conditions.push("s.publish_at >= date('now', '-' || ? || ' days')"); params.push(days); }
+        const where = conditions.length > 0 ? "WHERE " + conditions.join(" AND ") : "";
+        const rows = db.prepare(
+          `SELECT s.post_urn, s.text_preview, s.publish_at, s.reactions, s.impressions, s.comments, s.engagement, COALESCE(m.content_type,'text') as content_type, m.hashtags FROM social_metadata s LEFT JOIN content_type_map m ON s.post_urn = m.post_urn ${where} ORDER BY s.${sortCol} DESC LIMIT 50`
+        ).all(...params);
+        db.close();
+        return toolResult({ posts: rows, count: (rows as any[]).length, sorted_by: sortCol });
+      }
+
+      // ── Messaging (Voyager) ──────────────────────────────────────────────
+      case "linkedin_conversations": {
+        const count = Number((args as any).count) || 20;
+        const result = await getConversations(count);
+        return toolResult(result);
+      }
+      case "linkedin_messages": {
+        const conversationId = String((args as any).conversation_id);
+        const count = Number((args as any).count) || 20;
+        const result = await getConversationMessages(conversationId, count);
+        return toolResult(result);
+      }
+      case "linkedin_send_message": {
+        const conversationId = String((args as any).conversation_id);
+        const text = String((args as any).text);
+        const result = await sendMessage(conversationId, text);
+        return toolResult(result);
+      }
+      case "linkedin_start_conversation": {
+        const recipientUrns = (args as any).recipient_urns as string[];
+        const text = String((args as any).text);
+        const result = await createConversation(recipientUrns, text);
+        return toolResult(result);
+      }
+
+      // ── Invitations & Connections (Voyager) ──────────────────────────────
+      case "linkedin_send_invitation": {
+        const publicId = String((args as any).public_id);
+        const message = (args as any).message ? String((args as any).message) : undefined;
+        const result = await sendInvitation(publicId, message);
+        return toolResult(result);
+      }
+      case "linkedin_invitations": {
+        const type = ((args as any).type || 'received') as 'received' | 'sent';
+        const count = Number((args as any).count) || 20;
+        const result = await getInvitations(type, count);
+        return toolResult(result);
+      }
+      case "linkedin_respond_invitation": {
+        const invitationId = String((args as any).invitation_id);
+        const action = String((args as any).action) as 'accept' | 'ignore';
+        const result = await respondInvitation(invitationId, action);
+        return toolResult(result);
+      }
+      case "linkedin_connections": {
+        const count = Number((args as any).count) || 40;
+        const start = Number((args as any).start) || 0;
+        const result = await getConnections(count, start);
+        return toolResult(result);
+      }
+
+      // ── Feed & Intelligence (Voyager) ────────────────────────────────────
+      case "linkedin_feed": {
+        const count = Number((args as any).count) || 20;
+        const result = await getFeed(count);
+        return toolResult(result);
+      }
+      case "linkedin_profile_detail": {
+        const publicId = String((args as any).public_id);
+        const result = await getProfileDetail(publicId);
+        return toolResult(result);
+      }
+      case "linkedin_notifications": {
+        const count = Number((args as any).count) || 20;
+        const result = await getNotifications(count);
+        return toolResult(result);
+      }
+      case "linkedin_who_viewed": {
+        const count = Number((args as any).count) || 20;
+        const result = await getWhoViewed(count);
+        return toolResult(result);
       }
 
       default:
