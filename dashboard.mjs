@@ -10,7 +10,7 @@
 
 import { createServer } from 'node:http';
 import { spawn, execSync } from 'node:child_process';
-import { readFileSync, existsSync, writeFileSync, statSync } from 'node:fs';
+import { readFileSync, existsSync, writeFileSync, statSync, readdirSync } from 'node:fs';
 import { join, extname, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { homedir, platform } from 'node:os';
@@ -540,6 +540,81 @@ async function handleRequest(req, res) {
       } catch (e) {
         return json(res, { error: e.message }, 500);
       }
+    }
+
+    // POST /api/articles/draft — generate full article (PL hero + EN hub-spoke) via draft-article.mjs
+    // Body: { topic_slug: string, words?: number (500-8000, default 3500), lang?: 'pl'|'en'|'both' (default 'both') }
+    // Returns: { ok, title_pl, title_en, slug_pl, slug_en, excerpt_pl, excerpt_en, pl_ts, en_ts, usage }
+    // Synchronous spawn — blocks until Claude finishes (typical 60-180s for 3500 words).
+    if (method === 'POST' && path === '/api/articles/draft') {
+      const body = await parseBody(req).catch(() => ({}));
+      const topicSlug = (body.topic_slug || '').trim();
+      const words = parseInt(body.words || '3500', 10);
+      const lang = body.lang || 'both';
+      if (!topicSlug || !/^[a-z0-9-]+$/.test(topicSlug)) {
+        return json(res, { error: 'topic_slug required (kebab-case)' }, 400);
+      }
+      if (!Number.isFinite(words) || words < 500 || words > 8000) {
+        return json(res, { error: 'words must be 500-8000' }, 400);
+      }
+      if (!['pl', 'en', 'both'].includes(lang)) {
+        return json(res, { error: 'lang must be pl, en, or both' }, 400);
+      }
+      const child = spawn('node', [
+        'scripts/draft-article.mjs',
+        `--topic-slug=${topicSlug}`,
+        `--words=${words}`,
+        `--lang=${lang}`,
+      ], { cwd: MCP_DIR, env: process.env });
+      let stdout = '';
+      let stderr = '';
+      child.stdout.on('data', d => { stdout += d.toString(); });
+      child.stderr.on('data', d => { stderr += d.toString(); });
+      child.on('close', (code) => {
+        if (code !== 0) {
+          return json(res, { error: 'draft-article.mjs failed', exit_code: code, stderr: stderr.slice(-3000) }, 500);
+        }
+        try {
+          const result = JSON.parse(stdout);
+          return json(res, { ...result, log: stderr.slice(-1500) });
+        } catch (e) {
+          return json(res, { error: 'JSON parse failed', message: e.message, stdout_preview: stdout.slice(0, 800), stderr: stderr.slice(-2000) }, 500);
+        }
+      });
+      child.on('error', (err) => {
+        return json(res, { error: 'spawn failed', message: err.message }, 500);
+      });
+      // Don't return — async, response sent in 'close' handler
+      return;
+    }
+
+    // GET /api/articles/drafts — list saved drafts in OUTPUT_DIR
+    if (method === 'GET' && path === '/api/articles/drafts') {
+      const draftDir = process.env.ARTICLE_DRAFT_DIR || join(DATA_DIR, 'article-drafts');
+      if (!existsSync(draftDir)) return json(res, []);
+      try {
+        const files = readdirSync(draftDir).filter(f => f.endsWith('.ts'));
+        const items = files.map(f => {
+          const p = join(draftDir, f);
+          const stat = statSync(p);
+          return { filename: f, slug: f.replace(/\.ts$/, ''), size_bytes: stat.size, mtime: stat.mtime.toISOString() };
+        }).sort((a, b) => b.mtime.localeCompare(a.mtime));
+        return json(res, items);
+      } catch (e) {
+        return json(res, { error: e.message }, 500);
+      }
+    }
+
+    // GET /api/articles/draft/:slug — fetch a saved draft .ts content
+    if (method === 'GET' && path.match(/^\/api\/articles\/draft\/[a-z0-9-]+$/)) {
+      const slug = path.split('/').pop();
+      const draftDir = process.env.ARTICLE_DRAFT_DIR || join(DATA_DIR, 'article-drafts');
+      const filePath = join(draftDir, `${slug}.ts`);
+      if (!existsSync(filePath)) return json(res, { error: 'draft not found' }, 404);
+      const content = readFileSync(filePath, 'utf-8');
+      res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8', 'Content-Disposition': `attachment; filename="${slug}.ts"` });
+      res.end(content);
+      return;
     }
 
     // GET /api/health — production smoke test endpoint (D1 verification)
