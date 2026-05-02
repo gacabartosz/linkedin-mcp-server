@@ -10,17 +10,22 @@
 
 import { createServer } from 'node:http';
 import { spawn, execSync } from 'node:child_process';
-import { readFileSync, existsSync } from 'node:fs';
-import { join, extname } from 'node:path';
-import { homedir } from 'node:os';
+import { readFileSync, existsSync, writeFileSync, statSync } from 'node:fs';
+import { join, extname, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { homedir, platform } from 'node:os';
+import { randomUUID } from 'node:crypto';
 import Database from 'better-sqlite3';
 
-const PORT = 6767;
+const PORT = parseInt(process.env.PORT, 10) || 6767;
+const IS_MACOS = platform() === 'darwin';
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const MCP_DIR = process.env.MCP_DIR || __dirname;
+const DATA_DIR = process.env.LINKEDIN_DATA_DIR || join(homedir(), '.linkedin-mcp');
 let _htmlCache = null; // Set to null on each request during dev: see below
-const DB_PATH = join(homedir(), '.linkedin-mcp', 'scheduler.db');
-const PROSPECTS_DB_PATH = join(homedir(), '.linkedin-mcp', 'prospects.db');
-const AUTH_PATH = join(homedir(), '.linkedin-mcp', 'auth.json');
-const MCP_DIR = '/Users/gaca/projects/personal/linkedin-mcp-server';
+const DB_PATH = join(DATA_DIR, 'scheduler.db');
+const PROSPECTS_DB_PATH = join(DATA_DIR, 'prospects.db');
+const AUTH_PATH = join(DATA_DIR, 'auth.json');
 const IMG_DIR = join(MCP_DIR, 'output', 'linkedin-mcp');
 
 // ── Language detection ───────────────────────────────────────────────────────
@@ -177,6 +182,50 @@ function migrateDb() {
     stmt.run(detectLanguage(p.text), p.id);
   }
   if (posts.length > 0) console.log('Auto-detected language for ' + posts.length + ' posts');
+
+  // ── Media Plan tables (idempotent) ─────────────────────────────────────────
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS media_plan_items (
+      id TEXT PRIMARY KEY,
+      topic_number INTEGER NOT NULL,
+      slug TEXT UNIQUE NOT NULL,
+      title TEXT NOT NULL,
+      hook TEXT,
+      language TEXT DEFAULT 'pl',
+      publish_at TEXT NOT NULL,
+      status TEXT DEFAULT 'plan',
+      score_lead_gen INTEGER, score_icp INTEGER, score_algo INTEGER,
+      score_freshness INTEGER, score_visual INTEGER, score_uniqueness INTEGER,
+      score_narrative INTEGER, score_total REAL,
+      post_text TEXT, hashtags TEXT, cta TEXT, lead_trigger TEXT,
+      format TEXT, icp TEXT, length_target TEXT,
+      banner_concept TEXT, banner_path TEXT,
+      visual_asset_plan TEXT, visual_asset_path TEXT, visual_asset_type TEXT,
+      source_project TEXT, live_signal TEXT, wiki_slug TEXT,
+      scheduled_post_id TEXT, linkedin_post_urn TEXT,
+      cannibalize_status TEXT DEFAULT 'pending',
+      cannibalize_overlaps TEXT, cannibalize_checked_at TEXT,
+      gsc_status TEXT DEFAULT 'not_checked',
+      gsc_inspect_result TEXT, gsc_checked_at TEXT,
+      created_at TEXT DEFAULT (datetime('now')),
+      updated_at TEXT DEFAULT (datetime('now'))
+    );
+    CREATE TABLE IF NOT EXISTS gsc_audit_log (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      media_plan_item_id TEXT,
+      action TEXT NOT NULL,
+      result TEXT,
+      detail TEXT,
+      created_at TEXT DEFAULT (datetime('now'))
+    );
+    CREATE TABLE IF NOT EXISTS media_plan_settings (
+      key TEXT PRIMARY KEY,
+      value TEXT,
+      updated_at TEXT DEFAULT (datetime('now'))
+    );
+    INSERT OR IGNORE INTO media_plan_settings (key, value) VALUES ('gsc_auto_submit', '1');
+  `);
+
   db.close();
 }
 
@@ -197,20 +246,21 @@ function getDaemonPid() {
   } catch { return null; }
 }
 
-function callMCP(toolName, args) {
+function callMCPServer(spawnConfig, toolName, args) {
   return new Promise((resolve, reject) => {
     const msgs = [
       JSON.stringify({jsonrpc:'2.0',id:1,method:'initialize',params:{protocolVersion:'2024-11-05',capabilities:{},clientInfo:{name:'dashboard',version:'2.0'}}}),
       JSON.stringify({jsonrpc:'2.0',id:2,method:'tools/call',params:{name:toolName,arguments:args}}),
     ].join('\n');
 
-    const proc = spawn('node', ['dist/index.js'], {
-      cwd: MCP_DIR,
-      env: { ...process.env, LINKEDIN_PERSON_URN: 'urn:li:person:FihAwG4y_B' },
+    const proc = spawn(spawnConfig.command, spawnConfig.args || [], {
+      cwd: spawnConfig.cwd,
+      env: { ...process.env, ...(spawnConfig.env || {}) },
       stdio: ['pipe', 'pipe', 'pipe'],
     });
 
     let out = '';
+    let stderr = '';
     let resolved = false;
 
     proc.stdout.on('data', d => {
@@ -233,11 +283,49 @@ function callMCP(toolName, args) {
       }
     });
 
-    proc.on('close', () => { if (!resolved) reject(new Error('No MCP response')); });
-    proc.stdin.write(msgs);
-    proc.stdin.end();
-    setTimeout(() => { if (!resolved) { resolved = true; proc.kill(); reject(new Error('Timeout')); } }, 60000);
+    proc.stderr.on('data', d => { stderr += d.toString(); });
+
+    proc.on('close', () => {
+      if (!resolved) {
+        const stderrSnippet = stderr.slice(0, 500).trim();
+        reject(new Error(stderrSnippet || 'No MCP response'));
+      }
+    });
+    // Write init first, then tools/call after small delay so server processes them in order
+    proc.stdin.write(JSON.stringify({jsonrpc:'2.0',id:1,method:'initialize',params:{protocolVersion:'2024-11-05',capabilities:{},clientInfo:{name:'dashboard',version:'2.0'}}}) + '\n');
+    setTimeout(() => {
+      if (resolved) return;
+      proc.stdin.write(JSON.stringify({jsonrpc:'2.0',id:2,method:'tools/call',params:{name:toolName,arguments:args}}) + '\n');
+    }, 300);
+    // Keep stdin open — close only on resolve/reject. Some MCP servers exit on EOF before responding.
+    setTimeout(() => { if (!resolved) { resolved = true; proc.kill(); reject(new Error('Timeout 60s')); } }, 60000);
   });
+}
+
+function callMCP(toolName, args) {
+  return callMCPServer({
+    command: 'node',
+    args: ['dist/index.js'],
+    cwd: MCP_DIR,
+    env: { LINKEDIN_PERSON_URN: 'urn:li:person:FihAwG4y_B' },
+  }, toolName, args);
+}
+
+function callGSC(toolName, args) {
+  return callMCPServer({
+    command: '/Users/gaca/.nvm/versions/node/v22.22.0/bin/mcp-server-gsc',
+    args: [],
+    env: { GOOGLE_APPLICATION_CREDENTIALS: '/Users/gaca/.gsc-mcp-key.json' },
+  }, toolName, args);
+}
+
+function gscAuditLog(itemId, action, result, detail) {
+  try {
+    const db = getDb(false);
+    db.prepare("INSERT INTO gsc_audit_log (media_plan_item_id, action, result, detail) VALUES (?, ?, ?, ?)")
+      .run(itemId, action, result, typeof detail === 'string' ? detail : JSON.stringify(detail));
+    db.close();
+  } catch (e) { console.error('gscAuditLog error:', e.message); }
 }
 
 // ── API Routes ───────────────────────────────────────────────────────────────
@@ -291,6 +379,195 @@ async function handleRequest(req, res) {
       res.writeHead(200, { 'Content-Type': mime, 'Cache-Control': 'public, max-age=3600' });
       res.end(data);
       return;
+    }
+
+    // GET /oauth/callback — production OAuth redirect target (replaces localhost:8585 callback in prod)
+    if (method === 'GET' && path === '/oauth/callback') {
+      const code = url.searchParams.get('code');
+      const errParam = url.searchParams.get('error');
+      if (errParam) {
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(`<html><body><h1>OAuth failed</h1><p>${errParam}</p><a href="/">Back</a></body></html>`);
+        return;
+      }
+      if (!code) {
+        res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end('<html><body><h1>Missing code</h1></body></html>');
+        return;
+      }
+      try {
+        const clientId = process.env.LINKEDIN_CLIENT_ID;
+        const clientSecret = process.env.LINKEDIN_CLIENT_SECRET;
+        const redirectUri = process.env.OAUTH_PUBLIC_REDIRECT_URI || `http://localhost:${PORT}/oauth/callback`;
+        if (!clientId || !clientSecret) throw new Error('LINKEDIN_CLIENT_ID/SECRET missing in env');
+        const tokenResp = await fetch('https://www.linkedin.com/oauth/v2/accessToken', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: new URLSearchParams({
+            grant_type: 'authorization_code', code, redirect_uri: redirectUri,
+            client_id: clientId, client_secret: clientSecret,
+          }),
+        });
+        if (!tokenResp.ok) throw new Error('Token exchange failed: ' + await tokenResp.text());
+        const td = await tokenResp.json();
+        const userResp = await fetch('https://api.linkedin.com/v2/userinfo', {
+          headers: { Authorization: `Bearer ${td.access_token}` },
+        });
+        let userName = 'LinkedIn User', personUrn = '';
+        if (userResp.ok) {
+          const u = await userResp.json();
+          userName = u.name || `${u.given_name || ''} ${u.family_name || ''}`.trim();
+          personUrn = u.sub ? `urn:li:person:${u.sub}` : '';
+        }
+        const tokens = {
+          access_token: td.access_token,
+          refresh_token: td.refresh_token,
+          expires_at: new Date(Date.now() + td.expires_in * 1000).toISOString(),
+          refresh_token_expires_at: td.refresh_token_expires_in ? new Date(Date.now() + td.refresh_token_expires_in * 1000).toISOString() : undefined,
+          person_urn: personUrn, user_name: userName,
+          scopes: (td.scope || '').split(' ').filter(Boolean),
+        };
+        writeFileSync(AUTH_PATH, JSON.stringify(tokens, null, 2), { mode: 0o600 });
+        _authCache = tokens; _authCacheAt = Date.now();
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(`<html><body style="font-family:system-ui;padding:2rem;max-width:640px;margin:0 auto"><h1>OAuth OK</h1><p>Welcome, ${userName}.</p><p>Token expires: ${tokens.expires_at}</p><p>Scopes: <code>${tokens.scopes.join(' ')}</code></p><p><a href="/">Back to dashboard</a></p></body></html>`);
+      } catch (err) {
+        res.writeHead(500, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(`<html><body><h1>Token exchange failed</h1><pre>${err.message || err}</pre></body></html>`);
+      }
+      return;
+    }
+
+    // GET /oauth/start — kick off auth, redirect to LinkedIn consent
+    if (method === 'GET' && path === '/oauth/start') {
+      const clientId = process.env.LINKEDIN_CLIENT_ID;
+      if (!clientId) { res.writeHead(500); res.end('LINKEDIN_CLIENT_ID missing'); return; }
+      const redirectUri = process.env.OAUTH_PUBLIC_REDIRECT_URI || `http://localhost:${PORT}/oauth/callback`;
+      const scopes = (url.searchParams.get('scopes') || 'openid profile email w_member_social r_member_postAnalytics').split(/\s+/).join(' ');
+      const state = randomUUID();
+      const authUrl = new URL('https://www.linkedin.com/oauth/v2/authorization');
+      authUrl.searchParams.set('response_type', 'code');
+      authUrl.searchParams.set('client_id', clientId);
+      authUrl.searchParams.set('redirect_uri', redirectUri);
+      authUrl.searchParams.set('state', state);
+      authUrl.searchParams.set('scope', scopes);
+      res.writeHead(302, { Location: authUrl.toString() });
+      res.end();
+      return;
+    }
+
+    // PUT /api/scraper-auth — update li_at cookie from UI textarea
+    if (method === 'PUT' && path === '/api/scraper-auth') {
+      const body = await parseBody(req);
+      const liAt = (body.li_at || '').trim();
+      if (!liAt || liAt.length < 50) return json(res, { error: 'li_at too short or missing' }, 400);
+      const scraperAuthPath = join(DATA_DIR, 'scraper-auth.json');
+      const existing = (() => { try { return JSON.parse(readFileSync(scraperAuthPath, 'utf-8')); } catch { return {}; } })();
+      const updated = { ...existing, li_at: liAt, tos_acknowledged: true, updated_at: new Date().toISOString() };
+      writeFileSync(scraperAuthPath, JSON.stringify(updated, null, 2), { mode: 0o600 });
+      return json(res, { ok: true, updated_at: updated.updated_at });
+    }
+
+    // ── Newsletter / Biuletyn — content.db routes ───────────────────────────
+    const CONTENT_DB_PATH = join(DATA_DIR, 'content.db');
+
+    if (method === 'GET' && path === '/api/newsletter/editions') {
+      if (!existsSync(CONTENT_DB_PATH)) return json(res, []);
+      const cdb = new Database(CONTENT_DB_PATH, { readonly: true });
+      try {
+        const rows = cdb.prepare(`SELECT id, edition_number, topic_slug, subject, status, send_at, sent_at,
+                                          recipient_count, linkedin_scheduled_post_id, model_used,
+                                          input_tokens, cache_read_tokens, output_tokens,
+                                          created_at, updated_at
+                                   FROM newsletter_editions ORDER BY id DESC LIMIT 100`).all();
+        return json(res, rows);
+      } catch (e) {
+        return json(res, []);
+      } finally { cdb.close(); }
+    }
+
+    if (method === 'GET' && path === '/api/newsletter/subscribers') {
+      // counts only — no PII
+      if (!existsSync(CONTENT_DB_PATH)) return json(res, { pending: 0, confirmed: 0, unsubscribed: 0, bounced: 0 });
+      const cdb = new Database(CONTENT_DB_PATH, { readonly: true });
+      try {
+        const rows = cdb.prepare(`SELECT status, COUNT(*) AS count FROM subscribers GROUP BY status`).all();
+        const stats = { pending: 0, confirmed: 0, unsubscribed: 0, bounced: 0 };
+        for (const r of rows) stats[r.status] = r.count;
+        return json(res, stats);
+      } catch (e) {
+        return json(res, { pending: 0, confirmed: 0, unsubscribed: 0, bounced: 0 });
+      } finally { cdb.close(); }
+    }
+
+    if (method === 'GET' && path === '/api/content/topic-scores') {
+      if (!existsSync(CONTENT_DB_PATH)) return json(res, []);
+      const cdb = new Database(CONTENT_DB_PATH, { readonly: true });
+      try {
+        const rows = cdb.prepare(`SELECT topic_slug, topic_label_pl, focus_area, ga4_traffic_30d,
+                                          gsc_impressions_30d, gsc_avg_position, query_match_count,
+                                          has_existing_article, score, scored_at
+                                   FROM topic_scores ORDER BY score DESC LIMIT 50`).all();
+        return json(res, rows);
+      } catch (e) { return json(res, []); }
+      finally { cdb.close(); }
+    }
+
+    if (method === 'POST' && path.match(/^\/api\/newsletter\/editions\/(\d+)\/schedule$/)) {
+      const id = parseInt(path.split('/')[4], 10);
+      const body = await parseBody(req).catch(() => ({}));
+      const sendAt = body.send_at || new Date(Date.now() + 60_000).toISOString();
+      if (!existsSync(CONTENT_DB_PATH)) return json(res, { error: 'content.db missing' }, 404);
+      const cdb = new Database(CONTENT_DB_PATH);
+      try {
+        const info = cdb.prepare(`UPDATE newsletter_editions SET status='scheduled', send_at=?, updated_at=? WHERE id=? AND status='draft'`).run(sendAt, new Date().toISOString(), id);
+        return json(res, { ok: info.changes > 0, id, send_at: sendAt });
+      } finally { cdb.close(); }
+    }
+
+    if (method === 'POST' && path.match(/^\/api\/newsletter\/editions\/(\d+)\/regenerate$/)) {
+      const id = parseInt(path.split('/')[4], 10);
+      if (!existsSync(CONTENT_DB_PATH)) return json(res, { error: 'content.db missing' }, 404);
+      const cdb = new Database(CONTENT_DB_PATH, { readonly: true });
+      const row = cdb.prepare('SELECT topic_slug FROM newsletter_editions WHERE id=?').get(id);
+      cdb.close();
+      if (!row) return json(res, { error: 'edition not found' }, 404);
+      // Spawn drafter as child process (non-blocking)
+      try {
+        const child = spawn('node', ['scripts/draft-edition.mjs', `--topic-slug=${row.topic_slug}`], { cwd: MCP_DIR, env: process.env, detached: true, stdio: 'ignore' });
+        child.unref();
+        return json(res, { ok: true, spawned_pid: child.pid, topic_slug: row.topic_slug });
+      } catch (e) {
+        return json(res, { error: e.message }, 500);
+      }
+    }
+
+    // GET /api/health — production smoke test endpoint (D1 verification)
+    if (method === 'GET' && path === '/api/health') {
+      const checks = { status: 'ok', db: 'unknown', auth: 'unknown', version: process.env.GIT_SHA || 'dev', uptime_s: Math.round(process.uptime()) };
+      try {
+        const db = getDb();
+        db.prepare('SELECT 1').get();
+        db.close();
+        checks.db = 'reachable';
+      } catch (err) {
+        checks.db = 'error: ' + (err.message || String(err)).slice(0, 80);
+        checks.status = 'degraded';
+      }
+      try {
+        const auth = getAuth();
+        if (auth?.access_token && auth?.expires_at) {
+          checks.auth = new Date(auth.expires_at) > new Date() ? 'valid' : 'expired';
+          if (checks.auth === 'expired') checks.status = 'degraded';
+        } else {
+          checks.auth = 'missing';
+          checks.status = 'degraded';
+        }
+      } catch {
+        checks.auth = 'error';
+        checks.status = 'degraded';
+      }
+      return json(res, checks, checks.status === 'ok' ? 200 : 503);
     }
 
     // GET /api/status
@@ -358,7 +635,28 @@ async function handleRequest(req, res) {
         const dbw = getDb(false);
         dbw.prepare("UPDATE scheduled_posts SET status = 'published', post_urn = ?, published_at = ?, updated_at = datetime('now') WHERE id = ?")
           .run(result.post_urn, new Date().toISOString(), id);
-        dbw.close();
+
+        // Auto-link to media_plan_items + auto-trigger GSC pipeline (if linked + auto-submit ON)
+        const linkedItem = dbw.prepare("SELECT * FROM media_plan_items WHERE scheduled_post_id = ?").get(id);
+        if (linkedItem) {
+          dbw.prepare("UPDATE media_plan_items SET linkedin_post_urn = ?, status = ?, updated_at = datetime('now') WHERE id = ?")
+            .run(result.post_urn, 'opublikowane', linkedItem.id);
+          const setting = dbw.prepare("SELECT value FROM media_plan_settings WHERE key = 'gsc_auto_submit'").get();
+          dbw.close();
+          if (setting?.value === '1' && linkedItem.wiki_slug) {
+            // Fire-and-forget GSC pipeline (response returns to caller immediately)
+            (async () => {
+              try {
+                const r = await fetch(`http://localhost:${PORT}/api/media-plan/${linkedItem.id}/gsc-submit`, { method: 'POST' });
+                console.log('Auto GSC submit:', linkedItem.slug, r.status);
+              } catch (e) {
+                console.error('Auto GSC error:', e.message);
+              }
+            })();
+          }
+        } else {
+          dbw.close();
+        }
         return json(res, { ok: true, post_urn: result.post_urn });
       } catch (err) {
         return json(res, { error: err.message }, 500);
@@ -516,7 +814,7 @@ Po zakończeniu wypisz raport: które zaproszenia wysłane, które nie (np. już
         try { health.prospects = pdb.prepare("SELECT COUNT(*) as cnt, COUNT(CASE WHEN lead_score > 0 THEN 1 END) as scored FROM prospects").get(); } catch { health.prospects = { cnt: 0, scored: 0 }; }
         pdb.close();
         // Voyager auth status
-        const scraperAuth = join(homedir(), '.linkedin-mcp', 'scraper-auth.json');
+        const scraperAuth = join(DATA_DIR, 'scraper-auth.json');
         let voyagerStatus = 'unknown';
         try {
           const sa = JSON.parse(readFileSync(scraperAuth, 'utf-8'));
@@ -575,15 +873,27 @@ Po zakończeniu wypisz raport: które zaproszenia wysłane, które nie (np. już
         },
       ];
 
-      // Check running PIDs via launchctl
+      // Check running PIDs — macOS uses launchctl, Linux/container reads docker ps or pgrep
       let runningPids = {};
       try {
-        const out = execSync('launchctl list 2>/dev/null | grep gaca.linkedin', { encoding: 'utf-8' });
-        for (const line of out.trim().split('\n')) {
-          const [pid, , label] = line.trim().split(/\s+/);
-          if (label) {
-            const id = label.replace('com.gaca.linkedin-', '');
-            runningPids[id] = pid !== '-' ? parseInt(pid) : null;
+        if (IS_MACOS) {
+          const out = execSync('launchctl list 2>/dev/null | grep gaca.linkedin', { encoding: 'utf-8' });
+          for (const line of out.trim().split('\n')) {
+            const [pid, , label] = line.trim().split(/\s+/);
+            if (label) {
+              const id = label.replace('com.gaca.linkedin-', '');
+              runningPids[id] = pid !== '-' ? parseInt(pid) : null;
+            }
+          }
+        } else {
+          // Linux container: each daemon runs in its own container; use pgrep on script name
+          for (const a of automations) {
+            const scriptName = (a.command || '').split('/').pop();
+            if (!scriptName) continue;
+            try {
+              const pid = execSync(`pgrep -f "node.*${scriptName}" | head -1`, { encoding: 'utf-8' }).trim();
+              if (pid) runningPids[a.id] = parseInt(pid);
+            } catch {}
           }
         }
       } catch {}
@@ -1483,6 +1793,438 @@ Po zakończeniu wypisz raport: które zaproszenia wysłane, które nie (np. już
       return json(res, { ok: true, classified, hashtags_updated: Object.keys(hashStats).length, total_posts: published.length });
     }
 
+    // ── /api/media-plan ────────────────────────────────────────────────────
+
+    // GET /api/media-plan — list all 12 items, optional ?status= filter
+    if (method === 'GET' && path === '/api/media-plan') {
+      const db = getDb();
+      const status = url.searchParams.get('status');
+      let rows;
+      if (status) {
+        rows = db.prepare("SELECT * FROM media_plan_items WHERE status = ? ORDER BY topic_number").all(status);
+      } else {
+        rows = db.prepare("SELECT * FROM media_plan_items ORDER BY topic_number").all();
+      }
+      const settings = db.prepare("SELECT key, value FROM media_plan_settings").all();
+      db.close();
+      const settingsObj = Object.fromEntries(settings.map(s => [s.key, s.value]));
+      // Counts by status
+      const counts = { plan: 0, napisane: 0, opublikowane: 0, gsc_verified: 0, cancelled: 0 };
+      for (const r of rows) counts[r.status] = (counts[r.status] || 0) + 1;
+      return json(res, { items: rows, counts, settings: settingsObj });
+    }
+
+    // GET /api/media-plan/:id — single item
+    if (method === 'GET' && path.match(/^\/api\/media-plan\/[^/]+$/)) {
+      const id = path.split('/').pop();
+      const db = getDb();
+      const item = db.prepare("SELECT * FROM media_plan_items WHERE id = ? OR slug = ?").get(id, id);
+      db.close();
+      if (!item) return json(res, { error: 'Not found' }, 404);
+      return json(res, item);
+    }
+
+    // PUT /api/media-plan/:id — update mutable fields
+    if (method === 'PUT' && path.match(/^\/api\/media-plan\/[^/]+$/)) {
+      const id = path.split('/').pop();
+      const body = await parseBody(req);
+      const allowed = [
+        'post_text', 'hashtags', 'cta', 'lead_trigger',
+        'banner_path', 'visual_asset_path', 'visual_asset_type',
+        'wiki_slug', 'publish_at', 'language',
+        'cannibalize_status'
+      ];
+      const updates = [];
+      const values = [];
+      for (const k of allowed) {
+        if (body[k] !== undefined) {
+          updates.push(`${k} = ?`);
+          values.push(body[k]);
+        }
+      }
+      if (updates.length === 0) return json(res, { error: 'No fields to update' }, 400);
+      const db = getDb(false);
+      const sql = `UPDATE media_plan_items SET ${updates.join(', ')}, updated_at = datetime('now') WHERE id = ? OR slug = ?`;
+      const result = db.prepare(sql).run(...values, id, id);
+      const item = db.prepare("SELECT * FROM media_plan_items WHERE id = ? OR slug = ?").get(id, id);
+      db.close();
+      if (!result.changes) return json(res, { error: 'Not found' }, 404);
+      return json(res, item);
+    }
+
+    // POST /api/media-plan/:id/check-cannibalize — Jaccard match vs bartoszgaca.pl articles
+    if (method === 'POST' && path.match(/^\/api\/media-plan\/[^/]+\/check-cannibalize$/)) {
+      const id = path.split('/')[3];
+      const db = getDb(false);
+      const item = db.prepare("SELECT * FROM media_plan_items WHERE id = ? OR slug = ?").get(id, id);
+      if (!item) { db.close(); return json(res, { error: 'Not found' }, 404); }
+
+      const ARTICLES_DIR = '/Users/gaca/projects/personal/bartoszgaca.pl/data/articles';
+      const tokenize = (s) => (s || '').toLowerCase()
+        .replace(/[^a-ząćęłńóśźż0-9\s]/g, ' ')
+        .split(/\s+/)
+        .filter(t => t.length >= 3);
+      const jaccard = (a, b) => {
+        const A = new Set(a), B = new Set(b);
+        const inter = [...A].filter(x => B.has(x)).length;
+        const union = new Set([...A, ...B]).size;
+        return union === 0 ? 0 : inter / union;
+      };
+
+      const itemTokens = tokenize(`${item.title || ''} ${item.hook || ''} ${item.hashtags || ''}`);
+
+      const overlaps = [];
+      try {
+        const { readdirSync, readFileSync } = await import('fs');
+        const files = readdirSync(ARTICLES_DIR).filter(f => f.endsWith('.ts') && f !== 'index.ts');
+        for (const f of files) {
+          const slug = f.replace(/\.ts$/, '');
+          const content = readFileSync(`${ARTICLES_DIR}/${f}`, 'utf-8');
+          const titleM = content.match(/title:\s*"([^"]+)"/);
+          const title = titleM ? titleM[1] : slug;
+          const articleTokens = tokenize(`${title} ${slug}`);
+          const score = jaccard(itemTokens, articleTokens);
+          if (score >= 0.15) overlaps.push({ slug, title, score: +score.toFixed(3) });
+        }
+      } catch (e) {
+        db.close();
+        return json(res, { error: `Failed to read articles: ${e.message}` }, 500);
+      }
+
+      overlaps.sort((a, b) => b.score - a.score);
+      const top3 = overlaps.slice(0, 3);
+      const maxScore = overlaps[0]?.score || 0;
+      const status = maxScore >= 0.4 ? 'strong' : maxScore >= 0.2 ? 'weak' : 'clear';
+
+      db.prepare(`UPDATE media_plan_items SET cannibalize_status = ?, cannibalize_overlaps = ?, cannibalize_checked_at = datetime('now'), updated_at = datetime('now') WHERE id = ?`)
+        .run(status, JSON.stringify(top3), item.id);
+      db.close();
+
+      return json(res, { status, overlaps: top3, total_checked: overlaps.length, max_score: maxScore });
+    }
+
+    // PUT /api/media-plan/settings/:key — toggle (e.g. gsc_auto_submit)
+    if (method === 'PUT' && path.match(/^\/api\/media-plan\/settings\/[^/]+$/)) {
+      const key = path.split('/').pop();
+      const body = await parseBody(req);
+      if (typeof body.value !== 'string') return json(res, { error: 'value (string) required' }, 400);
+      const db = getDb(false);
+      db.prepare("INSERT OR REPLACE INTO media_plan_settings (key, value, updated_at) VALUES (?, ?, datetime('now'))").run(key, body.value);
+      db.close();
+      return json(res, { ok: true, key, value: body.value });
+    }
+
+    // POST /api/media-plan/:id/transition — change status with validation
+    if (method === 'POST' && path.match(/^\/api\/media-plan\/[^/]+\/transition$/)) {
+      const id = path.split('/')[3];
+      const body = await parseBody(req);
+      const to = body.to;
+      const db = getDb(false);
+      const item = db.prepare("SELECT * FROM media_plan_items WHERE id = ? OR slug = ?").get(id, id);
+      if (!item) { db.close(); return json(res, { error: 'Not found' }, 404); }
+
+      const errors = [];
+      if (to === 'napisane') {
+        if (item.status !== 'plan' && item.status !== 'napisane') errors.push(`Can't transition from ${item.status} to napisane`);
+        if (!item.post_text || item.post_text.length < 1300) errors.push(`post_text must be >= 1300 chars (now ${(item.post_text || '').length})`);
+        if (!item.banner_path) errors.push('banner_path is empty');
+        else if (!existsSync(item.banner_path)) errors.push(`banner file not found: ${item.banner_path}`);
+        if (!item.visual_asset_path) errors.push('visual_asset_path is empty');
+        else if (!existsSync(item.visual_asset_path)) errors.push(`visual asset not found: ${item.visual_asset_path}`);
+        if (item.cannibalize_status === 'strong') errors.push('cannibalize_status is strong — blocks transition');
+      } else if (to === 'opublikowane') {
+        if (item.status !== 'napisane') errors.push(`Can't transition from ${item.status} to opublikowane`);
+        if (!item.scheduled_post_id) errors.push('scheduled_post_id missing — schedule first');
+      } else if (to === 'gsc_verified') {
+        if (item.status !== 'opublikowane') errors.push(`Can't transition from ${item.status} to gsc_verified`);
+      } else if (to === 'cancelled') {
+        // any → cancelled allowed
+      } else {
+        errors.push(`Unknown target status: ${to}`);
+      }
+
+      if (errors.length) { db.close(); return json(res, { error: 'Validation failed', errors }, 400); }
+
+      db.prepare("UPDATE media_plan_items SET status = ?, updated_at = datetime('now') WHERE id = ?").run(to, item.id);
+      const updated = db.prepare("SELECT * FROM media_plan_items WHERE id = ?").get(item.id);
+      db.close();
+      return json(res, updated);
+    }
+
+    // POST /api/media-plan/:id/schedule — create scheduled_posts row + link
+    if (method === 'POST' && path.match(/^\/api\/media-plan\/[^/]+\/schedule$/)) {
+      const id = path.split('/')[3];
+      const db = getDb(false);
+      const item = db.prepare("SELECT * FROM media_plan_items WHERE id = ? OR slug = ?").get(id, id);
+      if (!item) { db.close(); return json(res, { error: 'Not found' }, 404); }
+      if (item.status !== 'napisane') { db.close(); return json(res, { error: `Item must be 'napisane' (now ${item.status})` }, 400); }
+      if (item.scheduled_post_id) {
+        const existing = db.prepare("SELECT id, status, publish_at FROM scheduled_posts WHERE id = ?").get(item.scheduled_post_id);
+        if (existing) { db.close(); return json(res, { ok: true, already: true, scheduled_post: existing }); }
+      }
+
+      const newPostId = randomUUID();
+      const bannerConfig = item.banner_path ? JSON.stringify({ path: item.banner_path }) : null;
+      db.prepare(`INSERT INTO scheduled_posts (id, text, visibility, language, publish_at, status, banner_config, created_at, updated_at)
+                  VALUES (?, ?, 'PUBLIC', ?, ?, 'scheduled', ?, datetime('now'), datetime('now'))`)
+        .run(newPostId, item.post_text, item.language, item.publish_at, bannerConfig);
+      db.prepare("UPDATE media_plan_items SET scheduled_post_id = ?, updated_at = datetime('now') WHERE id = ?")
+        .run(newPostId, item.id);
+      const post = db.prepare("SELECT * FROM scheduled_posts WHERE id = ?").get(newPostId);
+      const updated = db.prepare("SELECT * FROM media_plan_items WHERE id = ?").get(item.id);
+      db.close();
+      return json(res, { ok: true, scheduled_post: post, item: updated });
+    }
+
+    // POST /api/media-plan/:id/gsc-inspect — read-only index_inspect via priv-gsc
+    if (method === 'POST' && path.match(/^\/api\/media-plan\/[^/]+\/gsc-inspect$/)) {
+      const id = path.split('/')[3];
+      const db = getDb();
+      const item = db.prepare("SELECT * FROM media_plan_items WHERE id = ? OR slug = ?").get(id, id);
+      db.close();
+      if (!item) return json(res, { error: 'Not found' }, 404);
+      if (!item.wiki_slug) return json(res, { error: 'wiki_slug is empty — set it first' }, 400);
+
+      const siteUrl = 'https://bartoszgaca.pl/';
+      const inspectionUrl = siteUrl.replace(/\/$/, '') + item.wiki_slug;
+
+      gscAuditLog(item.id, 'gsc-inspect', 'started', { inspectionUrl });
+      try {
+        const result = await callGSC('index_inspect', { siteUrl, inspectionUrl, languageCode: 'pl-PL' });
+        const dbw = getDb(false);
+        dbw.prepare("UPDATE media_plan_items SET gsc_status = ?, gsc_inspect_result = ?, gsc_checked_at = datetime('now'), updated_at = datetime('now') WHERE id = ?")
+          .run('inspected', JSON.stringify(result), item.id);
+        dbw.close();
+        gscAuditLog(item.id, 'gsc-inspect', 'ok', result);
+        return json(res, { ok: true, inspectionUrl, result });
+      } catch (err) {
+        gscAuditLog(item.id, 'gsc-inspect', 'error', err.message);
+        const dbw = getDb(false);
+        dbw.prepare("UPDATE media_plan_items SET gsc_status = ?, gsc_inspect_result = ?, gsc_checked_at = datetime('now'), updated_at = datetime('now') WHERE id = ?")
+          .run('error', JSON.stringify({ error: err.message }), item.id);
+        dbw.close();
+        return json(res, { error: err.message }, 500);
+      }
+    }
+
+    // POST /api/media-plan/:id/gsc-submit — pre-flight (page+canonical / sitemap / index_inspect) → submit_sitemap
+    if (method === 'POST' && path.match(/^\/api\/media-plan\/[^/]+\/gsc-submit$/)) {
+      const id = path.split('/')[3];
+      const db = getDb();
+      const item = db.prepare("SELECT * FROM media_plan_items WHERE id = ? OR slug = ?").get(id, id);
+      const settings = db.prepare("SELECT value FROM media_plan_settings WHERE key = 'gsc_auto_submit'").get();
+      db.close();
+      if (!item) return json(res, { error: 'Not found' }, 404);
+      if (!item.wiki_slug) return json(res, { error: 'wiki_slug is empty' }, 400);
+
+      const siteUrl = 'https://bartoszgaca.pl/';
+      const fullUrl = siteUrl.replace(/\/$/, '') + item.wiki_slug;
+
+      gscAuditLog(item.id, 'gsc-submit', 'started', { fullUrl, auto_submit_setting: settings?.value });
+
+      // Pre-flight 1: page exists + canonical
+      let pageOk = false, canonicalUrl = null;
+      try {
+        const r = await fetch(fullUrl, { redirect: 'manual' });
+        if (r.status !== 200) throw new Error(`HTTP ${r.status}`);
+        const html = await r.text();
+        const m = html.match(/<link[^>]+rel=["']canonical["'][^>]+href=["']([^"']+)["']/i);
+        canonicalUrl = m ? m[1] : null;
+        if (canonicalUrl && canonicalUrl !== fullUrl && canonicalUrl !== fullUrl + '/') {
+          throw new Error(`Canonical mismatch: ${canonicalUrl} != ${fullUrl}`);
+        }
+        pageOk = true;
+      } catch (err) {
+        gscAuditLog(item.id, 'gsc-submit', 'blocked_no_page', err.message);
+        const dbw = getDb(false);
+        dbw.prepare("UPDATE media_plan_items SET gsc_status = ?, updated_at = datetime('now') WHERE id = ?")
+          .run('blocked_no_page', item.id);
+        dbw.close();
+        return json(res, { error: 'Pre-flight 1 failed: page check', detail: err.message }, 400);
+      }
+
+      // Pre-flight 2: URL is in sitemap
+      let inSitemap = false, sitemapUrl = null;
+      try {
+        const sitemaps = await callGSC('list_sitemaps', { siteUrl });
+        const sitemapList = sitemaps.sitemap || sitemaps.sitemaps || [];
+        for (const sm of sitemapList) {
+          const smPath = sm.path || sm.feedpath || '';
+          if (!smPath) continue;
+          try {
+            const smRes = await fetch(smPath.startsWith('http') ? smPath : (siteUrl.replace(/\/$/, '') + smPath));
+            if (!smRes.ok) continue;
+            const xml = await smRes.text();
+            if (xml.includes(fullUrl) || xml.includes(item.wiki_slug)) {
+              inSitemap = true;
+              sitemapUrl = smPath;
+              break;
+            }
+          } catch {}
+        }
+        // Fallback: try common sitemap paths
+        if (!inSitemap) {
+          for (const p of ['/sitemap.xml', '/sitemap-articles.xml', '/sitemap-pages.xml']) {
+            try {
+              const baseUrl = siteUrl.replace(/\/$/, '');
+              const r = await fetch(baseUrl + p);
+              if (!r.ok) continue;
+              const xml = await r.text();
+              if (xml.includes(fullUrl) || xml.includes(item.wiki_slug)) {
+                inSitemap = true;
+                sitemapUrl = baseUrl + p;
+                break;
+              }
+            } catch {}
+          }
+        }
+        if (!inSitemap) throw new Error(`URL not found in any sitemap`);
+      } catch (err) {
+        gscAuditLog(item.id, 'gsc-submit', 'blocked_no_sitemap', err.message);
+        const dbw = getDb(false);
+        dbw.prepare("UPDATE media_plan_items SET gsc_status = ?, updated_at = datetime('now') WHERE id = ?")
+          .run('blocked_no_sitemap', item.id);
+        dbw.close();
+        return json(res, { error: 'Pre-flight 2 failed: sitemap check', detail: err.message }, 400);
+      }
+
+      // Pre-flight 3: index_inspect — already indexed?
+      let alreadyIndexed = false;
+      try {
+        const inspect = await callGSC('index_inspect', { siteUrl, inspectionUrl: fullUrl, languageCode: 'pl-PL' });
+        const status = inspect?.indexStatusResult?.coverageState || inspect?.coverageState || '';
+        if (/Submitted and indexed|Indexed/i.test(status)) {
+          alreadyIndexed = true;
+        }
+        gscAuditLog(item.id, 'gsc-submit', 'index_check', { status, alreadyIndexed });
+      } catch (err) {
+        // non-fatal — proceed to resubmit
+        gscAuditLog(item.id, 'gsc-submit', 'index_check_error', err.message);
+      }
+
+      if (alreadyIndexed) {
+        const dbw = getDb(false);
+        dbw.prepare("UPDATE media_plan_items SET gsc_status = ?, status = ?, gsc_checked_at = datetime('now'), updated_at = datetime('now') WHERE id = ?")
+          .run('already_indexed', 'gsc_verified', item.id);
+        dbw.close();
+        gscAuditLog(item.id, 'gsc-submit', 'skipped_already_indexed', { sitemapUrl });
+        return json(res, { ok: true, skipped: true, reason: 'already_indexed', sitemapUrl });
+      }
+
+      // Action: resubmit sitemap to nudge Google to recrawl
+      try {
+        const feedpath = sitemapUrl.startsWith('http') ? sitemapUrl : (siteUrl.replace(/\/$/, '') + sitemapUrl);
+        const submitRes = await callGSC('submit_sitemap', { siteUrl, feedpath });
+        const dbw = getDb(false);
+        dbw.prepare("UPDATE media_plan_items SET gsc_status = ?, status = ?, updated_at = datetime('now') WHERE id = ?")
+          .run('submitted', 'gsc_verified', item.id);
+        dbw.close();
+        gscAuditLog(item.id, 'gsc-submit', 'sitemap_submitted', { feedpath, response: submitRes });
+        return json(res, { ok: true, action: 'sitemap_resubmitted', sitemapUrl: feedpath });
+      } catch (err) {
+        gscAuditLog(item.id, 'gsc-submit', 'submit_error', err.message);
+        const dbw = getDb(false);
+        dbw.prepare("UPDATE media_plan_items SET gsc_status = ?, updated_at = datetime('now') WHERE id = ?")
+          .run('submit_error', item.id);
+        dbw.close();
+        return json(res, { error: 'Submit failed', detail: err.message }, 500);
+      }
+    }
+
+    // POST /api/media-plan/:id/upload — multipart upload for banner / visual asset
+    if (method === 'POST' && path.match(/^\/api\/media-plan\/[^/]+\/upload$/)) {
+      const id = path.split('/')[3];
+      const url2 = new URL(req.url, 'http://localhost:' + PORT);
+      const kind = url2.searchParams.get('kind') || 'visual'; // 'banner' or 'visual'
+      const filename = url2.searchParams.get('filename') || 'upload.bin';
+      const db = getDb();
+      const item = db.prepare("SELECT * FROM media_plan_items WHERE id = ? OR slug = ?").get(id, id);
+      db.close();
+      if (!item) return json(res, { error: 'Not found' }, 404);
+
+      const safeName = filename.replace(/[^a-zA-Z0-9._-]/g, '_');
+      const targetDir = `/Users/gaca/projects/personal/bartoszgaca.pl/banners/2026-Q2/${item.slug}`;
+      try { execSync(`mkdir -p "${targetDir}"`); } catch {}
+      const finalName = kind === 'banner' ? `banner${extname(safeName) || '.png'}` : safeName;
+      const targetPath = `${targetDir}/${finalName}`;
+
+      const chunks = [];
+      req.on('data', c => chunks.push(c));
+      req.on('end', () => {
+        try {
+          writeFileSync(targetPath, Buffer.concat(chunks));
+          const stats = statSync(targetPath);
+          const dbw = getDb(false);
+          const field = kind === 'banner' ? 'banner_path' : 'visual_asset_path';
+          const typeField = kind === 'visual' ? extname(safeName).slice(1) : null;
+          if (typeField) {
+            dbw.prepare(`UPDATE media_plan_items SET ${field} = ?, visual_asset_type = ?, updated_at = datetime('now') WHERE id = ?`).run(targetPath, typeField, item.id);
+          } else {
+            dbw.prepare(`UPDATE media_plan_items SET ${field} = ?, updated_at = datetime('now') WHERE id = ?`).run(targetPath, item.id);
+          }
+          dbw.close();
+          json(res, { ok: true, path: targetPath, size: stats.size, kind });
+        } catch (e) {
+          json(res, { error: e.message }, 500);
+        }
+      });
+      return;
+    }
+
+    // POST /api/media-plan/:id/generate-banner — call linkedin_banner_generate via MCP
+    if (method === 'POST' && path.match(/^\/api\/media-plan\/[^/]+\/generate-banner$/)) {
+      const id = path.split('/')[3];
+      const body = await parseBody(req).catch(() => ({}));
+      const db = getDb();
+      const item = db.prepare("SELECT * FROM media_plan_items WHERE id = ? OR slug = ?").get(id, id);
+      db.close();
+      if (!item) return json(res, { error: 'Not found' }, 404);
+
+      // Map our banner_concept to existing linkedin_banner_generate templates
+      const conceptToTemplate = {
+        screenshot: 'split',
+        numbers: 'numbers',
+        split: 'split',
+        code: 'quote',
+        typography: 'hero'
+      };
+      const template = conceptToTemplate[item.banner_concept] || 'hero';
+
+      const targetDir = `/Users/gaca/projects/personal/bartoszgaca.pl/banners/2026-Q2/${item.slug}`;
+      try { execSync(`mkdir -p "${targetDir}"`); } catch {}
+      const outputPath = `${targetDir}/banner.png`;
+
+      const args = {
+        template,
+        gradient: body.gradient || 'midnight',
+        headline: body.headline || (item.title || item.hook || `#${item.topic_number}`).slice(0, 60),
+        subheadline: body.subheadline || (item.hook || '').slice(0, 120),
+        cta_text: body.cta_text || 'bartoszgaca.pl',
+        output_path: outputPath
+      };
+
+      try {
+        const result = await callMCP('linkedin_banner_generate', args);
+        const dbw = getDb(false);
+        dbw.prepare("UPDATE media_plan_items SET banner_path = ?, updated_at = datetime('now') WHERE id = ?").run(outputPath, item.id);
+        dbw.close();
+        return json(res, { ok: true, banner_path: outputPath, mcp_result: result });
+      } catch (err) {
+        return json(res, { error: err.message }, 500);
+      }
+    }
+
+    // GET /api/media-plan/:id/gsc-audit — recent audit log entries
+    if (method === 'GET' && path.match(/^\/api\/media-plan\/[^/]+\/gsc-audit$/)) {
+      const id = path.split('/')[3];
+      const db = getDb();
+      const item = db.prepare("SELECT id FROM media_plan_items WHERE id = ? OR slug = ?").get(id, id);
+      if (!item) { db.close(); return json(res, { error: 'Not found' }, 404); }
+      const rows = db.prepare("SELECT * FROM gsc_audit_log WHERE media_plan_item_id = ? ORDER BY created_at DESC LIMIT 50").all(item.id);
+      db.close();
+      return json(res, { entries: rows });
+    }
+
     // GET / — serve dashboard HTML (cached; static content never changes at runtime)
     if (method === 'GET' && (path === '/' || path === '/index.html')) {
       if (!_htmlCache) _htmlCache = buildHtml();
@@ -1865,6 +2607,7 @@ function buildHtml() {
 '<div class="logo"><em>LI</em> Dashboard</div>',
 '<nav class="tabnav">',
 '<button class="tnb active" data-tab="posty">Posty</button>',
+'<button class="tnb" data-tab="mediaplan">Media Plan</button>',
 '<button class="tnb" data-tab="prospekci">Inbound Leads</button>',
 '<button class="tnb" data-tab="kalendarz">Kalendarz</button>',
 '<button class="tnb" data-tab="rutyna">Rutyna</button>',
@@ -1891,6 +2634,7 @@ function buildHtml() {
 '</div>',
 '</div>',
 // ── Tab: Prospekci & Zaproszenia ────────────────────────────────────────
+'<div class="tab-panel" id="tab-mediaplan"><div class="wrap" id="mp-root"></div></div>',
 '<div class="tab-panel" id="tab-prospekci"><div class="wrap" id="pro-root"></div></div>',
 // ── Tab: Kalendarz ──────────────────────────────────────────────────────
 '<div class="tab-panel" id="tab-kalendarz"><div class="wrap" id="kal-root"></div></div>',
@@ -1928,6 +2672,44 @@ function buildHtml() {
 '</div>',
 '</div>',
 '<div class="toast" id="toast"></div>',
+
+// ── Media Plan modal ──
+'<div class="overlay" id="mp-ov">',
+'<div class="modal" style="width:980px">',
+'<h2 id="mp-mtitle">Media Plan — Edit</h2>',
+'<div id="mp-meta" style="margin-bottom:14px;font-size:12px;color:var(--dim)"></div>',
+'<div class="lcol act" style="margin-bottom:14px">',
+'<label>Treść posta (PL/EN — wg item.language)</label>',
+'<textarea id="mp-text" placeholder="Napisz treść 1300-1700 znaków..." style="min-height:280px"></textarea>',
+'<div class="cc"><span id="mp-cc">0</span> chars (target 1300-1700) · <span id="mp-cc-warn" style="color:var(--red)"></span></div>',
+'</div>',
+'<div class="frow">',
+'<div class="fg"><label>Banner path</label><input type="text" id="mp-banner" placeholder=".../banner.png"><div style="display:flex;gap:6px;margin-top:6px"><button class="btn sm" id="mp-gen-banner">🎨 Generate via MCP</button><label class="btn sm" style="cursor:pointer">📁 Upload<input type="file" id="mp-upload-banner" accept=".png,.jpg,.jpeg" style="display:none"></label></div></div>',
+'<div class="fg"><label>Visual asset path</label><input type="text" id="mp-visual" placeholder=".../screenshot.png lub .../demo.mp4"><div style="display:flex;gap:6px;margin-top:6px"><label class="btn sm" style="cursor:pointer">📁 Upload screen/video<input type="file" id="mp-upload-visual" accept="image/*,video/*" style="display:none"></label></div></div>',
+'</div>',
+'<div class="frow">',
+'<div class="fg"><label>Hashtags (space-separated, with #)</label><input type="text" id="mp-hashtags" placeholder="#mcp #automation #algorithm"></div>',
+'<div class="fg"><label>CTA</label><input type="text" id="mp-cta" placeholder="DM **WORD** — pokażę..."></div>',
+'</div>',
+'<div class="frow">',
+'<div class="fg"><label>Publish at</label><input type="datetime-local" id="mp-publish-at"></div>',
+'<div class="fg"><label>Wiki slug</label><input type="text" id="mp-wiki-slug" placeholder="/baza-wiedzy/<slug>"></div>',
+'</div>',
+'<div class="cprev"><b>Visual asset plan (5-min capture):</b><br><pre id="mp-visual-plan" style="white-space:pre-wrap;font-size:11px;font-family:var(--mono);color:#c9d1d9;margin-top:6px"></pre></div>',
+'<div class="cprev" id="mp-gsc-box" style="display:none"><b>GSC inspect result:</b><br><pre id="mp-gsc-result" style="white-space:pre-wrap;font-size:11px;font-family:var(--mono);color:#c9d1d9;margin-top:6px;max-height:200px;overflow-y:auto"></pre></div>',
+'<div class="mact" style="flex-wrap:wrap;justify-content:flex-start;gap:6px">',
+'<button class="btn" id="mp-mcancel">Cancel</button>',
+'<button class="btn primary" id="mp-msave">💾 Save</button>',
+'<button class="btn" id="mp-recheck-can" style="background:#21262d">🔍 Recheck cannibalize</button>',
+'<button class="btn" id="mp-mark-napisane" style="background:#bf8700;border-color:#bf8700">✍️ Mark Napisane</button>',
+'<button class="btn" id="mp-schedule" style="background:#1f6feb;border-color:#1f6feb">🚀 Schedule LinkedIn</button>',
+'<button class="btn" id="mp-gsc-inspect" style="background:#21262d">🔎 GSC Inspect</button>',
+'<button class="btn" id="mp-gsc-submit" style="background:#238636;border-color:#238636">📤 GSC Submit</button>',
+'<button class="btn danger" id="mp-cancel-item">❌ Cancel item</button>',
+'</div>',
+'</div>',
+'</div>',
+
 '<script>',
 buildJs(),
 '</script>',
@@ -2345,7 +3127,416 @@ document.querySelectorAll('.tnb').forEach(function(b) {
     if (b.dataset.tab === 'siec') renderSiec();
     if (b.dataset.tab === 'leady') renderLeady();
     if (b.dataset.tab === 'kontenty') renderKontenty();
+    if (b.dataset.tab === 'mediaplan') renderMediaPlan();
   });
+});
+
+// ── MEDIA PLAN ───────────────────────────────────────────────────────────────
+
+var mpItems = [];
+
+function renderMediaPlan() {
+  var root = $$('mp-root');
+  if (!root) return;
+  root.innerHTML = '<div style="padding:40px;text-align:center;color:var(--dim)">Loading…</div>';
+  fetch('/api/media-plan').then(function(r) { return r.json(); }).then(function(data) {
+    mpItems = data.items || [];
+    var counts = data.counts || {};
+    var settings = data.settings || {};
+    var top3 = mpItems.filter(function(i) { return i.score_total >= 4.9 && i.status !== 'cancelled'; }).sort(function(a,b){return b.score_total - a.score_total;});
+    var html = [];
+    html.push('<h2 class="pg-title">Media Plan Q2 2026 — 12 tematów</h2>');
+    html.push('<div class="post-stats">');
+    html.push('<div class="stat">📋 Plan <b>' + (counts.plan || 0) + '</b></div>');
+    html.push('<div class="stat">✍️ Napisane <b>' + (counts.napisane || 0) + '</b></div>');
+    html.push('<div class="stat">🚀 Opublikowane <b>' + (counts.opublikowane || 0) + '</b></div>');
+    html.push('<div class="stat">🔍 GSC <b>' + (counts.gsc_verified || 0) + '</b></div>');
+    html.push('<div class="stat">❌ Cancelled <b>' + (counts.cancelled || 0) + '</b></div>');
+    html.push('<div class="stat" style="margin-left:auto"><label style="display:flex;gap:6px;align-items:center;font-size:12px;color:var(--dim);cursor:pointer"><input type="checkbox" id="mp-gsc-toggle" ' + (settings.gsc_auto_submit === '1' ? 'checked' : '') + '> GSC auto-submit</label></div>');
+    html.push('</div>');
+
+    if (top3.length) {
+      html.push('<div class="sec-h">⭐ TOP-3 do produkcji w pierwszej kolejności</div>');
+      html.push('<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:10px;margin-bottom:18px">');
+      for (var i = 0; i < top3.length; i++) html.push(renderMpCard(top3[i], true));
+      html.push('</div>');
+    }
+
+    html.push('<div class="sec-h">Wszystkie 12 tematów</div>');
+    html.push('<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(380px,1fr));gap:10px">');
+    for (var j = 0; j < mpItems.length; j++) html.push(renderMpCard(mpItems[j], false));
+    html.push('</div>');
+
+    root.innerHTML = html.join('');
+
+    // GSC auto-submit toggle handler
+    var gscToggle = $$('mp-gsc-toggle');
+    if (gscToggle) {
+      gscToggle.addEventListener('change', function() {
+        fetch('/api/media-plan/settings/gsc_auto_submit', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ value: gscToggle.checked ? '1' : '0' })
+        });
+      });
+    }
+  }).catch(function(e) {
+    root.innerHTML = '<div style="padding:40px;text-align:center;color:var(--red)">Error: ' + e.message + '</div>';
+  });
+}
+
+function renderMpCard(it, isTop) {
+  var statusBadge = {
+    plan: '<span class="badge b-scheduled">📋 Plan</span>',
+    napisane: '<span class="badge" style="background:rgba(210,153,34,.15);color:var(--yel)">✍️ Napisane</span>',
+    opublikowane: '<span class="badge b-published">🚀 Opublikowane</span>',
+    gsc_verified: '<span class="badge" style="background:rgba(63,185,80,.2);color:var(--grn)">🔍 GSC OK</span>',
+    cancelled: '<span class="badge b-cancelled">❌</span>'
+  }[it.status] || '<span class="badge">' + it.status + '</span>';
+
+  var canniBadge = {
+    clear: '<span class="badge" style="background:rgba(63,185,80,.15);color:var(--grn)">✅ clear</span>',
+    weak: '<span class="badge" style="background:rgba(210,153,34,.15);color:var(--yel)">⚠️ weak</span>',
+    strong: '<span class="badge" style="background:rgba(218,54,51,.15);color:var(--red)">🚨 strong</span>',
+    pending: '<span class="badge b-cancelled">⏳ pending</span>'
+  }[it.cannibalize_status || 'pending'];
+
+  var langBadge = it.language === 'en'
+    ? '<span class="badge b-en">EN</span>'
+    : '<span class="badge b-pl">PL</span>';
+
+  var stars = it.score_total >= 4.9 ? '⭐⭐⭐' : it.score_total >= 4.0 ? '⭐⭐' : it.score_total >= 3.0 ? '⭐' : '';
+  var scoreColor = it.score_total >= 4.9 ? 'var(--grn)' : it.score_total >= 4.0 ? 'var(--blu)' : it.score_total >= 3.0 ? 'var(--yel)' : 'var(--red)';
+
+  var publishDate = (it.publish_at || '').replace(' ', ' · ').slice(0, 16);
+
+  var hasContent = it.post_text && it.post_text.length >= 1300;
+  var hasBanner = !!it.banner_path;
+  var hasVisual = !!it.visual_asset_path;
+
+  var artChecks = [
+    hasContent ? '✅' : '☐',
+    hasBanner ? '✅' : '☐',
+    hasVisual ? '✅' : '☐'
+  ];
+
+  var hookText = (it.hook || '').replace(/</g, '&lt;');
+  var liveSig = (it.live_signal || '').slice(0, 100).replace(/</g, '&lt;');
+  var sourceProj = (it.source_project || '').split('/').pop();
+
+  var hashtagsArr = [];
+  try { hashtagsArr = JSON.parse(it.hashtags || '[]'); } catch {}
+  var hashtagsHtml = hashtagsArr.map(function(h) { return '<span style="color:var(--blu);font-family:var(--mono);font-size:10px">' + h + '</span>'; }).join(' ');
+
+  var titleText = (it.title || '').replace(/</g, '&lt;');
+
+  // GSC badge
+  var gscBadge = '';
+  if (it.gsc_status && it.gsc_status !== 'not_checked') {
+    var gscMap = {
+      inspected: '<span class="badge" style="background:rgba(56,139,253,.15);color:var(--blu)">🔎 GSC inspected</span>',
+      already_indexed: '<span class="badge" style="background:rgba(63,185,80,.2);color:var(--grn)">✅ GSC indexed</span>',
+      submitted: '<span class="badge" style="background:rgba(63,185,80,.15);color:var(--grn)">📤 GSC submitted</span>',
+      blocked_no_page: '<span class="badge" style="background:rgba(218,54,51,.15);color:var(--red)">🚫 GSC blocked: no page</span>',
+      blocked_no_sitemap: '<span class="badge" style="background:rgba(218,54,51,.15);color:var(--red)">🚫 GSC blocked: no sitemap</span>',
+      submit_error: '<span class="badge" style="background:rgba(218,54,51,.15);color:var(--red)">❌ GSC error</span>',
+      error: '<span class="badge" style="background:rgba(218,54,51,.15);color:var(--red)">❌ GSC error</span>'
+    };
+    gscBadge = gscMap[it.gsc_status] || ('<span class="badge">' + it.gsc_status + '</span>');
+  }
+
+  // LinkedIn link (if published)
+  var liLink = '';
+  if (it.linkedin_post_urn) {
+    var urnId = it.linkedin_post_urn.split(':').pop();
+    liLink = '<a href="https://www.linkedin.com/feed/update/' + it.linkedin_post_urn + '" target="_blank" style="font-size:11px">🔗 LinkedIn</a>';
+  } else if (it.scheduled_post_id) {
+    liLink = '<span style="font-size:11px;color:var(--blu)">📅 zaplanowany</span>';
+  }
+
+  return [
+    '<div class="card mp-card" style="border-left:3px solid ' + scoreColor + ';cursor:pointer" data-mp-open="' + it.id + '">',
+    '<div class="card-top">',
+    '<div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">',
+    '<b style="font-size:13px">#' + it.topic_number + '</b>',
+    statusBadge, langBadge, canniBadge, gscBadge,
+    '<span style="color:' + scoreColor + ';font-family:var(--mono);font-weight:700">' + (it.score_total || 0).toFixed(1) + '/5.0 ' + stars + '</span>',
+    '</div>',
+    '<div class="meta">' + publishDate + ' CET' + (liLink ? ' · ' + liLink : '') + '</div>',
+    '</div>',
+    titleText ? '<div style="font-size:13px;font-weight:600;color:var(--txt);margin:6px 0 2px">' + titleText + '</div>' : '',
+    '<div class="ptxt" style="max-height:none;font-size:12px;color:#c9d1d9;margin:4px 0">' + hookText + '</div>',
+    '<div class="meta" style="margin:4px 0">📦 ' + sourceProj + ' · ' + liveSig + '</div>',
+    hashtagsHtml ? '<div style="margin:4px 0">' + hashtagsHtml + '</div>' : '',
+    '<div class="meta" style="margin:8px 0;font-size:11px">',
+    'Treść: ' + artChecks[0] + ' &nbsp; Banner: ' + artChecks[1] + ' &nbsp; Visual: ' + artChecks[2],
+    '</div>',
+    '<div class="actions" data-mp-noopen="1">',
+    '<button class="btn sm" data-mp-recheck="' + it.id + '">🔍 Recheck</button>',
+    '<button class="btn sm primary" data-mp-open="' + it.id + '">📝 Edytuj</button>',
+    '</div>',
+    '</div>'
+  ].join('');
+}
+
+function mpRecheck(id) {
+  fetch('/api/media-plan/' + id + '/check-cannibalize', { method: 'POST' })
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      var msg = 'Cannibalize: ' + data.status + ' (max ' + (data.max_score || 0).toFixed(2) + ')';
+      if (data.overlaps && data.overlaps.length) {
+        msg += '\\nTop overlap: ' + data.overlaps[0].title.slice(0, 60);
+      }
+      toast(msg);
+      renderMediaPlan();
+    });
+}
+
+var mpEditing = null;
+
+function mpOpenDetail(id) {
+  var it = mpItems.find(function(x) { return x.id === id || x.slug === id; });
+  if (!it) return;
+  mpEditing = it;
+
+  $$('mp-mtitle').textContent = '#' + it.topic_number + ' · ' + (it.slug || '');
+  var meta = '<b style="color:var(--txt)">Status: ' + it.status + '</b> · Score ' + (it.score_total||0).toFixed(1) + '/5.0 · ' + it.language.toUpperCase() + ' · Banner concept: ' + (it.banner_concept || '—') + ' · Lead trigger: ' + (it.lead_trigger || '—');
+  if (it.hook) meta += '<br><br><b>Hook:</b> ' + it.hook.replace(/</g, '&lt;');
+  if (it.live_signal) meta += '<br><b>Live signal:</b> ' + it.live_signal.replace(/</g, '&lt;');
+  if (it.cannibalize_overlaps) {
+    try {
+      var ovs = JSON.parse(it.cannibalize_overlaps);
+      if (ovs.length) {
+        meta += '<br><b>Top cannibalize overlaps (' + (it.cannibalize_status || 'pending') + '):</b><br>';
+        ovs.forEach(function(o) { meta += '· ' + o.score + ' — ' + o.title.slice(0, 80) + '<br>'; });
+      }
+    } catch {}
+  }
+  $$('mp-meta').innerHTML = meta;
+
+  $$('mp-text').value = it.post_text || '';
+  $$('mp-cc').textContent = (it.post_text || '').length;
+  mpUpdateCharWarn();
+
+  $$('mp-banner').value = it.banner_path || '';
+  $$('mp-visual').value = it.visual_asset_path || '';
+  var hashtagsArr = [];
+  try { hashtagsArr = JSON.parse(it.hashtags || '[]'); } catch {}
+  $$('mp-hashtags').value = hashtagsArr.join(' ');
+  $$('mp-cta').value = it.cta || '';
+  $$('mp-wiki-slug').value = it.wiki_slug || '';
+  if (it.publish_at) $$('mp-publish-at').value = it.publish_at.replace(' ', 'T').slice(0, 16);
+
+  $$('mp-visual-plan').textContent = it.visual_asset_plan || '(brak — dodaj instrukcję capture do MEDIA-PLAN-2026-Q2.md)';
+
+  if (it.gsc_inspect_result) {
+    $$('mp-gsc-box').style.display = '';
+    try {
+      $$('mp-gsc-result').textContent = JSON.stringify(JSON.parse(it.gsc_inspect_result), null, 2);
+    } catch {
+      $$('mp-gsc-result').textContent = it.gsc_inspect_result;
+    }
+  } else {
+    $$('mp-gsc-box').style.display = 'none';
+  }
+
+  // Show/hide buttons by status
+  $$('mp-mark-napisane').style.display = (it.status === 'plan') ? '' : 'none';
+  $$('mp-schedule').style.display = (it.status === 'napisane' && !it.scheduled_post_id) ? '' : 'none';
+  $$('mp-gsc-inspect').style.display = (it.status === 'opublikowane' || it.status === 'gsc_verified') ? '' : 'none';
+  $$('mp-gsc-submit').style.display = (it.status === 'opublikowane') ? '' : 'none';
+
+  $$('mp-ov').classList.add('open');
+}
+
+function mpCloseModal() { $$('mp-ov').classList.remove('open'); mpEditing = null; }
+
+function mpUpdateCharWarn() {
+  var n = parseInt($$('mp-cc').textContent, 10) || 0;
+  var w = $$('mp-cc-warn');
+  if (n < 1300) w.textContent = '⚠️ za krótko (' + (1300 - n) + ' do minimum)';
+  else if (n > 1700) w.textContent = '⚠️ za długo (' + (n - 1700) + ' nadwyżki)';
+  else w.textContent = '✅ OK';
+}
+
+function mpSave() {
+  if (!mpEditing) return;
+  var hashtagsRaw = $$('mp-hashtags').value.trim();
+  var hashtagsArr = hashtagsRaw ? hashtagsRaw.split(/\s+/).filter(function(t) { return t.startsWith('#'); }) : [];
+  var publishAtRaw = $$('mp-publish-at').value;
+  var publishAt = publishAtRaw ? publishAtRaw.replace('T', ' ') + ':00' : mpEditing.publish_at;
+  var body = {
+    post_text: $$('mp-text').value,
+    banner_path: $$('mp-banner').value || null,
+    visual_asset_path: $$('mp-visual').value || null,
+    hashtags: JSON.stringify(hashtagsArr),
+    cta: $$('mp-cta').value || null,
+    wiki_slug: $$('mp-wiki-slug').value || null,
+    publish_at: publishAt
+  };
+  fetch('/api/media-plan/' + mpEditing.id, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  }).then(function(r) { return r.json(); }).then(function(data) {
+    if (data.error) { toast('Save error: ' + data.error); return; }
+    toast('Zapisano', true);
+    mpEditing = data;
+    renderMediaPlan();
+  });
+}
+
+function mpTransition(to) {
+  if (!mpEditing) return;
+  fetch('/api/media-plan/' + mpEditing.id + '/transition', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ to: to })
+  }).then(function(r) { return r.json().then(function(d) { return { status: r.status, body: d }; }); }).then(function(rr) {
+    if (rr.status >= 400) {
+      var msg = (rr.body.error || 'error') + ': ' + (rr.body.errors || []).join(' / ');
+      alert(msg);
+      return;
+    }
+    toast('Status → ' + to, true);
+    mpEditing = rr.body;
+    renderMediaPlan();
+    setTimeout(function() { mpOpenDetail(rr.body.id); }, 200);
+  });
+}
+
+function mpSchedule() {
+  if (!mpEditing) return;
+  if (!confirm('Utworzyć scheduled_posts row dla ' + mpEditing.slug + '?\\n\\nPo zapisie wejdź w tab Posty żeby kliknąć Publish.')) return;
+  fetch('/api/media-plan/' + mpEditing.id + '/schedule', { method: 'POST' })
+    .then(function(r) { return r.json(); }).then(function(data) {
+      if (data.error) { alert('Schedule error: ' + data.error); return; }
+      toast('Zaplanowane jako scheduled_posts.id=' + data.scheduled_post.id, true);
+      renderMediaPlan();
+      setTimeout(function() { mpOpenDetail(mpEditing.id); }, 200);
+    });
+}
+
+function mpGscInspect() {
+  if (!mpEditing) return;
+  $$('mp-gsc-result').textContent = 'Inspecting…';
+  $$('mp-gsc-box').style.display = '';
+  fetch('/api/media-plan/' + mpEditing.id + '/gsc-inspect', { method: 'POST' })
+    .then(function(r) { return r.json(); }).then(function(data) {
+      if (data.error) { $$('mp-gsc-result').textContent = 'Error: ' + data.error; return; }
+      $$('mp-gsc-result').textContent = JSON.stringify(data.result, null, 2);
+      toast('GSC inspect done', true);
+      renderMediaPlan();
+    });
+}
+
+function mpGscSubmit() {
+  if (!mpEditing) return;
+  if (!confirm('Wymusić GSC submit dla ' + mpEditing.slug + '?\\n\\nPre-flight: page+canonical → sitemap → index_inspect → submit_sitemap (jeśli nie indexed)')) return;
+  fetch('/api/media-plan/' + mpEditing.id + '/gsc-submit', { method: 'POST' })
+    .then(function(r) { return r.json().then(function(d) { return { status: r.status, body: d }; }); }).then(function(rr) {
+      if (rr.status >= 400) {
+        alert('GSC submit blocked: ' + rr.body.error + '\\n\\n' + (rr.body.detail || ''));
+        return;
+      }
+      var msg = rr.body.skipped ? 'Skipped: ' + rr.body.reason : ('Action: ' + rr.body.action);
+      toast(msg, true);
+      renderMediaPlan();
+      setTimeout(function() { mpOpenDetail(mpEditing.id); }, 200);
+    });
+}
+
+function mpCancelItem() {
+  if (!mpEditing) return;
+  if (!confirm('Anulować ' + mpEditing.slug + '? (status → cancelled)')) return;
+  mpTransition('cancelled');
+}
+
+function mpRecheckInModal() {
+  if (!mpEditing) return;
+  fetch('/api/media-plan/' + mpEditing.id + '/check-cannibalize', { method: 'POST' })
+    .then(function(r) { return r.json(); }).then(function(data) {
+      toast('Cannibalize: ' + data.status, true);
+      renderMediaPlan();
+      // refresh modal meta
+      fetch('/api/media-plan/' + mpEditing.id).then(function(r){return r.json();}).then(function(it){ mpEditing = it; mpOpenDetail(it.id); });
+    });
+}
+
+function mpGenerateBanner() {
+  if (!mpEditing) return;
+  toast('Generuję banner przez linkedin_banner_generate (~5-15s)...', true);
+  fetch('/api/media-plan/' + mpEditing.id + '/generate-banner', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
+    .then(function(r) { return r.json(); }).then(function(data) {
+      if (data.error) { toast('Banner gen error: ' + data.error); return; }
+      $$('mp-banner').value = data.banner_path;
+      toast('Banner: ' + data.banner_path.split('/').pop(), true);
+    });
+}
+
+function mpUpload(kind, file) {
+  if (!mpEditing || !file) return;
+  var url = '/api/media-plan/' + mpEditing.id + '/upload?kind=' + kind + '&filename=' + encodeURIComponent(file.name);
+  toast('Upload ' + file.name + ' (' + Math.round(file.size/1024) + 'KB)...', true);
+  fetch(url, { method: 'POST', headers: { 'Content-Type': file.type || 'application/octet-stream' }, body: file })
+    .then(function(r) { return r.json(); }).then(function(data) {
+      if (data.error) { toast('Upload error: ' + data.error); return; }
+      if (kind === 'banner') $$('mp-banner').value = data.path;
+      else $$('mp-visual').value = data.path;
+      toast('Uploaded: ' + data.path.split('/').pop() + ' (' + Math.round(data.size/1024) + 'KB)', true);
+    });
+}
+
+// Modal listeners (one-time setup, delegated)
+document.addEventListener('click', function(e) {
+  var t = e.target;
+  if (t.id === 'mp-ov') mpCloseModal();
+  if (t.id === 'mp-mcancel') mpCloseModal();
+  if (t.id === 'mp-msave') mpSave();
+  if (t.id === 'mp-recheck-can') mpRecheckInModal();
+  if (t.id === 'mp-mark-napisane') mpTransition('napisane');
+  if (t.id === 'mp-schedule') mpSchedule();
+  if (t.id === 'mp-gsc-inspect') mpGscInspect();
+  if (t.id === 'mp-gsc-submit') mpGscSubmit();
+  if (t.id === 'mp-cancel-item') mpCancelItem();
+  if (t.id === 'mp-gen-banner') mpGenerateBanner();
+
+  // Card delegated handlers (replace inline onclick — escaped quotes break in template literal)
+  var openTarget = t.closest && t.closest('[data-mp-open]');
+  if (openTarget && !t.closest('[data-mp-noopen]')) {
+    mpOpenDetail(openTarget.getAttribute('data-mp-open'));
+    return;
+  }
+  // Recheck button (also matches data-mp-open via fallback in actions)
+  if (t.dataset && t.dataset.mpRecheck) {
+    e.stopPropagation();
+    mpRecheck(t.dataset.mpRecheck);
+    return;
+  }
+  // Edytuj button inside actions
+  if (t.dataset && t.dataset.mpOpen && t.closest('[data-mp-noopen]')) {
+    e.stopPropagation();
+    mpOpenDetail(t.dataset.mpOpen);
+    return;
+  }
+});
+
+document.addEventListener('input', function(e) {
+  if (e.target.id === 'mp-text') {
+    $$('mp-cc').textContent = e.target.value.length;
+    mpUpdateCharWarn();
+  }
+});
+
+document.addEventListener('change', function(e) {
+  if (e.target.id === 'mp-upload-banner' && e.target.files && e.target.files[0]) {
+    mpUpload('banner', e.target.files[0]);
+    e.target.value = '';
+  }
+  if (e.target.id === 'mp-upload-visual' && e.target.files && e.target.files[0]) {
+    mpUpload('visual', e.target.files[0]);
+    e.target.value = '';
+  }
 });
 
 // ── COPY UTILITY ──────────────────────────────────────────────────────────────
@@ -3592,6 +4783,7 @@ switchTab(activeTab);
 if (activeTab === 'siec') renderSiec();
 if (activeTab === 'leady') renderLeady();
 if (activeTab === 'kontenty') renderKontenty();
+if (activeTab === 'mediaplan') renderMediaPlan();
 
 setInterval(function() { loadStatus(); loadPosts(); }, 30000);
 setInterval(function() { if (activeTab === 'prospekci') loadProspekci(); }, 60000);

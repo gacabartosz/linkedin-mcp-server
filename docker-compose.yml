@@ -1,0 +1,94 @@
+# LinkedIn MCP — production stack
+# Deployed to: VPS 51.68.174.118 at /opt/linkedin-mcp/
+# Subdomain: admin.bartoszgaca.pl (via Traefik on traefik-public network)
+#
+# Volumes:
+#   /data/linkedin-mcp/  (persisted DBs + auth.json + scraper-auth.json)
+#   /etc/linkedin-mcp/.env  (read-only env_file)
+#
+# Usage:
+#   docker compose up -d --build
+#   docker compose logs -f dashboard
+
+x-common: &common
+  image: linkedin-mcp:latest
+  build:
+    context: .
+    dockerfile: Dockerfile
+  env_file:
+    - /etc/linkedin-mcp/.env
+  volumes:
+    - /data/linkedin-mcp:/data/linkedin-mcp
+  restart: unless-stopped
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "5"
+
+services:
+  dashboard:
+    <<: *common
+    container_name: linkedin-mcp-dashboard
+    command: ["node", "dashboard.mjs"]
+    environment:
+      PORT: "3336"
+      LINKEDIN_DATA_DIR: /data/linkedin-mcp
+    networks:
+      - traefik-public
+      - default
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=traefik-public"
+      # Router (TLS)
+      - "traefik.http.routers.lmcp.rule=Host(`admin.bartoszgaca.pl`)"
+      - "traefik.http.routers.lmcp.entrypoints=websecure"
+      - "traefik.http.routers.lmcp.tls.certresolver=le"
+      - "traefik.http.routers.lmcp.middlewares=lmcp-auth@docker"
+      # Service
+      - "traefik.http.services.lmcp.loadbalancer.server.port=3336"
+      # Basic Auth middleware — replace AUTH_HASH after htpasswd -nbB admin '<password>'
+      # Format: user:bcrypt-hash, escape $ as $$ in compose
+      - "traefik.http.middlewares.lmcp-auth.basicauth.users=${ADMIN_BASICAUTH:-admin:REPLACE_WITH_BCRYPT_HASH}"
+      - "traefik.http.middlewares.lmcp-auth.basicauth.realm=admin.bartoszgaca.pl"
+      # Optional HTTP→HTTPS redirect
+      - "traefik.http.routers.lmcp-http.rule=Host(`admin.bartoszgaca.pl`)"
+      - "traefik.http.routers.lmcp-http.entrypoints=web"
+      - "traefik.http.routers.lmcp-http.middlewares=lmcp-https-redirect@docker"
+      - "traefik.http.middlewares.lmcp-https-redirect.redirectscheme.scheme=https"
+
+  auto-publish:
+    <<: *common
+    container_name: linkedin-mcp-auto-publish
+    command: ["node", "auto-publish.mjs"]
+    networks:
+      - default
+
+  auto-engage:
+    <<: *common
+    container_name: linkedin-mcp-auto-engage
+    command: ["node", "auto-engage.mjs"]
+    networks:
+      - default
+
+  auto-analytics:
+    <<: *common
+    container_name: linkedin-mcp-auto-analytics
+    command: ["node", "auto-analytics.mjs", "--daemon"]
+    networks:
+      - default
+
+  newsletter-send:
+    <<: *common
+    container_name: linkedin-mcp-newsletter-send
+    # Newsletter sender runs on a daily cron pattern (08:00). Wrapper sleeps until next 08:00.
+    # Will be replaced with proper systemd timer or apscheduler in script itself.
+    command: ["sh", "-c", "while true; do node scripts/send-edition.mjs || true; sleep 3600; done"]
+    networks:
+      - default
+
+networks:
+  traefik-public:
+    external: true
+  default:
+    driver: bridge

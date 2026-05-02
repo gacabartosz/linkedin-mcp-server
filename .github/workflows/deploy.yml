@@ -1,0 +1,138 @@
+name: Deploy to VPS
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'scripts/**'
+      - 'templates/**'
+      - 'guidelines/**'
+      - 'dashboard.mjs'
+      - 'auto-publish.mjs'
+      - 'auto-engage.mjs'
+      - 'auto-analytics.mjs'
+      - 'auto-prospect.mjs'
+      - 'auto-invite.mjs'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'tsconfig.json'
+      - 'Dockerfile'
+      - 'docker-compose.yml'
+      - '.dockerignore'
+      - '.github/workflows/deploy.yml'
+  workflow_dispatch: {}
+
+concurrency:
+  group: deploy-linkedin-mcp
+  cancel-in-progress: false
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies (deterministic)
+        run: npm ci
+
+      - name: Type-check + build
+        run: npm run build
+
+      - name: Ensure VPS directories
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script: |
+            set -e
+            mkdir -p /opt/linkedin-mcp
+            mkdir -p /data/linkedin-mcp
+            mkdir -p /etc/linkedin-mcp
+            mkdir -p /data/backups/linkedin-mcp
+            chmod 700 /etc/linkedin-mcp /data/linkedin-mcp
+
+      - name: Sync code to /opt/linkedin-mcp
+        uses: burnett01/rsync-deployments@7.0.1
+        with:
+          switches: >-
+            -avz --delete
+            --exclude='node_modules/'
+            --exclude='.git/'
+            --exclude='.github/'
+            --exclude='.env'
+            --exclude='.env.*'
+            --exclude='*.log'
+            --exclude='output/'
+            --exclude='.ralph/'
+            --exclude='.dockerignore'
+            --exclude='com.gaca.*.plist'
+          path: ./
+          remote_path: /opt/linkedin-mcp/
+          remote_host: ${{ secrets.VPS_HOST }}
+          remote_user: ${{ secrets.VPS_USER }}
+          remote_key: ${{ secrets.VPS_SSH_KEY }}
+
+      - name: Sync compiled dist
+        uses: burnett01/rsync-deployments@7.0.1
+        with:
+          switches: -avz --delete
+          path: dist/
+          remote_path: /opt/linkedin-mcp/dist/
+          remote_host: ${{ secrets.VPS_HOST }}
+          remote_user: ${{ secrets.VPS_USER }}
+          remote_key: ${{ secrets.VPS_SSH_KEY }}
+
+      - name: Build & restart docker stack
+        uses: appleboy/ssh-action@v1
+        env:
+          ADMIN_PROBE: ${{ secrets.ADMIN_BASICAUTH_PROBE_PASSWORD }}
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          envs: ADMIN_PROBE
+          script: |
+            set -e
+            cd /opt/linkedin-mcp
+            # GIT_SHA propagated as build arg + env so /api/health reports it
+            export GIT_SHA="${{ github.sha }}"
+            docker compose build --build-arg GIT_SHA=$GIT_SHA
+            docker compose up -d --remove-orphans
+            sleep 8
+            echo "── Containers ──"
+            docker compose ps
+            echo "── Health ──"
+            curl -fsS --user "admin:${ADMIN_PROBE}" https://admin.bartoszgaca.pl/api/health || (
+              echo "Health probe FAILED" && docker compose logs --tail=50 dashboard && exit 1
+            )
+
+      - name: Daily backup cron (idempotent install)
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script: |
+            set -e
+            cat > /etc/cron.daily/linkedin-mcp-backup <<'EOF'
+            #!/bin/sh
+            DATE=$(date +%F)
+            for db in scheduler analytics engage prospects content; do
+              if [ -f "/data/linkedin-mcp/${db}.db" ]; then
+                sqlite3 "/data/linkedin-mcp/${db}.db" ".backup '/data/backups/linkedin-mcp/${db}-${DATE}.db'" 2>/dev/null || true
+              fi
+            done
+            find /data/backups/linkedin-mcp -name "*.db" -mtime +30 -delete
+            EOF
+            chmod +x /etc/cron.daily/linkedin-mcp-backup
