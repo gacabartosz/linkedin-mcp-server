@@ -97,17 +97,34 @@ jobs:
         uses: appleboy/ssh-action@v1
         env:
           ADMIN_PROBE: ${{ secrets.ADMIN_BASICAUTH_PROBE_PASSWORD }}
+          ADMIN_BCRYPT: ${{ secrets.ADMIN_BASICAUTH }}
+          GIT_SHA_VAL: ${{ github.sha }}
         with:
           host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
-          envs: ADMIN_PROBE
+          envs: ADMIN_PROBE,ADMIN_BCRYPT,GIT_SHA_VAL
           script: |
             set -e
             cd /opt/linkedin-mcp
-            # GIT_SHA propagated as build arg + env so /api/health reports it
-            export GIT_SHA="${{ github.sha }}"
-            docker compose build --build-arg GIT_SHA=$GIT_SHA
+            # ADMIN_BASICAUTH is read by docker-compose.yml ${ADMIN_BASICAUTH} expansion in Traefik labels.
+            # Persist to /etc/linkedin-mcp/.env so subsequent `docker compose` calls (manual ops) work too.
+            if [ -n "$ADMIN_BCRYPT" ]; then
+              umask 077
+              # Write or update the ADMIN_BASICAUTH line idempotently
+              if [ -f /etc/linkedin-mcp/.env ]; then
+                grep -v '^ADMIN_BASICAUTH=' /etc/linkedin-mcp/.env > /etc/linkedin-mcp/.env.tmp || true
+                echo "ADMIN_BASICAUTH=$ADMIN_BCRYPT" >> /etc/linkedin-mcp/.env.tmp
+                mv /etc/linkedin-mcp/.env.tmp /etc/linkedin-mcp/.env
+              else
+                mkdir -p /etc/linkedin-mcp
+                echo "ADMIN_BASICAUTH=$ADMIN_BCRYPT" > /etc/linkedin-mcp/.env
+              fi
+              chmod 600 /etc/linkedin-mcp/.env
+            fi
+            export ADMIN_BASICAUTH="$ADMIN_BCRYPT"
+            export GIT_SHA="$GIT_SHA_VAL"
+            docker compose build --build-arg GIT_SHA="$GIT_SHA"
             docker compose up -d --remove-orphans
             sleep 8
             echo "── Containers ──"
