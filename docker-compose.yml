@@ -1,6 +1,9 @@
-# LinkedIn MCP — production stack
+# LinkedIn MCP — production stack (HEADLESS — daemons only)
 # Deployed to: VPS 51.68.174.118 at /opt/linkedin-mcp/
-# Subdomain: admin.bartoszgaca.pl (via Traefik on traefik-public network)
+#
+# Web UI: bartoszgaca.pl/admin/ (handled by bartoszgaca.pl backend, reads
+# /data/linkedin-mcp/content.db read-only). NO public dashboard exposure
+# from this stack — dashboard.mjs runs internally for OAuth callback only.
 #
 # Volumes:
 #   /data/linkedin-mcp/  (persisted DBs + auth.json + scraper-auth.json)
@@ -8,7 +11,7 @@
 #
 # Usage:
 #   docker compose up -d --build
-#   docker compose logs -f dashboard
+#   docker compose logs -f auto-publish
 
 x-common: &common
   image: linkedin-mcp:latest
@@ -27,6 +30,8 @@ x-common: &common
       max-file: "5"
 
 services:
+  # Internal-only OAuth callback server. Reachable from host on 127.0.0.1:3336.
+  # Used when user triggers OAuth refresh from bartoszgaca.pl/admin/biuletyn (proxy via backend).
   dashboard:
     <<: *common
     container_name: linkedin-mcp-dashboard
@@ -34,28 +39,10 @@ services:
     environment:
       PORT: "3336"
       LINKEDIN_DATA_DIR: /data/linkedin-mcp
+    ports:
+      - "127.0.0.1:3336:3336"
     networks:
-      - traefik-public
       - default
-    labels:
-      - "traefik.enable=true"
-      - "traefik.docker.network=traefik-public"
-      # Router (TLS)
-      - "traefik.http.routers.lmcp.rule=Host(`admin.bartoszgaca.pl`)"
-      - "traefik.http.routers.lmcp.entrypoints=websecure"
-      - "traefik.http.routers.lmcp.tls.certresolver=le"
-      - "traefik.http.routers.lmcp.middlewares=lmcp-auth@docker"
-      # Service
-      - "traefik.http.services.lmcp.loadbalancer.server.port=3336"
-      # Basic Auth middleware — replace AUTH_HASH after htpasswd -nbB admin '<password>'
-      # Format: user:bcrypt-hash, escape $ as $$ in compose
-      - "traefik.http.middlewares.lmcp-auth.basicauth.users=${ADMIN_BASICAUTH:-admin:REPLACE_WITH_BCRYPT_HASH}"
-      - "traefik.http.middlewares.lmcp-auth.basicauth.realm=admin.bartoszgaca.pl"
-      # Optional HTTP→HTTPS redirect
-      - "traefik.http.routers.lmcp-http.rule=Host(`admin.bartoszgaca.pl`)"
-      - "traefik.http.routers.lmcp-http.entrypoints=web"
-      - "traefik.http.routers.lmcp-http.middlewares=lmcp-https-redirect@docker"
-      - "traefik.http.middlewares.lmcp-https-redirect.redirectscheme.scheme=https"
 
   auto-publish:
     <<: *common
@@ -81,14 +68,11 @@ services:
   newsletter-send:
     <<: *common
     container_name: linkedin-mcp-newsletter-send
-    # Newsletter sender runs on a daily cron pattern (08:00). Wrapper sleeps until next 08:00.
-    # Will be replaced with proper systemd timer or apscheduler in script itself.
+    # Newsletter sender runs on a daily cron pattern (08:00). Wrapper sleeps 1h between runs.
     command: ["sh", "-c", "while true; do node scripts/send-edition.mjs || true; sleep 3600; done"]
     networks:
       - default
 
 networks:
-  traefik-public:
-    external: true
   default:
     driver: bridge

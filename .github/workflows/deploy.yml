@@ -96,41 +96,23 @@ jobs:
       - name: Build & restart docker stack
         uses: appleboy/ssh-action@v1
         env:
-          ADMIN_PROBE: ${{ secrets.ADMIN_BASICAUTH_PROBE_PASSWORD }}
-          ADMIN_BCRYPT: ${{ secrets.ADMIN_BASICAUTH }}
           GIT_SHA_VAL: ${{ github.sha }}
         with:
           host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
-          envs: ADMIN_PROBE,ADMIN_BCRYPT,GIT_SHA_VAL
+          envs: GIT_SHA_VAL
           script: |
             set -e
             cd /opt/linkedin-mcp
-            # ADMIN_BASICAUTH is read by docker-compose.yml ${ADMIN_BASICAUTH} expansion in Traefik labels.
-            # Persist to /etc/linkedin-mcp/.env so subsequent `docker compose` calls (manual ops) work too.
-            if [ -n "$ADMIN_BCRYPT" ]; then
-              umask 077
-              # Write or update the ADMIN_BASICAUTH line idempotently
-              if [ -f /etc/linkedin-mcp/.env ]; then
-                grep -v '^ADMIN_BASICAUTH=' /etc/linkedin-mcp/.env > /etc/linkedin-mcp/.env.tmp || true
-                echo "ADMIN_BASICAUTH=$ADMIN_BCRYPT" >> /etc/linkedin-mcp/.env.tmp
-                mv /etc/linkedin-mcp/.env.tmp /etc/linkedin-mcp/.env
-              else
-                mkdir -p /etc/linkedin-mcp
-                echo "ADMIN_BASICAUTH=$ADMIN_BCRYPT" > /etc/linkedin-mcp/.env
-              fi
-              chmod 600 /etc/linkedin-mcp/.env
-            fi
-            export ADMIN_BASICAUTH="$ADMIN_BCRYPT"
             export GIT_SHA="$GIT_SHA_VAL"
             docker compose build --build-arg GIT_SHA="$GIT_SHA"
             docker compose up -d --remove-orphans
             sleep 8
             echo "── Containers ──"
             docker compose ps
-            echo "── Health ──"
-            curl -fsS --user "admin:${ADMIN_PROBE}" https://admin.bartoszgaca.pl/api/health || (
+            echo "── Health (internal, no public exposure) ──"
+            curl -fsS http://127.0.0.1:3336/api/health || (
               echo "Health probe FAILED" && docker compose logs --tail=50 dashboard && exit 1
             )
 
