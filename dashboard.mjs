@@ -2690,6 +2690,7 @@ function buildHtml() {
 '<button class="tnb" data-tab="siec">Siec</button>',
 '<button class="tnb" data-tab="leady">Leady</button>',
 '<button class="tnb" data-tab="kontenty">Kontenty</button>',
+'<button class="tnb" data-tab="artykuly">Artykuły</button>',
 '</nav>',
 '<div class="sbar" id="sbar">...</div>',
 '</div>',
@@ -2723,6 +2724,8 @@ function buildHtml() {
 '<div class="tab-panel" id="tab-leady"><div class="wrap" id="leady-root"></div></div>',
 // ── Tab: Kontenty (Content Intelligence) ───────────────────────────
 '<div class="tab-panel" id="tab-kontenty"><div class="wrap" id="kontenty-root"></div></div>',
+// ── Tab: Artykuły (Article Drafter — Wariant G-A) ──────────────────
+'<div class="tab-panel" id="tab-artykuly"><div class="wrap" id="art-root"></div></div>',
 // ── Modal ───────────────────────────────────────────────────────────────
 '<div class="overlay" id="ov">',
 '<div class="modal">',
@@ -3203,6 +3206,7 @@ document.querySelectorAll('.tnb').forEach(function(b) {
     if (b.dataset.tab === 'leady') renderLeady();
     if (b.dataset.tab === 'kontenty') renderKontenty();
     if (b.dataset.tab === 'mediaplan') renderMediaPlan();
+    if (b.dataset.tab === 'artykuly') renderArtykuly();
   });
 });
 
@@ -4859,6 +4863,124 @@ if (activeTab === 'siec') renderSiec();
 if (activeTab === 'leady') renderLeady();
 if (activeTab === 'kontenty') renderKontenty();
 if (activeTab === 'mediaplan') renderMediaPlan();
+if (activeTab === 'artykuly') renderArtykuly();
+
+// ── ARTYKULY (Wariant G-A: article drafter UI) ──────────────────────────
+var artTopics = null;
+
+function renderArtykuly() {
+  var root = document.getElementById('art-root');
+  if (!root) return;
+  if (root.dataset.rendered === '1') return;
+  root.dataset.rendered = '1';
+  root.innerHTML =
+    '<div style="max-width:780px">' +
+    '<h2 style="margin-top:0">Generator artykułów</h2>' +
+    '<p style="color:var(--dim);font-size:14px">Sonnet 4.6 + adaptive thinking + prompt cache. Generuje pełny artykuł PL (~3500 słów) + EN hub-spoke. Output: 2 pliki .ts gotowe do bartoszgaca.pl/data/articles/.</p>' +
+    '<form id="art-form" style="display:grid;gap:14px;margin-top:20px">' +
+      '<label style="display:grid;gap:4px"><span style="font-weight:600;font-size:13px">Topic</span>' +
+        '<select id="art-topic" required style="padding:8px;background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:4px"></select>' +
+      '</label>' +
+      '<label style="display:grid;gap:4px"><span style="font-weight:600;font-size:13px">Word count: <span id="art-words-display">3500</span></span>' +
+        '<input type="range" id="art-words" min="500" max="8000" step="500" value="3500">' +
+      '</label>' +
+      '<label style="display:grid;gap:4px"><span style="font-weight:600;font-size:13px">Language</span>' +
+        '<select id="art-lang" style="padding:8px;background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:4px">' +
+          '<option value="both">PL hero + EN hub-spoke</option>' +
+          '<option value="pl">PL only</option>' +
+          '<option value="en">EN only</option>' +
+        '</select>' +
+      '</label>' +
+      '<button type="submit" id="art-submit" class="btn primary" style="margin-top:8px">Generate (60-180s)</button>' +
+    '</form>' +
+    '<div id="art-progress" style="margin-top:20px"></div>' +
+    '<div id="art-result" style="margin-top:20px"></div>' +
+    '<hr style="border:none;border-top:1px solid var(--border);margin:30px 0">' +
+    '<h3 style="margin:0 0 10px">Saved drafts</h3>' +
+    '<div id="art-drafts"></div>' +
+    '</div>';
+
+  var topicSel = document.getElementById('art-topic');
+  var wordsRange = document.getElementById('art-words');
+  var wordsDisp = document.getElementById('art-words-display');
+  var langSel = document.getElementById('art-lang');
+  var form = document.getElementById('art-form');
+  var btn = document.getElementById('art-submit');
+  var progress = document.getElementById('art-progress');
+  var resultDiv = document.getElementById('art-result');
+  var draftsDiv = document.getElementById('art-drafts');
+
+  wordsRange.addEventListener('input', function() { wordsDisp.textContent = wordsRange.value; });
+
+  // Load topic options
+  fetch('/api/content/topic-scores').then(function(r) { return r.json(); }).then(function(rows) {
+    artTopics = rows;
+    topicSel.innerHTML = '<option value="">-- wybierz topic --</option>' +
+      rows.map(function(t) {
+        var gap = t.has_existing_article === 0 ? ' ⚡GAP' : '';
+        return '<option value="' + t.topic_slug + '">[' + t.score.toFixed(2) + '] ' + (t.topic_label_pl || t.topic_slug) + gap + '</option>';
+      }).join('');
+  }).catch(function(e) { topicSel.innerHTML = '<option>Error: ' + e.message + '</option>'; });
+
+  // Load saved drafts
+  function loadDrafts() {
+    fetch('/api/articles/drafts').then(function(r) { return r.json(); }).then(function(rows) {
+      if (!Array.isArray(rows) || rows.length === 0) { draftsDiv.innerHTML = '<p style="color:var(--dim);font-size:13px">Brak zapisanych draftów.</p>'; return; }
+      draftsDiv.innerHTML = rows.map(function(d) {
+        return '<div style="display:flex;justify-content:space-between;align-items:center;padding:8px;border:1px solid var(--border);border-radius:4px;margin-bottom:6px">' +
+               '<div><code>' + d.filename + '</code> <span style="color:var(--dim);font-size:12px">' + Math.round(d.size_bytes / 1024) + ' KB · ' + d.mtime.slice(0,16).replace('T', ' ') + '</span></div>' +
+               '<a href="/api/articles/draft/' + d.slug + '" download style="font-size:12px">Download .ts</a>' +
+               '</div>';
+      }).join('');
+    });
+  }
+  loadDrafts();
+
+  form.addEventListener('submit', function(e) {
+    e.preventDefault();
+    var slug = topicSel.value;
+    if (!slug) { progress.innerHTML = '<p style="color:#f55">Wybierz topic.</p>'; return; }
+    btn.disabled = true; btn.textContent = 'Generating... (this takes 60-180s, dont close)';
+    progress.innerHTML = '<p style="color:var(--dim)">⏳ Calling Claude... | topic=<code>' + slug + '</code> words=' + wordsRange.value + ' lang=' + langSel.value + '</p>';
+    resultDiv.innerHTML = '';
+    var t0 = Date.now();
+    fetch('/api/articles/draft', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ topic_slug: slug, words: parseInt(wordsRange.value, 10), lang: langSel.value }),
+    }).then(function(r) { return r.json(); }).then(function(res) {
+      var dt = ((Date.now() - t0) / 1000).toFixed(1);
+      btn.disabled = false; btn.textContent = 'Generate (60-180s)';
+      if (res.error) {
+        progress.innerHTML = '<p style="color:#f55">❌ Failed in ' + dt + 's: ' + res.error + '</p>' +
+                             '<pre style="background:#222;padding:10px;font-size:11px;overflow:auto;max-height:300px">' + (res.stderr || res.message || '').replace(/[<>&]/g, function(c) { return {'<':'&lt;','>':'&gt;','&':'&amp;'}[c]; }) + '</pre>';
+        return;
+      }
+      progress.innerHTML = '<p style="color:#3a3">✅ Generated in ' + dt + 's. Model: <code>' + (res.usage && res.usage.model || '?') + '</code> · in/cached/out: ' + (res.usage && res.usage.input_tokens || 0) + '/' + (res.usage && res.usage.cache_read_input_tokens || 0) + '/' + (res.usage && res.usage.output_tokens || 0) + ' tokens</p>';
+      var html =
+        '<div style="display:grid;gap:14px">' +
+        '<div style="border:1px solid var(--border);padding:14px;border-radius:6px">' +
+          '<h3 style="margin:0 0 6px">PL: ' + (res.title_pl || '?') + '</h3>' +
+          '<p style="color:var(--dim);font-size:13px;margin:0 0 8px">slug: <code>' + (res.slug_pl || '?') + '</code> · ' + (res.pl_ts ? Math.round(res.pl_ts.length / 1024) : 0) + ' KB</p>' +
+          '<p style="font-size:13px;font-style:italic">' + (res.excerpt_pl || '') + '</p>' +
+          '<a href="/api/articles/draft/' + (res.slug_pl || '') + '" download class="btn">Download PL .ts</a>' +
+        '</div>' +
+        '<div style="border:1px solid var(--border);padding:14px;border-radius:6px">' +
+          '<h3 style="margin:0 0 6px">EN: ' + (res.title_en || '?') + '</h3>' +
+          '<p style="color:var(--dim);font-size:13px;margin:0 0 8px">slug: <code>' + (res.slug_en || '?') + '</code> · ' + (res.en_ts ? Math.round(res.en_ts.length / 1024) : 0) + ' KB</p>' +
+          '<p style="font-size:13px;font-style:italic">' + (res.excerpt_en || '') + '</p>' +
+          '<a href="/api/articles/draft/' + (res.slug_en || '') + '" download class="btn">Download EN .ts</a>' +
+        '</div>' +
+        '<details><summary style="cursor:pointer;color:var(--dim);font-size:12px">Server log</summary><pre style="background:#222;padding:10px;font-size:11px;overflow:auto;max-height:200px">' + (res.log || '').replace(/[<>&]/g, function(c) { return {'<':'&lt;','>':'&gt;','&':'&amp;'}[c]; }) + '</pre></details>' +
+        '</div>';
+      resultDiv.innerHTML = html;
+      loadDrafts();
+    }).catch(function(e) {
+      btn.disabled = false; btn.textContent = 'Generate (60-180s)';
+      progress.innerHTML = '<p style="color:#f55">Network error: ' + e.message + '</p>';
+    });
+  });
+}
 
 setInterval(function() { loadStatus(); loadPosts(); }, 30000);
 setInterval(function() { if (activeTab === 'prospekci') loadProspekci(); }, 60000);
