@@ -8,31 +8,54 @@ export async function createComment(
   parentCommentUrn?: string,
 ): Promise<{ comment_urn: string; created_at: string }> {
   const personUrn = getPersonUrn();
-  const encodedPost = encodeURIComponent(postUrn);
 
+  // Path: gdy reply, użyj activity URN; gdy top-level, użyj share URN
+  let pathUrn = postUrn;
+  if (parentCommentUrn) {
+    const m = parentCommentUrn.match(/activity:(\d+)/);
+    if (m) pathUrn = `urn:li:activity:${m[1]}`;
+  }
+  const encodedPath = encodeURIComponent(pathUrn);
+
+  // Body: object MUSI być, LinkedIn API wymaga go żeby wiedzieć do którego posta
+  // przypisać komentarz. Bez object → 400 "Error while parsing the request".
   const body: Record<string, unknown> = {
     actor: personUrn,
+    object: postUrn,  // share URN posta (zawsze, niezależnie od reply/top-level)
     message: { text },
     ...(parentCommentUrn ? { parentComment: parentCommentUrn } : {}),
   };
 
-  // Try /rest API first, fall back to v2
+  // VERBOSE LOG (do diagnozy 400 — usuń po naprawieniu)
+  log("info", `[createComment] path=${pathUrn}`);
+  log("info", `[createComment] body=${JSON.stringify(body)}`);
+
   let response: { "x-restli-id"?: string; id?: string };
   try {
     response = await linkedinRequest<{ "x-restli-id"?: string; id?: string }>(
       "POST",
-      `/socialActions/${encodedPost}/comments`,
+      `/socialActions/${encodedPath}/comments`,
       body,
     );
   } catch (err) {
-    if (err instanceof LinkedInApiError && err.status === 403) {
-      log("info", "Falling back to v2 socialActions for comment");
-      response = await linkedinRequest<{ "x-restli-id"?: string; id?: string }>(
-        "POST",
-        `/socialActions/${encodedPost}/comments`,
-        body,
-        { apiBase: "v2" },
-      );
+    if (err instanceof LinkedInApiError) {
+      log("error", `[createComment] /rest failed: status=${err.status} message=${err.message}`);
+    }
+    if (err instanceof LinkedInApiError && (err.status === 403 || err.status === 400)) {
+      log("info", `Falling back to v2 socialActions (status ${err.status})`);
+      try {
+        response = await linkedinRequest<{ "x-restli-id"?: string; id?: string }>(
+          "POST",
+          `/socialActions/${encodedPath}/comments`,
+          body,
+          { apiBase: "v2" },
+        );
+      } catch (err2) {
+        if (err2 instanceof LinkedInApiError) {
+          log("error", `[createComment] /v2 also failed: status=${err2.status} message=${err2.message}`);
+        }
+        throw err2;
+      }
     } else {
       throw err;
     }
