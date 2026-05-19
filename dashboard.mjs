@@ -470,7 +470,9 @@ async function handleRequest(req, res) {
       const clientId = process.env.LINKEDIN_CLIENT_ID;
       if (!clientId) { res.writeHead(500); res.end('LINKEDIN_CLIENT_ID missing'); return; }
       const redirectUri = process.env.OAUTH_PUBLIC_REDIRECT_URI || `http://localhost:${PORT}/oauth/callback`;
-      const scopes = (url.searchParams.get('scopes') || 'openid profile email w_member_social r_member_postAnalytics').split(/\s+/).join(' ');
+      // r_member_social: bez tego oficjalne API zwraca 403 na socialActions.GET_ALL
+      // (auto-engage czytanie komentarzy pod postami → 'Cycle complete: 0 processed, 0 replies, 10 errors')
+      const scopes = (url.searchParams.get('scopes') || 'openid profile email w_member_social r_member_postAnalytics r_member_social').split(/\s+/).join(' ');
       const state = randomUUID();
       const authUrl = new URL('https://www.linkedin.com/oauth/v2/authorization');
       authUrl.searchParams.set('response_type', 'code');
@@ -3961,8 +3963,14 @@ function renderRutyna() {
     h += '<div class="sec-h" style="margin-bottom:8px">Automatyzacje — status</div>';
     h += '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:10px;margin-bottom:24px">';
     autos.forEach(function(a) {
-      var statusColor = a.running ? 'var(--grn)' : 'var(--red)';
-      var statusText = a.running ? ('AKTYWNY' + (a.pid ? ' (PID '+a.pid+')' : '')) : 'ZATRZYMANY';
+      // Cron-style LaunchAgents (StartCalendarInterval) are not "stopped" when
+      // running:false — they're scheduled-idle. Show "IDLE — następny HH:MM"
+      // so users don't think the automation crashed.
+      var isCron = /Cron:/i.test(a.schedule || '');
+      var statusColor = a.running ? 'var(--grn)' : (isCron ? 'var(--yel)' : 'var(--red)');
+      var statusText = a.running
+        ? ('AKTYWNY' + (a.pid ? ' (PID '+a.pid+')' : ''))
+        : (isCron ? ('IDLE — następny ' + (a.nextRun || a.schedule || '?')) : 'ZATRZYMANY');
       var dot = '<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:' + statusColor + ';margin-right:6px"></span>';
       h += '<div style="background:var(--card);border:1px solid var(--brd);border-radius:8px;padding:12px">';
       h += '<div style="font-weight:600;font-size:13px;margin-bottom:4px">' + esc(a.label) + '</div>';

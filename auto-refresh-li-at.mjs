@@ -66,6 +66,15 @@ function decryptCookie(encryptedValue, key) {
 
 // ── 3. Czytaj ciasteczka z SQLite Chrome ────────────────────────────────────
 
+// li_at is base64url-like: alphanumerics + _- (+ rare =, . in some versions).
+// Chrome v127+ introduced App-Bound Encryption ('v20' prefix) which decryptCookie()
+// does NOT handle — it silently returns mangled UTF-8 bytes. Without this guard
+// the script writes ~181 bytes of garbage to scraper-auth.json, breaking Voyager
+// API calls (HTTP headers reject non-ASCII characters).
+function isAsciiLiAt(s) {
+  return typeof s === 'string' && /^[A-Za-z0-9_\-=.]{50,400}$/.test(s);
+}
+
 function readLiAt(cookiesPath, key) {
   // Chrome może trzymać lock na pliku — kopiujemy do /tmp
   const tmpPath = join(tmpdir(), `chrome-cookies-${Date.now()}.db`);
@@ -84,9 +93,14 @@ function readLiAt(cookiesPath, key) {
     const row = rows[0];
     // Spróbuj odszyfrować
     const decrypted = decryptCookie(row.encrypted_value, key);
-    if (decrypted && decrypted.length > 50) return decrypted;
+    if (decrypted && isAsciiLiAt(decrypted)) return decrypted;
+    if (decrypted && decrypted.length > 50) {
+      // Decrypt returned ~181 bytes but they're not ASCII — typical signature of
+      // Chrome v127+ App-Bound Encryption (v20 prefix). Loud-fail instead of writing garbage.
+      log(`  ⚠️ Decrypted li_at nie jest ASCII (${decrypted.length} bajtów). Prawdopodobnie Chrome v127+ App-Bound Encryption (v20 prefix). Pomijam — wymagany manual paste z DevTools przez UI dashboard /api/scraper-auth.`);
+    }
     // Fallback: value plaintext
-    if (row.value && row.value.length > 50) return row.value;
+    if (row.value && isAsciiLiAt(row.value)) return row.value;
     return null;
   } catch (e) {
     log(`  SQLite error (${cookiesPath}): ${e.message}`);
