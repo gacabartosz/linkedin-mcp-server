@@ -15,6 +15,7 @@
 import { readFileSync, existsSync } from 'node:fs';
 import { join, extname } from 'node:path';
 import { homedir } from 'node:os';
+import { execSync } from 'node:child_process';
 import Database from 'better-sqlite3';
 
 const DB_PATH = join(homedir(), '.linkedin-mcp', 'scheduler.db');
@@ -56,6 +57,13 @@ function log(msg) {
 
 function logError(msg) {
   console.error(`[${new Date().toISOString()}] ${msg}`);
+}
+
+function notify(title, body) {
+  try {
+    const safe = (s) => s.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+    execSync(`osascript -e 'display notification "${safe(body)}" with title "${safe(title)}"'`);
+  } catch {}
 }
 
 // ── Auth ────────────────────────────────────────────────────────────────────
@@ -466,10 +474,13 @@ const POST_IDENTIFIERS = {
   'Mój Gmail miał 25 000 maili': 'gmail-cleanup',
   'Napisałem w Claude': 'mcp-intro',
   'Wysłałem fakturę korygującą w EUR do KSeF': 'ksef4',
+  'Żona napisała': 'post2-pierogi',
+  'jechać po pierogi': 'post2-pierogi',
 };
 
 // Map post keys → image file paths
 const POST_IMAGES = {
+  'post2-pierogi': join(IMG_DIR, 'post2-banner.png'),
   'post3': join(IMG_DIR, 'post3-banner.png'),
   'post4': join(IMG_DIR, 'post4-banner.png'),
   'post5': join(IMG_DIR, 'post5-banner.png'),
@@ -619,8 +630,30 @@ async function checkAndPublish() {
         ).run(postUrn, new Date().toISOString(), post.id);
         dbw.close();
 
+        // macOS notification
+        notify('LinkedIn ✅ Post opublikowany', post.text.slice(0, 80).replace(/\n/g, ' '));
+
+        // Schedule comment monitoring: +2h, +6h, +24h, +72h
+        try {
+          const engDb = new Database(join(homedir(), '.linkedin-mcp', 'engage.db'));
+          engDb.prepare(`CREATE TABLE IF NOT EXISTS comment_watch (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            post_id TEXT NOT NULL, post_urn TEXT NOT NULL, post_text TEXT,
+            check_at TEXT NOT NULL, status TEXT DEFAULT 'pending',
+            replies_sent INTEGER DEFAULT 0, created_at TEXT DEFAULT (datetime('now'))
+          )`).run();
+          const stmt = engDb.prepare(`INSERT OR IGNORE INTO comment_watch (post_id, post_urn, post_text, check_at) VALUES (?, ?, ?, ?)`);
+          for (const h of [2, 6, 24, 72]) {
+            const checkAt = new Date(Date.now() + h * 3600 * 1000).toISOString();
+            stmt.run(post.id, postUrn, post.text.slice(0, 500), checkAt);
+          }
+          engDb.close();
+          log(`  Comment watch scheduled: +2h, +6h, +24h, +72h`);
+        } catch (e) {
+          logError(`  Comment watch setup failed: ${e.message}`);
+        }
+
         // Queue auto-comment for 12-22 min later (randomized)
-        // Use shareUrn for the comment API (NOT the ugcPost URN)
         const commentText = postKey ? (AUTO_COMMENTS[postKey] || AUTO_COMMENTS.default) : AUTO_COMMENTS.default;
         const commentDelay = randomMinutes(12, 22);
         const commentDelayMin = Math.round(commentDelay / 60000);
@@ -667,6 +700,7 @@ async function checkAndPublish() {
     try {
       const commentUrn = await createComment(c.share_urn, c.post_urn, c.text);
       log(`  Comment added: ${commentUrn}`);
+      notify('LinkedIn 💬 Komentarz dodany', c.text.slice(0, 80).replace(/\n/g, ' '));
       commentQueue.splice(commentQueue.indexOf(c), 1);
     } catch (err) {
       logError(`  Comment failed for ${c.share_urn}: ${err.message}`);

@@ -1,43 +1,87 @@
-# LinkedIn MCP Server — Fix Plan
+# Plan naprawy dashboard — 5 problemow
 
-## Phase: Post-MVP Polish
+## Problem 1: Nie widac zdjec
 
-### Completed
-- [x] Project scaffolding (package.json, tsconfig.json, .gitignore)
-- [x] Utils: config.ts, logger.ts, errors.ts
-- [x] API client with token management and refresh
-- [x] OAuth 2.0 flow with localhost callback
-- [x] Profile API (linkedin_profile_me)
-- [x] Posts API (create, update, delete, get, list, repost)
-- [x] Media upload (images + video, 2-step flow)
-- [x] Comments API (create, list, delete)
-- [x] Reactions API (add, remove)
-- [x] Scheduler (SQLite store, daemon, publisher)
-- [x] Content templates (7 built-in + custom)
-- [x] Brand voice configuration
-- [x] Gemini Imagen 4 integration
-- [x] MCP server with all 24 tools
-- [x] README.md
-- [x] GitHub Actions publish workflow
-- [x] Build passes, 24 tools verified
-- [x] Add shebang to dist/index.js (#!/usr/bin/env node) via prepublish script
-- [x] Add CLAUDE.md with project conventions
-- [x] LinkedIn algorithm guidelines (guidelines/linkedin-strategy.json + tool #25 linkedin_guidelines)
-- [x] 5 new templates (viral-trend, community-question, lead-magnet, carousel-edu, thought-leadership-pl) — 12 total
-- [x] Upgraded all templates with tips field and algorithm-aware descriptions
-- [x] Extended BrandVoiceConfig with LinkedIn algorithm fields
-- [x] Updated tool descriptions with algorithm best practices
+**Root cause:** IMG_DIR wskazuje na `/Users/gaca/output/personal/linkedin-mcp` (pusty katalog).
+Obrazy sa w `/Users/gaca/projects/personal/linkedin-mcp-server/output/linkedin-mcp/`.
 
-### TODO — Next tasks for Ralph
-- [x] Update CLAUDE.md to reflect Phase 2 changes (25 tools, 12 templates, guidelines module)
-- [ ] Test linkedin_auth_status tool with no tokens — verify graceful response
-- [ ] Test linkedin_guidelines tool with various topics — verify all return data
-- [ ] Test linkedin_template_list — verify 12 templates load correctly
-- [ ] Test linkedin_brand_voice get — verify new LinkedIn-specific fields present
-- [ ] Test linkedin_schedule_create → linkedin_schedule_list flow
-- [ ] Add input validation error messages that guide users (e.g., "text is required, use linkedin_template_list to browse templates")
-- [x] Add connection timeout to fetch calls (AbortController with 30s timeout)
-- [ ] Verify the scheduler catch-up logic works (overdue posts published on startup)
-- [ ] Consider adding linkedin_post_create_with_image convenience tool (generate + upload + post in one call)
-- [x] Ensure guidelines/linkedin-strategy.json is included in npm package (files[] in package.json)
-- [x] Add tips field to ContentTemplate TypeScript interface in templates.ts
+**Fix:** Zmienic IMG_DIR w dashboard.mjs linia 24:
+```js
+const IMG_DIR = '/Users/gaca/projects/personal/linkedin-mcp-server/output/linkedin-mcp';
+```
+
+Dodatkowo: `enrichPost()` uzywa `identifyPost()` do mapowania tekst->obraz.
+Wiele postow nie matchuje bo teksty sie zmienily. Fix: dodac brakujace snippets do POST_IDENTIFIERS.
+
+**Pliki:** dashboard.mjs linia 24 + linie 56-110 (POST_IDENTIFIERS)
+
+---
+
+## Problem 2: Nie pobieraja sie nowe kontakty (auto-prospect)
+
+**Root cause:** Scraper cookie `li_at` wygasl (z 16.03). Voyager API zwracal 403 -> MCP timeout 60s.
+Cookie juz odswiezony (08.04). Ale `auto-prospect.mjs` uzywa `callMCP()` z timeout 60s ktory moze byc za krotki.
+
+**Fix:**
+1. Cookie zaktualizowany — zweryfikowac ze search dziala
+2. Zwiekszyc timeout callMCP z 60s na 120s w auto-prospect.mjs (linia 87)
+3. Dodac lepsze error handling — logowac HTTP status Voyagera
+4. Przetestowac: `node auto-prospect.mjs` reczne uruchomienie
+
+**Pliki:** auto-prospect.mjs linia 87
+
+---
+
+## Problem 3: Nie widac komentarzy i statystyk z LinkedIn
+
+**Root cause:** Dashboard nie ma sekcji z engagement metrics. Dane sa w engage.db
+(processed_comments, engagement_log) ale nie sa wyswietlane.
+
+**Fix:** Dodac sekcje "Engagement" do headera i tab Posty:
+1. Nowy endpoint GET /api/engagement — podsumowanie z engage.db:
+   - Komentarze przetworzone dzis / w tym tygodniu
+   - Decyzje: replied / liked / skipped
+   - Ostatnie 10 komentarzy z decyzjami
+2. W headerze `.sbar` dodac: Comments today: X | Replies: Y
+3. W kartach published postow: link "Zobacz komentarze" (linkedin_comments_list)
+
+**Pliki:** dashboard.mjs — nowy endpoint + loadStatus() + renderCard()
+
+---
+
+## Problem 4: Brak mozliwosci edycji proponowanych postow
+
+**Root cause:** Dwa bugi:
+1. `PROPOSED_POSTS.indexOf(p)` zwraca -1 (porownanie referencji obiektow JS)
+2. Rendered `data-idx` jest -1 -> openCreateFromProposed dostaje undefined
+
+**Fix:** W render() uzyc findIndex z porownaniem po dacie:
+```js
+var origIdx = PROPOSED_POSTS.findIndex(function(pp) { return pp.date === p.date; });
+```
+
+**Pliki:** dashboard.mjs — render() funkcja
+
+---
+
+## Problem 5: Brak zmian w harmonogramie po zaplanowaniu posta
+
+**Root cause:** Po Save w modalu, loadPosts() odswieza Posty, ale renderKalendarz()
+NIE jest wywolywany. Kalendarz pokazuje stale dane do recznego odswiezenia.
+
+**Fix:** W savePost() po sukcesie dodac renderKalendarz():
+```js
+toast('Post created', true); closeModal(); loadPosts(); renderKalendarz();
+```
+
+**Pliki:** dashboard.mjs — savePost()
+
+---
+
+## Kolejnosc
+
+1. Fix IMG_DIR (natychmiastowy efekt wizualny)
+2. Fix indexOf bug + calendar refresh (edycja proposed postow)
+3. Test auto-prospect z nowym cookie
+4. Timeout 60->120s w auto-prospect
+5. Engagement endpoint + UI w dashboardzie

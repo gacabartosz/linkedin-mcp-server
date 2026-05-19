@@ -13,6 +13,17 @@ import { spawn, execSync } from 'node:child_process';
 import { readFileSync, existsSync, writeFileSync, statSync, readdirSync } from 'node:fs';
 import { join, extname, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+
+// Load .env from project root (for LINKEDIN_CLIENT_ID etc. when run via launchd)
+try {
+  const envPath = join(dirname(fileURLToPath(import.meta.url)), '.env');
+  if (existsSync(envPath)) {
+    readFileSync(envPath, 'utf-8').split('\n').forEach(line => {
+      const m = line.match(/^([A-Z_][A-Z0-9_]*)="?([^"]*)"?\s*$/);
+      if (m && !process.env[m[1]]) process.env[m[1]] = m[2];
+    });
+  }
+} catch {}
 import { homedir, platform } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import Database from 'better-sqlite3';
@@ -169,6 +180,21 @@ function getImageFile(text) {
 
 function getDb(readonly = true) {
   return new Database(DB_PATH, { readonly });
+}
+
+const ENGAGE_DB_PATH = join(homedir(), '.linkedin-mcp', 'engage.db');
+function getEngageDb(readonly = true) {
+  const db = new Database(ENGAGE_DB_PATH, { readonly });
+  db.exec(`CREATE TABLE IF NOT EXISTS reply_proposals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT NOT NULL,
+    source_id TEXT NOT NULL, source_text TEXT, source_author TEXT,
+    post_urn TEXT, post_text TEXT, proposed_reply TEXT NOT NULL,
+    lead_score INTEGER DEFAULT 0, troll_risk INTEGER DEFAULT 0,
+    engagement_value INTEGER DEFAULT 0, urgency INTEGER DEFAULT 0,
+    status TEXT DEFAULT 'pending', sent_at TEXT,
+    created_at TEXT DEFAULT (datetime('now')), updated_at TEXT DEFAULT (datetime('now'))
+  )`);
+  return db;
 }
 
 function migrateDb() {
@@ -381,8 +407,9 @@ async function handleRequest(req, res) {
       return;
     }
 
-    // GET /oauth/callback — production OAuth redirect target (replaces localhost:8585 callback in prod)
-    if (method === 'GET' && path === '/oauth/callback') {
+    // GET /oauth/callback — production OAuth redirect target
+    // Also handles /callback alias (registered in LinkedIn Developer App)
+    if (method === 'GET' && (path === '/oauth/callback' || path === '/callback')) {
       const code = url.searchParams.get('code');
       const errParam = url.searchParams.get('error');
       if (errParam) {
@@ -398,7 +425,7 @@ async function handleRequest(req, res) {
       try {
         const clientId = process.env.LINKEDIN_CLIENT_ID;
         const clientSecret = process.env.LINKEDIN_CLIENT_SECRET;
-        const redirectUri = process.env.OAUTH_PUBLIC_REDIRECT_URI || `http://localhost:${PORT}/oauth/callback`;
+        const redirectUri = process.env.OAUTH_PUBLIC_REDIRECT_URI || `http://localhost:${PORT}/callback`;
         if (!clientId || !clientSecret) throw new Error('LINKEDIN_CLIENT_ID/SECRET missing in env');
         const tokenResp = await fetch('https://www.linkedin.com/oauth/v2/accessToken', {
           method: 'POST',
@@ -443,7 +470,9 @@ async function handleRequest(req, res) {
       const clientId = process.env.LINKEDIN_CLIENT_ID;
       if (!clientId) { res.writeHead(500); res.end('LINKEDIN_CLIENT_ID missing'); return; }
       const redirectUri = process.env.OAUTH_PUBLIC_REDIRECT_URI || `http://localhost:${PORT}/oauth/callback`;
-      const scopes = (url.searchParams.get('scopes') || 'openid profile email w_member_social r_member_postAnalytics').split(/\s+/).join(' ');
+      // r_member_social: bez tego oficjalne API zwraca 403 na socialActions.GET_ALL
+      // (auto-engage czytanie komentarzy pod postami → 'Cycle complete: 0 processed, 0 replies, 10 errors')
+      const scopes = (url.searchParams.get('scopes') || 'openid profile email w_member_social r_member_postAnalytics r_member_social').split(/\s+/).join(' ');
       const state = randomUUID();
       const authUrl = new URL('https://www.linkedin.com/oauth/v2/authorization');
       authUrl.searchParams.set('response_type', 'code');
@@ -902,7 +931,19 @@ Po zakończeniu wypisz raport: które zaproszenia wysłane, które nie (np. już
           const exp = new Date(auth.expires_at);
           officialStatus = exp > new Date() ? `valid_until_${auth.expires_at.slice(0,10)}` : 'expired';
         } catch { officialStatus = 'no_file'; }
-        health.auth = { voyager: voyagerStatus, official: officialStatus };
+        // Generuj OAuth URL jeśli token expired i CLIENT_ID dostępny
+        let oauthUrl = null;
+        const clientId = process.env.LINKEDIN_CLIENT_ID;
+        if (clientId && (officialStatus === 'expired' || officialStatus === 'no_file')) {
+          const redirect = process.env.OAUTH_PUBLIC_REDIRECT_URI || `http://localhost:${PORT}/callback`;
+          const params = new URLSearchParams({
+            response_type: 'code', client_id: clientId, redirect_uri: redirect,
+            scope: 'openid profile email w_member_social',
+            state: 'dashboard-refresh-' + Date.now(),
+          });
+          oauthUrl = `https://www.linkedin.com/oauth/v2/authorization?${params.toString()}`;
+        }
+        health.auth = { voyager: voyagerStatus, official: officialStatus, oauth_url: oauthUrl };
         // MCP tools count
         health.mcp_tools = 71;
         adb.close();
@@ -1692,7 +1733,13 @@ Po zakończeniu wypisz raport: które zaproszenia wysłane, które nie (np. już
           // Auto-refresh cookie before scanning
           send({ type: 'start', message: 'Odswiezam sesje LinkedIn...' });
           try {
-            execSync('node scripts/refresh-voyager-cookie.mjs 2>&1', { cwd: MCP_DIR, timeout: 30000 });
+            // Próba 1: wyciągnij li_at z Chrome (szybkie, bez logowania)
+            try {
+              execSync('node auto-refresh-li-at.mjs 2>&1', { cwd: MCP_DIR, timeout: 15000 });
+            } catch {
+              // Fallback: Playwright persistent session
+              execSync('node scripts/refresh-voyager-cookie.mjs 2>&1', { cwd: MCP_DIR, timeout: 60000 });
+            }
             send({ type: 'start', message: 'Sesja odswiezona. Szukam prospektow...' });
           } catch (cookieErr) {
             send({ type: 'start', message: 'Nie udalo sie odswiezyc sesji — probuje szukac...' });
@@ -1868,6 +1915,120 @@ Po zakończeniu wypisz raport: które zaproszenia wysłane, które nie (np. już
       return json(res, { ok: true, classified, hashtags_updated: Object.keys(hashStats).length, total_posts: published.length });
     }
 
+    // ── /api/threads (pamięć wątków komentarzy) ──────────────────────────
+
+    if (method === 'GET' && path === '/api/threads') {
+      const db = getEngageDb(true);
+      try {
+        db.exec(`CREATE TABLE IF NOT EXISTS thread_memory (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, post_urn TEXT NOT NULL,
+          post_text TEXT, post_author TEXT, post_url TEXT,
+          thread_json TEXT, our_replies_json TEXT,
+          last_scraped_at TEXT DEFAULT (datetime('now')),
+          comment_count INTEGER DEFAULT 0, needs_review BOOLEAN DEFAULT 0,
+          UNIQUE(post_urn)
+        )`);
+      } catch {}
+      const rows = db.prepare("SELECT * FROM thread_memory ORDER BY last_scraped_at DESC LIMIT 50").all();
+      db.close();
+      return json(res, rows);
+    }
+
+    // POST /api/threads/backfill — uruchom backfill (long-running, background)
+    if (method === 'POST' && path === '/api/threads/backfill') {
+      const body = await parseBody(req).catch(() => ({}));
+      const limit = parseInt(body.limit, 10) || 5;
+      const dryRun = body.dry_run ? '--dry-run' : '';
+      try {
+        // Background spawn — nie blokujemy response
+        const child = spawn('node', [
+          'scripts/backfill-comments.mjs',
+          '--limit', String(limit),
+          ...(dryRun ? ['--dry-run'] : []),
+        ], { cwd: MCP_DIR, detached: true, stdio: 'ignore' });
+        child.unref();
+        return json(res, { ok: true, pid: child.pid, limit, dryRun: !!body.dry_run, message: 'Backfill uruchomiony w tle. Logi: tail -f playwright-comments.log' });
+      } catch (e) {
+        return json(res, { error: e.message }, 500);
+      }
+    }
+
+    if (method === 'GET' && path === '/api/playwright-cycles') {
+      const db = getEngageDb(true);
+      try {
+        db.exec(`CREATE TABLE IF NOT EXISTS playwright_cycles (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          started_at TEXT DEFAULT (datetime('now')), ended_at TEXT,
+          posts_checked INTEGER DEFAULT 0, proposals_created INTEGER DEFAULT 0,
+          errors INTEGER DEFAULT 0, notes TEXT
+        )`);
+      } catch {}
+      const rows = db.prepare("SELECT * FROM playwright_cycles ORDER BY started_at DESC LIMIT 30").all();
+      db.close();
+      return json(res, rows);
+    }
+
+    // ── /api/proposals ────────────────────────────────────────────────────
+
+    // GET /api/proposals — lista propozycji (pending/all)
+    if (method === 'GET' && path === '/api/proposals') {
+      const status = url.searchParams.get('status') || 'pending';
+      const db = getEngageDb(true);
+      const rows = status === 'all'
+        ? db.prepare("SELECT * FROM reply_proposals ORDER BY created_at DESC LIMIT 100").all()
+        : db.prepare("SELECT * FROM reply_proposals WHERE status = ? ORDER BY created_at DESC LIMIT 50").all(status);
+      db.close();
+      return json(res, rows);
+    }
+
+    // PUT /api/proposals/:id — edytuj treść propozycji
+    if (method === 'PUT' && path.match(/^\/api\/proposals\/\d+$/)) {
+      const id = parseInt(path.split('/').pop(), 10);
+      const body = await parseBody(req);
+      const db = getEngageDb(false);
+      const result = db.prepare(
+        "UPDATE reply_proposals SET proposed_reply = ?, updated_at = datetime('now') WHERE id = ? AND status = 'pending'"
+      ).run(body.proposed_reply || '', id);
+      const row = db.prepare("SELECT * FROM reply_proposals WHERE id = ?").get(id);
+      db.close();
+      if (!result.changes) return json(res, { error: 'Not found or already sent' }, 404);
+      return json(res, row);
+    }
+
+    // POST /api/proposals/:id/send — APPROVE propozycję (Playwright sender wyśle ją asynchronicznie)
+    if (method === 'POST' && path.match(/^\/api\/proposals\/\d+\/send$/)) {
+      const id = parseInt(path.split('/')[3], 10);
+      const db = getEngageDb(false);
+      const prop = db.prepare("SELECT * FROM reply_proposals WHERE id = ? AND status = 'pending'").get(id);
+      if (!prop) { db.close(); return json(res, { error: 'Not found or already sent' }, 404); }
+
+      if (prop.type === 'dm') {
+        // DM: ręcznie przez LinkedIn UI (Voyager API ma bany)
+        db.prepare("UPDATE reply_proposals SET status='sent', sent_at=datetime('now'), sent_via='manual_dm', updated_at=datetime('now') WHERE id=?").run(id);
+        db.close();
+        return json(res, { ok: true, manual: true, copy_text: prop.proposed_reply, url: 'https://www.linkedin.com/messaging/', info: 'Skopiuj tekst i wyślij przez LinkedIn Messaging' });
+      }
+
+      // Comment: approval queue — Playwright sender (auto-comment-sender.mjs) wyśle gdy będzie cykl
+      db.prepare("UPDATE reply_proposals SET status='approved', approved_at=datetime('now'), updated_at=datetime('now') WHERE id=?").run(id);
+      db.close();
+      return json(res, {
+        ok: true,
+        queued: true,
+        info: 'Zatwierdzone — Playwright sender wyśle automatycznie w ciągu kilku/kilkudziesięciu minut (losowy delay 5-30 min, human-like)',
+      });
+    }
+
+    // POST /api/proposals/:id/reject — odrzuć propozycję
+    if (method === 'POST' && path.match(/^\/api\/proposals\/\d+\/reject$/)) {
+      const id = parseInt(path.split('/')[3], 10);
+      const db = getEngageDb(false);
+      const result = db.prepare("UPDATE reply_proposals SET status='rejected', updated_at=datetime('now') WHERE id=?").run(id);
+      db.close();
+      if (!result.changes) return json(res, { error: 'Not found' }, 404);
+      return json(res, { ok: true });
+    }
+
     // ── /api/media-plan ────────────────────────────────────────────────────
 
     // GET /api/media-plan — list all 12 items, optional ?status= filter
@@ -1904,7 +2065,7 @@ Po zakończeniu wypisz raport: które zaproszenia wysłane, które nie (np. już
       const id = path.split('/').pop();
       const body = await parseBody(req);
       const allowed = [
-        'post_text', 'hashtags', 'cta', 'lead_trigger',
+        'post_text', 'hook', 'title', 'hashtags', 'cta', 'lead_trigger',
         'banner_path', 'visual_asset_path', 'visual_asset_type',
         'wiki_slug', 'publish_at', 'language',
         'cannibalize_status'
@@ -2500,11 +2661,23 @@ function buildHtml() {
 'a{color:var(--blu)}',
 '.header{background:var(--card);border-bottom:1px solid var(--brd);padding:0 20px;display:flex;align-items:center;gap:12px;height:52px;position:sticky;top:0;z-index:50;overflow:hidden}',
 '.logo{font-size:16px;font-weight:700;white-space:nowrap;flex-shrink:0}.logo em{color:var(--blu);font-style:normal}',
-'.tabnav{display:flex;gap:2px;overflow-x:auto;flex:1;scrollbar-width:none;-webkit-overflow-scrolling:touch}',
-'.tabnav::-webkit-scrollbar{display:none}',
-'.tnb{background:none;border:none;color:var(--dim);font-family:inherit;font-size:13px;font-weight:600;padding:7px 13px;border-radius:6px;cursor:pointer;white-space:nowrap;transition:.15s}',
+/* Hamburger + sliding sidebar nav */
+'.hburger{background:none;border:1px solid var(--brd);color:var(--txt);width:36px;height:36px;border-radius:6px;cursor:pointer;display:flex;flex-direction:column;justify-content:center;align-items:center;gap:3px;flex-shrink:0;transition:.15s}',
+'.hburger:hover{background:rgba(255,255,255,.05);border-color:var(--blu)}',
+'.hburger span{display:block;width:18px;height:2px;background:var(--txt);border-radius:2px;transition:.2s}',
+'.hburger.open span:nth-child(1){transform:translateY(5px) rotate(45deg)}',
+'.hburger.open span:nth-child(2){opacity:0}',
+'.hburger.open span:nth-child(3){transform:translateY(-5px) rotate(-45deg)}',
+'.current-tab{font-size:14px;font-weight:600;color:var(--blu);padding:0 10px;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+'.nav-overlay{position:fixed;inset:0;background:rgba(0,0,0,.5);opacity:0;pointer-events:none;transition:.2s;z-index:99}',
+'.nav-overlay.open{opacity:1;pointer-events:auto}',
+'.tabnav{position:fixed;left:0;top:0;bottom:0;width:280px;background:var(--card);border-right:1px solid var(--brd);transform:translateX(-100%);transition:transform .25s ease;z-index:100;display:flex;flex-direction:column;gap:2px;padding:60px 12px 12px;overflow-y:auto}',
+'.tabnav.open{transform:translateX(0)}',
+'.tabnav::-webkit-scrollbar{width:6px}.tabnav::-webkit-scrollbar-thumb{background:var(--brd);border-radius:3px}',
+'.nav-header{position:absolute;top:12px;left:12px;right:12px;font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:1px;padding:8px 12px;border-bottom:1px solid var(--brd)}',
+'.tnb{background:none;border:none;color:var(--dim);font-family:inherit;font-size:14px;font-weight:600;padding:11px 14px;border-radius:6px;cursor:pointer;white-space:nowrap;transition:.15s;text-align:left;width:100%;display:flex;align-items:center;gap:8px}',
 '.tnb:hover{color:var(--txt);background:rgba(255,255,255,.05)}',
-'.tnb.active{color:var(--grn);background:rgba(63,185,80,.1)}',
+'.tnb.active{color:var(--grn);background:rgba(63,185,80,.12);border-left:3px solid var(--grn);padding-left:11px}',
 '.sbar{display:flex;gap:10px;align-items:center;font-size:11px;flex-wrap:nowrap;flex-shrink:0}',
 '.sdot{width:7px;height:7px;border-radius:50%;display:inline-block;margin-right:3px}',
 '.sdot.g{background:var(--grn)}.sdot.r{background:var(--red)}.sdot.y{background:var(--yel)}',
@@ -2679,8 +2852,12 @@ function buildHtml() {
 '</head>',
 '<body>',
 '<div class="header">',
+'<button class="hburger" id="hburger" aria-label="Menu"><span></span><span></span><span></span></button>',
 '<div class="logo"><em>LI</em> Dashboard</div>',
-'<nav class="tabnav">',
+'<div class="current-tab" id="current-tab">Posty</div>',
+'<div class="nav-overlay" id="nav-overlay"></div>',
+'<nav class="tabnav" id="tabnav">',
+'<div class="nav-header">Menu</div>',
 '<button class="tnb active" data-tab="posty">Posty</button>',
 '<button class="tnb" data-tab="mediaplan">Media Plan</button>',
 '<button class="tnb" data-tab="prospekci">Inbound Leads</button>',
@@ -2691,6 +2868,8 @@ function buildHtml() {
 '<button class="tnb" data-tab="leady">Leady</button>',
 '<button class="tnb" data-tab="kontenty">Kontenty</button>',
 '<button class="tnb" data-tab="artykuly">Artykuły</button>',
+'<button class="tnb" data-tab="propozycje" id="tab-btn-propozycje">💬 Propozycje</button>',
+'<button class="tnb" data-tab="watki" id="tab-btn-watki">🧵 Wątki</button>',
 '</nav>',
 '<div class="sbar" id="sbar">...</div>',
 '</div>',
@@ -2726,6 +2905,39 @@ function buildHtml() {
 '<div class="tab-panel" id="tab-kontenty"><div class="wrap" id="kontenty-root"></div></div>',
 // ── Tab: Artykuły (Article Drafter — Wariant G-A) ──────────────────
 '<div class="tab-panel" id="tab-artykuly"><div class="wrap" id="art-root"></div></div>',
+
+// ── Tab: Propozycje odpowiedzi ──────────────────────────────────────────────
+'<div class="tab-panel" id="tab-propozycje">',
+'<div class="wrap">',
+'<div style="display:flex;align-items:center;gap:12px;margin-bottom:16px">',
+'<h2 style="margin:0;font-size:16px">💬 Propozycje odpowiedzi</h2>',
+'<span id="prop-count" style="background:var(--blu);color:#fff;padding:2px 8px;border-radius:10px;font-size:11px">0</span>',
+'<select id="prop-filter" style="margin-left:auto;background:var(--card);border:1px solid var(--brd);color:var(--txt);padding:4px 8px;border-radius:4px;font-size:12px">',
+'<option value="pending">Oczekujące</option>',
+'<option value="all">Wszystkie</option>',
+'<option value="sent">Wysłane</option>',
+'<option value="rejected">Odrzucone</option>',
+'</select>',
+'<button class="btn sm" id="prop-refresh">↺ Odśwież</button>',
+'</div>',
+'<div id="prop-list"></div>',
+'</div>',
+'</div>',
+
+// ── Tab: Wątki (thread_memory) ──────────────────────────────────────────────
+'<div class="tab-panel" id="tab-watki">',
+'<div class="wrap">',
+'<div style="display:flex;align-items:center;gap:12px;margin-bottom:16px">',
+'<h2 style="margin:0;font-size:16px">🧵 Pamięć wątków komentarzy</h2>',
+'<span id="watki-count" style="background:var(--blu);color:#fff;padding:2px 8px;border-radius:10px;font-size:11px">0</span>',
+'<span id="watki-last-cycle" style="font-size:11px;color:var(--dim);margin-left:auto"></span>',
+'<button class="btn sm" id="watki-refresh">↺ Odśwież</button>',
+'</div>',
+'<div id="watki-cycles" style="margin-bottom:16px"></div>',
+'<div id="watki-list"></div>',
+'</div>',
+'</div>',
+
 // ── Modal ───────────────────────────────────────────────────────────────
 '<div class="overlay" id="ov">',
 '<div class="modal">',
@@ -2756,6 +2968,10 @@ function buildHtml() {
 '<div class="modal" style="width:980px">',
 '<h2 id="mp-mtitle">Media Plan — Edit</h2>',
 '<div id="mp-meta" style="margin-bottom:14px;font-size:12px;color:var(--dim)"></div>',
+'<div class="frow" style="margin-bottom:10px">',
+'<div class="fg"><label>Hook (pierwsze 62 znaki — widoczne przed "see more")</label><input type="text" id="mp-hook" placeholder="Konkretne zdanie. Problem lub fakt." maxlength="120" style="font-weight:600"></div>',
+'<div class="fg" style="max-width:220px"><label>Title (wewnętrzny)</label><input type="text" id="mp-title" placeholder="Tytuł tematu"></div>',
+'</div>',
 '<div class="lcol act" style="margin-bottom:14px">',
 '<label>Treść posta (PL/EN — wg item.language)</label>',
 '<textarea id="mp-text" placeholder="Napisz treść 1300-1700 znaków..." style="min-height:280px"></textarea>',
@@ -3195,7 +3411,34 @@ function switchTab(id) {
   localStorage.setItem('li_tab', id);
   document.querySelectorAll('.tnb').forEach(function(b) { b.classList.toggle('active', b.dataset.tab === id); });
   document.querySelectorAll('.tab-panel').forEach(function(p) { p.classList.toggle('active', p.id === 'tab-' + id); });
+  // Update header label
+  var lbl = document.getElementById('current-tab');
+  var btn = document.querySelector('.tnb[data-tab="' + id + '"]');
+  if (lbl && btn) lbl.textContent = btn.textContent.trim();
+  // Close hamburger menu
+  closeNav();
 }
+
+function openNav() {
+  document.getElementById('tabnav').classList.add('open');
+  document.getElementById('nav-overlay').classList.add('open');
+  document.getElementById('hburger').classList.add('open');
+}
+function closeNav() {
+  document.getElementById('tabnav').classList.remove('open');
+  document.getElementById('nav-overlay').classList.remove('open');
+  document.getElementById('hburger').classList.remove('open');
+}
+function toggleNav() {
+  if (document.getElementById('tabnav').classList.contains('open')) closeNav(); else openNav();
+}
+
+document.getElementById('hburger').addEventListener('click', toggleNav);
+document.getElementById('nav-overlay').addEventListener('click', closeNav);
+// ESC zamyka menu
+document.addEventListener('keydown', function(e) {
+  if (e.key === 'Escape') closeNav();
+});
 
 document.querySelectorAll('.tnb').forEach(function(b) {
   b.addEventListener('click', function() {
@@ -3207,8 +3450,17 @@ document.querySelectorAll('.tnb').forEach(function(b) {
     if (b.dataset.tab === 'kontenty') renderKontenty();
     if (b.dataset.tab === 'mediaplan') renderMediaPlan();
     if (b.dataset.tab === 'artykuly') renderArtykuly();
+    if (b.dataset.tab === 'propozycje') loadProposals();
+    if (b.dataset.tab === 'watki') loadWatki();
   });
 });
+
+// Init header label
+(function initLabel() {
+  var lbl = document.getElementById('current-tab');
+  var active = document.querySelector('.tnb.active');
+  if (lbl && active) lbl.textContent = active.textContent.trim();
+})();
 
 // ── MEDIA PLAN ───────────────────────────────────────────────────────────────
 
@@ -3393,6 +3645,8 @@ function mpOpenDetail(id) {
   }
   $$('mp-meta').innerHTML = meta;
 
+  $$('mp-hook').value = it.hook || '';
+  $$('mp-title').value = it.title || '';
   $$('mp-text').value = it.post_text || '';
   $$('mp-cc').textContent = (it.post_text || '').length;
   mpUpdateCharWarn();
@@ -3445,6 +3699,8 @@ function mpSave() {
   var publishAtRaw = $$('mp-publish-at').value;
   var publishAt = publishAtRaw ? publishAtRaw.replace('T', ' ') + ':00' : mpEditing.publish_at;
   var body = {
+    hook: $$('mp-hook').value || null,
+    title: $$('mp-title').value || null,
     post_text: $$('mp-text').value,
     banner_path: $$('mp-banner').value || null,
     visual_asset_path: $$('mp-visual').value || null,
@@ -3707,8 +3963,14 @@ function renderRutyna() {
     h += '<div class="sec-h" style="margin-bottom:8px">Automatyzacje — status</div>';
     h += '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:10px;margin-bottom:24px">';
     autos.forEach(function(a) {
-      var statusColor = a.running ? 'var(--grn)' : 'var(--red)';
-      var statusText = a.running ? ('AKTYWNY' + (a.pid ? ' (PID '+a.pid+')' : '')) : 'ZATRZYMANY';
+      // Cron-style LaunchAgents (StartCalendarInterval) are not "stopped" when
+      // running:false — they're scheduled-idle. Show "IDLE — następny HH:MM"
+      // so users don't think the automation crashed.
+      var isCron = /Cron:/i.test(a.schedule || '');
+      var statusColor = a.running ? 'var(--grn)' : (isCron ? 'var(--yel)' : 'var(--red)');
+      var statusText = a.running
+        ? ('AKTYWNY' + (a.pid ? ' (PID '+a.pid+')' : ''))
+        : (isCron ? ('IDLE — następny ' + (a.nextRun || a.schedule || '?')) : 'ZATRZYMANY');
       var dot = '<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:' + statusColor + ';margin-right:6px"></span>';
       h += '<div style="background:var(--card);border:1px solid var(--brd);border-radius:8px;padding:12px">';
       h += '<div style="font-weight:600;font-size:13px;margin-bottom:4px">' + esc(a.label) + '</div>';
@@ -3730,9 +3992,18 @@ function renderRutyna() {
       // Auth status
       var authColor = dh.auth && dh.auth.official && dh.auth.official.startsWith('valid') ? 'var(--grn)' : 'var(--red)';
       var voyColor = dh.auth && dh.auth.voyager === 'has_cookie' ? 'var(--yel)' : 'var(--red)';
+      var oauthUrl = dh.auth?.oauth_url || '';
       hh += '<div style="background:var(--card);border:1px solid var(--brd);border-radius:6px;padding:8px">';
       hh += '<div style="font-size:11px;color:var(--dim)">Official API</div>';
-      hh += '<div style="color:' + authColor + ';font-weight:600;font-size:12px">' + esc(dh.auth?.official || '?') + '</div></div>';
+      hh += '<div style="color:' + authColor + ';font-weight:600;font-size:12px">' + esc(dh.auth?.official || '?') + '</div>';
+      if (dh.auth?.official === 'expired' || dh.auth?.official === 'no_file') {
+        if (oauthUrl) {
+          hh += '<a href="' + oauthUrl + '" style="font-size:10px;color:var(--blu);text-decoration:none;display:block;margin-top:4px">🔑 Odśwież token →</a>';
+        } else {
+          hh += '<div style="font-size:10px;color:var(--yel);margin-top:4px">Brak CLIENT_ID w env</div>';
+        }
+      }
+      hh += '</div>';
       hh += '<div style="background:var(--card);border:1px solid var(--brd);border-radius:6px;padding:8px">';
       hh += '<div style="font-size:11px;color:var(--dim)">Voyager (Scraper)</div>';
       hh += '<div style="color:' + voyColor + ';font-weight:600;font-size:12px">' + esc(dh.auth?.voyager || '?') + '</div></div>';
@@ -4864,6 +5135,15 @@ if (activeTab === 'leady') renderLeady();
 if (activeTab === 'kontenty') renderKontenty();
 if (activeTab === 'mediaplan') renderMediaPlan();
 if (activeTab === 'artykuly') renderArtykuly();
+if (activeTab === 'propozycje') loadProposals();
+
+// Refresh button + filter
+document.addEventListener('click', function(e) {
+  if (e.target.id === 'prop-refresh') loadProposals();
+});
+document.addEventListener('change', function(e) {
+  if (e.target.id === 'prop-filter') loadProposals();
+});
 
 // ── ARTYKULY (Wariant G-A: article drafter UI) ──────────────────────────
 var artTopics = null;
@@ -4988,6 +5268,189 @@ setInterval(function() { if (activeTab === 'analytics') renderAnalytics(); }, 12
 setInterval(function() { if (activeTab === 'siec') renderSiec(); }, 120000);
 setInterval(function() { if (activeTab === 'leady') renderLeady(); }, 120000);
 setInterval(function() { if (activeTab === 'kontenty') renderKontenty(); }, 120000);
+setInterval(function() { if (activeTab === 'propozycje') loadProposals(); }, 30000);
+setInterval(function() { if (activeTab === 'watki') loadWatki(); }, 30000);
+
+// ── WATKI (thread memory) ──────────────────────────────────────────────────
+function loadWatki() {
+  Promise.all([
+    fetch('/api/threads').then(function(r) { return r.json(); }),
+    fetch('/api/playwright-cycles').then(function(r) { return r.json(); })
+  ]).then(function(arr) {
+    var threads = arr[0] || [];
+    var cycles = arr[1] || [];
+    renderWatki(threads, cycles);
+  }).catch(function(e) {
+    var el = document.getElementById('watki-list');
+    if (el) el.innerHTML = '<p style="color:var(--red)">Błąd: ' + e.message + '</p>';
+  });
+}
+
+function renderWatki(threads, cycles) {
+  var cnt = document.getElementById('watki-count');
+  var list = document.getElementById('watki-list');
+  var cyclesEl = document.getElementById('watki-cycles');
+  var lastEl = document.getElementById('watki-last-cycle');
+  if (!cnt || !list) return;
+
+  cnt.textContent = threads.length + ' wątków';
+
+  // Cykl info
+  var lastCycle = cycles[0];
+  if (lastCycle && lastEl) {
+    lastEl.textContent = 'Ostatni cykl: ' + (lastCycle.ended_at || 'w toku') +
+      ' (sprawdzono ' + lastCycle.posts_checked + ' postów, ' + lastCycle.proposals_created + ' propozycji)';
+  }
+
+  // Tabela cykli (ostatnie 5)
+  if (cyclesEl) {
+    if (cycles.length === 0) {
+      cyclesEl.innerHTML = '<div style="font-size:12px;color:var(--dim);padding:8px;border:1px dashed var(--brd);border-radius:6px">Brak uruchomień Playwright — uruchom: <code style="background:var(--card);padding:2px 6px;border-radius:3px">node auto-comment-playwright.mjs --once</code></div>';
+    } else {
+      cyclesEl.innerHTML = '<div style="font-size:11px;color:var(--dim);margin-bottom:6px">Ostatnie cykle Playwright:</div>' +
+        '<table style="width:100%;font-size:11px;border-collapse:collapse">' +
+        '<tr style="border-bottom:1px solid var(--brd)"><th style="text-align:left;padding:4px">Start</th><th>Posts</th><th>Propozycje</th><th>Errors</th><th>Notes</th></tr>' +
+        cycles.slice(0, 5).map(function(c) {
+          var color = c.errors > 0 ? 'var(--red)' : 'var(--grn)';
+          return '<tr style="border-bottom:1px solid var(--brd)">' +
+            '<td style="padding:4px">' + (c.started_at||'?').slice(0,16) + '</td>' +
+            '<td style="text-align:center">' + (c.posts_checked||0) + '</td>' +
+            '<td style="text-align:center;color:var(--blu)">' + (c.proposals_created||0) + '</td>' +
+            '<td style="text-align:center;color:' + color + '">' + (c.errors||0) + '</td>' +
+            '<td style="font-size:10px;color:var(--dim)">' + ((c.notes||'').slice(0,50)) + '</td>' +
+            '</tr>';
+        }).join('') + '</table>';
+    }
+  }
+
+  // Lista wątków
+  if (!threads.length) {
+    list.innerHTML = '<p style="color:var(--dim);text-align:center;padding:40px">Brak zeskrapowanych wątków. Playwright daemon zaczyna pracę po pierwszym cyklu.</p>';
+    return;
+  }
+
+  list.innerHTML = threads.map(function(t) {
+    var ourReplies = [];
+    try { ourReplies = JSON.parse(t.our_replies_json || '[]'); } catch {}
+    var thread = [];
+    try { thread = JSON.parse(t.thread_json || '[]'); } catch {}
+
+    return '<div style="background:var(--card);border:1px solid var(--brd);border-radius:8px;padding:14px;margin-bottom:12px">' +
+      '<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">' +
+      '<span style="font-size:12px;color:var(--dim)">Autor postu:</span>' +
+      '<b>' + esc(t.post_author || '?') + '</b>' +
+      '<span style="margin-left:auto;font-size:11px;color:var(--dim)">' + ((t.last_scraped_at||'').slice(0,16)) + '</span>' +
+      '<span style="background:var(--blu);color:#fff;padding:2px 6px;border-radius:4px;font-size:10px">' + thread.length + ' komentarzy</span>' +
+      '</div>' +
+      '<div style="background:var(--bg);padding:8px;border-radius:4px;font-size:12px;color:var(--dim);margin-bottom:8px;max-height:60px;overflow:hidden">' +
+      esc((t.post_text||'(brak treści posta)').slice(0,250)) + '</div>' +
+      (ourReplies.length > 0
+        ? '<div style="font-size:11px;color:var(--grn);margin-top:6px">✅ Twoje odpowiedzi w wątku: ' + ourReplies.length + '</div>'
+        : '<div style="font-size:11px;color:var(--yel);margin-top:6px">⏳ Brak twoich odpowiedzi</div>') +
+      (t.post_url ? '<div style="margin-top:8px"><a href="' + t.post_url + '" target="_blank" style="font-size:11px;color:var(--blu)">→ Otwórz post w LinkedIn</a></div>' : '') +
+      '</div>';
+  }).join('');
+}
+
+document.addEventListener('click', function(e) {
+  if (e.target && e.target.id === 'watki-refresh') loadWatki();
+});
+
+// ── PROPOZYCJE ──────────────────────────────────────────────────────────────
+
+var propFilter = 'pending';
+
+function loadProposals() {
+  var filter = document.getElementById('prop-filter');
+  if (filter) propFilter = filter.value;
+  fetch('/api/proposals?status=' + propFilter)
+    .then(function(r) { return r.json(); })
+    .then(function(data) { renderProposals(data); })
+    .catch(function(e) { var el = document.getElementById('prop-list'); if (el) el.innerHTML = '<p style="color:var(--red)">Błąd: ' + e.message + '</p>'; });
+}
+
+function renderProposals(proposals) {
+  var cnt = document.getElementById('prop-count');
+  var list = document.getElementById('prop-list');
+  if (!cnt || !list) return;
+  var pending = proposals.filter(function(p) { return p.status === 'pending'; });
+  cnt.textContent = pending.length + ' oczekujących';
+  cnt.style.background = pending.length > 0 ? 'var(--blu)' : 'var(--dim)';
+  if (!proposals.length) { list.innerHTML = '<p style="color:var(--dim);text-align:center;padding:40px">Brak propozycji</p>'; return; }
+  list.innerHTML = proposals.map(function(p) {
+    var typeIcon = p.type === 'comment' ? '💬' : '✉️';
+    var typeLabel = p.type === 'comment' ? 'Komentarz' : 'DM';
+    var statusColor = p.status === 'pending' ? 'var(--yel)' :
+                      p.status === 'approved' ? 'var(--blu)' :
+                      p.status === 'sent' ? 'var(--grn)' :
+                      p.status === 'rejected' ? 'var(--dim)' : 'var(--red)';
+    var statusLabel = p.status === 'approved' ? '⏳ approved (czeka na Playwright)' : p.status;
+    var scoreBar = '<span style="font-size:10px;color:var(--dim)">lead=' + (p.lead_score||0) + ' troll=' + (p.troll_risk||0) + ' eng=' + (p.engagement_value||0) + (p.urgency ? ' urg=' + p.urgency : '') + '</span>';
+    var datesBar = (p.comment_created_at || p.post_created_at || p.approved_at) ? (
+      '<div style="font-size:10px;color:var(--dim);margin-bottom:6px;display:flex;gap:12px;flex-wrap:wrap">' +
+        (p.comment_created_at ? '💬 komentarz: ' + esc(p.comment_created_at.slice(0,16)) : '') +
+        (p.post_created_at ? ' · 📅 post: ' + esc(p.post_created_at.slice(0,16)) : '') +
+        (p.approved_at ? ' · ✅ zatwierdzono: ' + esc(p.approved_at.slice(0,16)) : '') +
+        (p.sent_at ? ' · 📤 wysłano: ' + esc(p.sent_at.slice(0,16)) : '') +
+      '</div>'
+    ) : '';
+    var actions = p.status === 'pending' ? (
+      '<div style="display:flex;gap:8px;margin-top:8px">' +
+      '<button class="btn sm primary" onclick="sendProposal(' + p.id + ')">✅ Zatwierdź (Playwright wyśle)</button>' +
+      '<button class="btn sm" onclick="rejectProposal(' + p.id + ')" style="background:var(--red);border-color:var(--red)">✗ Odrzuć</button>' +
+      '</div>'
+    ) : '<div style="margin-top:8px;font-size:11px;color:' + statusColor + '">' + statusLabel + (p.sent_at ? ' · ' + p.sent_at.slice(0,16) : '') + '</div>';
+    return '<div style="background:var(--card);border:1px solid var(--brd);border-radius:8px;padding:14px;margin-bottom:12px">' +
+      '<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">' +
+      '<span>' + typeIcon + ' ' + typeLabel + '</span>' +
+      '<span style="color:var(--dim);font-size:11px">od: <b>' + esc(p.source_author||'?') + '</b></span>' +
+      '<span style="margin-left:auto;font-size:11px;color:' + statusColor + '">' + statusLabel + '</span>' +
+      '</div>' +
+      datesBar +
+      '<div style="background:var(--bg);padding:8px;border-radius:4px;font-size:12px;color:var(--dim);margin-bottom:8px;max-height:60px;overflow:hidden">' + esc((p.source_text||'').slice(0,200)) + '</div>' +
+      scoreBar +
+      '<div style="margin-top:8px">' +
+      '<label style="font-size:11px;color:var(--dim)">Propozycja odpowiedzi:</label>' +
+      '<textarea id="prop-reply-' + p.id + '" style="width:100%;min-height:80px;margin-top:4px;background:var(--bg);border:1px solid var(--brd);color:var(--txt);padding:8px;border-radius:4px;font-size:12px;resize:vertical" ' + (p.status !== 'pending' ? 'readonly' : '') + '>' + esc(p.proposed_reply||'') + '</textarea>' +
+      '</div>' +
+      actions +
+      '</div>';
+  }).join('');
+}
+
+function sendProposal(id) {
+  var textarea = document.getElementById('prop-reply-' + id);
+  var text = textarea ? textarea.value : '';
+  if (!text.trim()) { toast('Treść odpowiedzi jest pusta'); return; }
+  // Najpierw zapisz edycję
+  fetch('/api/proposals/' + id, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ proposed_reply: text })
+  }).then(function() {
+    return fetch('/api/proposals/' + id + '/send', { method: 'POST' });
+  }).then(function(r) { return r.json(); }).then(function(data) {
+    if (data.error) { toast('Błąd: ' + data.error); return; }
+    if (data.manual) {
+      navigator.clipboard.writeText(data.copy_text || '').catch(function(){});
+      toast('DM: Tekst skopiowany! Otwórz LinkedIn Messaging ✅', true);
+      window.open(data.url, '_blank');
+    } else {
+      toast('Wysłano komentarz! ✅', true);
+    }
+    loadProposals();
+  }).catch(function(e) { toast('Błąd: ' + e.message); });
+}
+
+function rejectProposal(id) {
+  if (!confirm('Odrzucić tę propozycję?')) return;
+  fetch('/api/proposals/' + id + '/reject', { method: 'POST' })
+    .then(function(r) { return r.json(); })
+    .then(function() { toast('Odrzucono', true); loadProposals(); })
+    .catch(function(e) { toast('Błąd: ' + e.message); });
+}
+
+function esc(s) { return (s||'').replace(/[<>&"]/g, function(c) { return {'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[c]; }); }
 `;
 }
 
