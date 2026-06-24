@@ -14,20 +14,47 @@
 import { chromium } from 'playwright';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
-import { mkdirSync, appendFileSync } from 'node:fs';
+import { mkdirSync, appendFileSync, readFileSync, writeFileSync, existsSync, readlinkSync, unlinkSync } from 'node:fs';
 import Database from 'better-sqlite3';
 
 const PROFILE_DIR = join(homedir(), '.linkedin-mcp', 'browser-profile');
+const SCHEDULE_PATH = join(homedir(), '.linkedin-mcp', 'scraper-schedule.json');
 const DB_PATH = join(homedir(), '.linkedin-mcp', 'analytics.db');
 const LOG_DIR = join('/Users/gaca/projects/personal/linkedin-mcp-server/output/linkedin-mcp');
 const LOG_FILE = join(LOG_DIR, 'analytics-scrape.log');
 
 const dryRun = process.argv.includes('--dry-run');
+const force = process.argv.includes('--force');
 
 function log(msg) {
   const line = `[${new Date().toISOString()}] ${msg}`;
   console.log(line);
   try { mkdirSync(LOG_DIR, { recursive: true }); appendFileSync(LOG_FILE, line + '\n'); } catch {}
+}
+
+// Self-heal locka: trwały profil (zalogowana sesja) jest potrzebny do web-Highcharts — wstrzyknięte li_at
+// NIE uwierzytelnia web-appki (redirect loop), tylko API. Osierocony Chrome (po SIGKILL / wycieku cookie-refresh)
+// zostawia SingletonLock z MARTWYM PID i blokuje scrape — to było źródło 75-dniowego zamrożenia.
+// Czyścimy TYLKO martwy lock; żywy (cookie-refresh w trakcie) przeczekujemy, a po czasie głośno pomijamy.
+async function ensureProfileFree(profileDir) {
+  const lock = join(profileDir, 'SingletonLock');
+  for (let attempt = 0; attempt < 6; attempt++) {
+    if (!existsSync(lock)) return;
+    let pid = 0;
+    try { pid = parseInt(String(readlinkSync(lock)).split('-').pop(), 10) || 0; } catch { return; }
+    let alive = false;
+    if (pid > 0) { try { process.kill(pid, 0); alive = true; } catch (e) { alive = (e.code === 'EPERM'); } }
+    if (!alive) {
+      for (const f of ['SingletonLock', 'SingletonSocket', 'SingletonCookie']) {
+        try { unlinkSync(join(profileDir, f)); } catch {}
+      }
+      log(`Usunięto osierocony lock (martwy PID ${pid}).`);
+      return;
+    }
+    log(`Profil zajęty przez żywy PID ${pid} (pewnie cookie-refresh) — czekam… (${attempt + 1}/6)`);
+    await new Promise(r => setTimeout(r, 10000));
+  }
+  throw new Error('Profil przeglądarki zajęty (żywy lock) po 60 s — pomijam scrape, spróbuję w następnym oknie.');
 }
 
 // Pages to scrape
@@ -226,7 +253,7 @@ async function scrapeConnections(page, db) {
   log('Scraping: Connections via Voyager API ...');
 
   // Import voyagerRequest dynamically
-  const { voyagerRequest } = await import('./dist/scraper/voyager.js');
+  const { voyagerRequest } = await import('../dist/scraper/voyager.js');
 
   const PROSPECTS_DB = join(homedir(), '.linkedin-mcp', 'prospects.db');
   const pdb = new Database(PROSPECTS_DB);
@@ -245,7 +272,7 @@ async function scrapeConnections(page, db) {
   let totalConnections = 0;
   let start = 0;
   const batchSize = 40;
-  const maxPages = 200; // 40 * 200 = 8000 max
+  const maxPages = 10; // mniej agresywnie: 40 * 10 = 400 najnowszych connections / bieg (było 200 = 8000)
 
   for (let page = 0; page < maxPages; page++) {
     try {
@@ -328,6 +355,8 @@ async function main() {
 
   const db = ensureDb();
 
+  // Trwały profil (zalogowana sesja) — web-Highcharts wymaga prawdziwej sesji przeglądarki.
+  await ensureProfileFree(PROFILE_DIR);
   const ctx = await chromium.launchPersistentContext(PROFILE_DIR, {
     headless: false,
     channel: 'chrome',

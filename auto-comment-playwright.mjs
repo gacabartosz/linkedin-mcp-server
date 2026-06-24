@@ -30,10 +30,38 @@
 
 import { chromium } from 'playwright';
 import { spawn } from 'node:child_process';
-import { readFileSync, existsSync, mkdirSync } from 'node:fs';
+import { readFileSync, existsSync, mkdirSync, readlinkSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import Database from 'better-sqlite3';
+import {
+  buildPrompt, callClaude, parseClaudeJson,
+  validateProposal, computeComposite, loadPersona, factCheck, retrieveKnowledge,
+} from './lib/comment-gen.mjs';
+
+// Self-heal SingletonLock: ten daemon dzieli browser-profile z cookie-refresh / scrape, więc
+// osierocony (martwy PID) lock blokuje start i daje crash -9 (gubione cykle komentarzy → Golden Hour ucieka).
+// Czyścimy TYLKO martwy lock; żywy (inny proces w trakcie) przeczekujemy, a po czasie pomijamy cykl.
+async function ensureProfileFree(profileDir) {
+  const lock = join(profileDir, 'SingletonLock');
+  for (let attempt = 0; attempt < 6; attempt++) {
+    if (!existsSync(lock)) return;
+    let pid = 0;
+    try { pid = parseInt(String(readlinkSync(lock)).split('-').pop(), 10) || 0; } catch { return; }
+    let alive = false;
+    if (pid > 0) { try { process.kill(pid, 0); alive = true; } catch (e) { alive = (e.code === 'EPERM'); } }
+    if (!alive) {
+      for (const f of ['SingletonLock', 'SingletonSocket', 'SingletonCookie']) {
+        try { unlinkSync(join(profileDir, f)); } catch {}
+      }
+      log(`  Usunięto osierocony lock profilu (martwy PID ${pid}).`);
+      return;
+    }
+    log(`  Profil zajęty (żywy PID ${pid}) — czekam… (${attempt + 1}/6)`);
+    await new Promise((r) => setTimeout(r, 5000));
+  }
+  throw new Error('Profil przeglądarki zajęty (żywy lock) po 30 s — pomijam ten cykl komentarzy.');
+}
 
 // ── CONFIG ──────────────────────────────────────────────────────────────────
 
@@ -43,20 +71,28 @@ const CONFIG = {
   PERSONA_DIR: '/Users/gaca/projects/personal/second-mind/_system',
   LOG_DIR: '/Users/gaca/projects/personal/linkedin-mcp-server/output/linkedin-mcp',
 
-  // Aktywne godziny CEST (UTC: 6:00-20:00)
-  ACTIVE_HOURS_UTC: { start: 6, end: 20 },
+  // Decyzja Bartka: GENEROWANIE propozycji 24/7 (nic nie umyka), WYSYŁKA dalej tylko 8-22
+  // (okno trzyma auto-comment-sender.mjs). Tu skanujemy całą dobę.
+  SCAN_24_7: true,
+  ACTIVE_HOURS_UTC: { start: 6, end: 20 }, // tylko informacyjnie (sender ma własne okno)
 
-  // Losowy interwał 2h ± 25 min
-  INTERVAL_BASE_MS: 2 * 60 * 60 * 1000,
-  INTERVAL_JITTER_MAX_MS: 25 * 60 * 1000,
-  INTERVAL_JITTER_MIN_MS: 10 * 60 * 1000,
+  // Losowy interwał 20 min ± 5-15 min (częściej, żeby nowe komentarze NIE umykały)
+  INTERVAL_BASE_MS: 20 * 60 * 1000,        // 20 min
+  INTERVAL_JITTER_MAX_MS: 15 * 60 * 1000,  // ±15 min
+  INTERVAL_JITTER_MIN_MS: 5 * 60 * 1000,   // ±5 min
 
   // Limity
-  MAX_POSTS_PER_CYCLE: 10,
-  MAX_PROPOSALS_PER_CYCLE: 5,
-  MAX_CYCLES_PER_DAY: 3,
-  MAX_ERRORS_BEFORE_PAUSE: 3,
-  ERROR_PAUSE_HOURS: 24,
+  MAX_POSTS_PER_CYCLE: 15,
+  MAX_PROPOSALS_PER_CYCLE: 15,             // backlog rozłoży się na kilka cykli; wysyłkę dławi sender
+  MAX_CYCLES_PER_DAY: 100,                 // 24/7 × ~20 min = ~72/dobę, z buforem
+  MAX_ERRORS_BEFORE_PAUSE: 5,
+  ERROR_PAUSE_HOURS: 3,
+
+  // Full-sweep (B): skanuj ostatnie posty NIEZALEŻNIE od notyfikacji
+  SWEEP_POST_LIMIT: 15,
+  SWEEP_DAYS: 21,
+  GOTO_RETRIES: 2,                         // retry na ERR_INTERNET_DISCONNECTED itp.
+  CYCLE_TIMEOUT_MS: 8 * 60 * 1000,         // hard-timeout całego cyklu (anti-hang)
 
   // Scoring
   MIN_LEAD_OR_ENGAGE: 3,
@@ -66,9 +102,7 @@ const CONFIG = {
   HUMAN_DELAY_MIN: 3000,
   HUMAN_DELAY_MAX: 15000,
 
-  // Claude
-  CLAUDE_BIN: '/Users/gaca/.local/bin/claude',
-  CLAUDE_MODEL: 'opus',
+  // Claude — faktyczny model przypięty w lib/comment-gen.mjs (CLAUDE.MODEL = 'claude-opus-4-8')
   CLAUDE_TIMEOUT_MS: 120000,
 
   // Playwright
@@ -101,7 +135,43 @@ function nextDelay() {
 // ── DB ──────────────────────────────────────────────────────────────────────
 
 function getDb() {
-  return new Database(CONFIG.ENGAGE_DB);
+  const db = new Database(CONFIG.ENGAGE_DB);
+  // Defensive: ensure tables daemon depends on exist (idempotent)
+  db.exec(`CREATE TABLE IF NOT EXISTS processed_notifications (
+    notification_id TEXT PRIMARY KEY,
+    type TEXT,
+    post_urn TEXT,
+    actor_name TEXT,
+    processed_at TEXT DEFAULT (datetime('now'))
+  );`);
+  // Priority scrape: dashboard wrzuca tu post_urn (przycisk „Pobierz komentarze do postu"),
+  // daemon skanuje je PIERWSZE w cyklu, potem czyści.
+  db.exec(`CREATE TABLE IF NOT EXISTS priority_scrape (
+    post_urn TEXT PRIMARY KEY,
+    requested_at TEXT DEFAULT (datetime('now'))
+  );`);
+  return db;
+}
+
+function snowflakeToIso(urn) {
+  const m = (urn || '').match(/(activity|share|ugcPost):(\d+)/);
+  if (!m) return null;
+  try {
+    const ts = Number(BigInt(m[2]) >> 22n);
+    const d = new Date(ts);
+    return d.getFullYear() >= 2015 && d.getFullYear() <= 2030 ? d.toISOString() : null;
+  } catch { return null; }
+}
+
+function resolvePublishedAt(postUrn) {
+  // 1) JOIN ze scheduler.db; 2) Snowflake decode fallback
+  try {
+    const sch = new Database(join(homedir(), '.linkedin-mcp', 'scheduler.db'), { readonly: true });
+    const row = sch.prepare("SELECT publish_at FROM scheduled_posts WHERE post_urn = ? LIMIT 1").get(postUrn);
+    sch.close();
+    if (row?.publish_at) return row.publish_at;
+  } catch {}
+  return snowflakeToIso(postUrn);
 }
 
 function getTodayCycleCount() {
@@ -144,16 +214,18 @@ function getThread(postUrn) {
 
 function saveThread(data) {
   const db = getDb();
+  const publishedAt = resolvePublishedAt(data.postUrn);
   db.prepare(`
-    INSERT INTO thread_memory (post_urn, post_text, post_author, post_url, thread_json, our_replies_json, comment_count, last_scraped_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
+    INSERT INTO thread_memory (post_urn, post_text, post_author, post_url, thread_json, our_replies_json, comment_count, post_published_at, last_scraped_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
     ON CONFLICT(post_urn) DO UPDATE SET
       thread_json = excluded.thread_json,
       our_replies_json = excluded.our_replies_json,
       comment_count = excluded.comment_count,
+      post_published_at = COALESCE(excluded.post_published_at, thread_memory.post_published_at),
       last_scraped_at = datetime('now')
   `).run(data.postUrn, data.postText || '', data.postAuthor || '', data.postUrl || '',
-         JSON.stringify(data.thread), JSON.stringify(data.ourReplies), data.thread.length);
+         JSON.stringify(data.thread), JSON.stringify(data.ourReplies), data.thread.length, publishedAt);
   db.close();
 }
 
@@ -171,147 +243,184 @@ function markNotificationProcessed(notifId, type, postUrn, actor) {
   db.close();
 }
 
-function saveProposal(p) {
-  if (DRY_RUN) { log(`  [DRY-RUN] Skip save: ${p.proposedReply.slice(0, 60)}...`); return; }
+function saveThreadComments(postUrn, comments, ourName) {
+  if (DRY_RUN || !comments?.length) return;
   const db = getDb();
+  const insert = db.prepare(`
+    INSERT OR IGNORE INTO thread_comments
+      (post_urn, comment_urn, parent_comment_urn, author_name, author_headline, comment_text, comment_created_at, is_our_comment, scraped_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+  `);
+  const tx = db.transaction((rows) => {
+    for (const c of rows) {
+      if (!c.commentUrn) continue;
+      const isOurs = (c.author?.includes('Bartosz') || c.author?.includes(ourName)) ? 1 : 0;
+      insert.run(
+        postUrn,
+        c.commentUrn,
+        c.parentCommentUrn || c.replyToUrn || null,
+        c.author || '',
+        c.authorHeadline || '',
+        c.text || '',
+        c.createdAt || null,
+        isOurs,
+      );
+    }
+  });
+  tx(comments);
+  db.close();
+}
+
+// validateProposal + computeComposite → przeniesione do lib/comment-gen.mjs (import na górze)
+
+function saveProposal(p) {
+  if (DRY_RUN) { log(`  [DRY-RUN] Skip save: ${p.proposedReply.slice(0, 60)}...`); return 'dry-run'; }
+  const db = getDb();
+  const contextJson = JSON.stringify(p.contextUsed || []);
+  // pre-send walidacja strukturalna + notatki z fact-check passa (C) → status='blocked'
+  const notes = [
+    ...validateProposal({ proposedReply: p.proposedReply, sourceText: p.commentText }, db),
+    ...(Array.isArray(p.extraNotes) ? p.extraNotes : []),
+  ];
+  const status = notes.length > 0 ? 'blocked' : 'pending';
+  const composite = computeComposite(p.scoring || {});
+  if (notes.length > 0) log(`  🚫 BLOCKED (${notes.join(', ')}): ${p.proposedReply.slice(0, 60)}...`);
   db.prepare(`
     INSERT OR IGNORE INTO reply_proposals
     (type, source_id, source_text, source_author, post_urn, post_text,
-     proposed_reply, lead_score, troll_risk, engagement_value, thread_context, status)
-    VALUES ('comment', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+     proposed_reply, original_reply, lead_score, troll_risk, engagement_value, thread_context,
+     temperature, tone, context_used, reasoning, parent_in_tree, status,
+     validation_notes, composite_score)
+    VALUES ('comment', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(p.commentUrn, p.commentText, p.commentAuthor, p.postUrn, p.postText.slice(0, 500),
-         p.proposedReply, p.scoring.lead_score || 0, p.scoring.troll_risk || 0,
-         p.scoring.engagement_value || 0, p.threadContext.slice(0, 4000));
+         p.proposedReply, p.proposedReply, p.scoring.lead_score || 0, p.scoring.troll_risk || 0,
+         p.scoring.engagement_value || 0, p.threadContext.slice(0, 4000),
+         p.temperature || 3, p.tone || 'neutral', contextJson, (p.reasoning || '').slice(0, 500),
+         p.parentInTree || p.commentUrn, status,
+         notes.length ? JSON.stringify(notes) : null, composite);
   db.close();
-  log(`  💾 Propozycja zapisana: ${p.proposedReply.slice(0, 60)}...`);
+  log(`  💾 Propozycja ${status === 'blocked' ? '🚫 BLOCKED' : 'zapisana'} (score=${composite}/10 temp=${p.temperature} tone=${p.tone}): ${p.proposedReply.slice(0, 60)}...`);
+  return status;
 }
 
-// ── PERSONA ─────────────────────────────────────────────────────────────────
-
-let cachedPersona = null;
-function loadPersona() {
-  if (cachedPersona) return cachedPersona;
-  let profile = '', workStyle = '';
-  try { profile = readFileSync(join(CONFIG.PERSONA_DIR, 'profile.md'), 'utf-8'); } catch {}
-  try { workStyle = readFileSync(join(CONFIG.PERSONA_DIR, 'work-style.md'), 'utf-8'); } catch {}
-  cachedPersona = (profile + '\n\n' + workStyle).slice(0, 3500);
-  return cachedPersona;
+// ── DEDUP PER-KOMENTARZ (B0) ──────────────────────────────────────────────────
+// Komentarz uznajemy za obsłużony gdy: mamy już propozycję na ten URN (pending/approved/sent)
+// LUB w drzewie istnieje NASZA odpowiedź będąca jego dzieckiem (wysłana).
+// To zastępuje stary dedup po URN POSTA, który blokował całe posty (root cause incydentu).
+function isCommentHandled(commentUrn) {
+  if (!commentUrn) return false;
+  const db = getDb();
+  try {
+    // Dedup po KOMENTARZU niezależnie od statusu: jeśli komentarz ma JAKĄKOLWIEK propozycję (też 'rejected'),
+    // NIE proponuj ponownie. Wcześniej 'rejected' było pominięte → odrzucone wracały jako nowe 'pending'
+    // (objaw: „odrzucam komentarze i się nie odrzucają").
+    const prop = db.prepare(
+      "SELECT 1 FROM reply_proposals WHERE source_id = ? LIMIT 1"
+    ).get(commentUrn);
+    if (prop) return true;
+    const replied = db.prepare(
+      "SELECT 1 FROM thread_comments WHERE parent_comment_urn = ? AND is_our_comment = 1 LIMIT 1"
+    ).get(commentUrn);
+    return !!replied;
+  } catch { return false; }
+  finally { db.close(); }
 }
 
-// ── CLAUDE CLI ──────────────────────────────────────────────────────────────
+// ── FULL-SWEEP (B) ─────────────────────────────────────────────────────────────
+// Ostatnie opublikowane posty ze scheduler.db — skanowane NIEZALEŻNIE od notyfikacji,
+// żeby (a) odpisać „na wszystkie" i (b) odświeżać drzewko co cykl.
+function getRecentPostsForSweep() {
+  const seen = new Set();
+  const out = [];
+  const add = (urn, src) => {
+    if (!urn || seen.has(urn)) return;
+    seen.add(urn);
+    out.push({ notifId: urn, postUrl: `https://www.linkedin.com/feed/update/${urn}/`, source: src });
+  };
+  // 0) NAJWYŻSZY PRIORYTET: ręczne żądania z dashboardu („Pobierz komentarze do postu") — skanuj NAJPIERW, potem wyczyść.
+  try {
+    const db = getDb();
+    const prio = db.prepare(`SELECT post_urn AS u FROM priority_scrape ORDER BY requested_at ASC LIMIT ?`).all(CONFIG.SWEEP_POST_LIMIT);
+    for (const r of prio) add(r.u, 'priority');
+    if (prio.length && !DRY_RUN) db.prepare(`DELETE FROM priority_scrape`).run();
+    db.close();
+    if (prio.length) log(`  ⭐ Priority scrape (z dashboardu): ${prio.length} post(ów)`);
+  } catch (e) { log(`  ⚠️  Priority scrape read: ${e.message}`); }
 
-function callClaude(prompt) {
-  return new Promise((resolve) => {
-    const child = spawn(CONFIG.CLAUDE_BIN, [
-      '-p', '--no-session-persistence',
-      '--model', CONFIG.CLAUDE_MODEL,
-      '--output-format', 'text',
-    ], { stdio: ['pipe', 'pipe', 'pipe'] });
-
-    let out = '', err = '';
-    child.stdin.write(prompt);
-    child.stdin.end();
-    child.stdout.on('data', (d) => (out += d));
-    child.stderr.on('data', (d) => (err += d));
-
-    const timer = setTimeout(() => {
-      child.kill('SIGTERM');
-      log(`  ⚠️  Claude timeout po ${CONFIG.CLAUDE_TIMEOUT_MS}ms`);
-      resolve(null);
-    }, CONFIG.CLAUDE_TIMEOUT_MS);
-
-    child.on('close', (code) => {
-      clearTimeout(timer);
-      if (code !== 0) { log(`  ⚠️  Claude exit ${code}: ${err.slice(0, 200)}`); resolve(null); return; }
-      resolve(out.trim());
-    });
-    child.on('error', (e) => { clearTimeout(timer); log(`  ⚠️  Claude spawn error: ${e.message}`); resolve(null); });
-  });
+  // 1) PRIORYTET: posty z NIEODPOWIEDZIANYMI cudzymi komentarzami (engage.db) — to gwarantuje
+  //    że „każdy komentarz który wymaga odpowiedzi" trafi do skanu (źródłem NIE jest scheduler.db,
+  //    bo komentarze są też na postach nie-schedulowanych narzędziem).
+  try {
+    const db = getDb();
+    const unanswered = db.prepare(`
+      SELECT tc.post_urn AS u, COUNT(*) AS c FROM thread_comments tc
+      WHERE tc.is_our_comment = 0 AND tc.post_urn IS NOT NULL AND tc.post_urn != ''
+        AND NOT EXISTS (SELECT 1 FROM reply_proposals rp WHERE rp.source_id = tc.comment_urn)
+        AND NOT EXISTS (SELECT 1 FROM thread_comments r WHERE r.parent_comment_urn = tc.comment_urn AND r.is_our_comment = 1)
+      GROUP BY tc.post_urn ORDER BY c DESC LIMIT ?
+    `).all(CONFIG.SWEEP_POST_LIMIT);
+    for (const r of unanswered) add(r.u, 'unanswered');
+    // 2) ostatnio scrapowane posty (thread_memory) — odświeżenie drzewka
+    const recent = db.prepare(`SELECT post_urn AS u FROM thread_memory WHERE post_urn IS NOT NULL ORDER BY last_scraped_at DESC LIMIT ?`).all(CONFIG.SWEEP_POST_LIMIT);
+    for (const r of recent) add(r.u, 'recent');
+    db.close();
+  } catch (e) { log(`  ⚠️  Sweep engage.db: ${e.message}`); }
+  // 3) nowe posty ze scheduler.db (świeżo opublikowane, przed 1. scrape)
+  try {
+    const sch = new Database(join(homedir(), '.linkedin-mcp', 'scheduler.db'), { readonly: true });
+    const cutoff = new Date(Date.now() - CONFIG.SWEEP_DAYS * 86400 * 1000).toISOString();
+    const rows = sch.prepare(
+      `SELECT post_urn AS u FROM scheduled_posts
+       WHERE post_urn IS NOT NULL AND post_urn != ''
+         AND COALESCE(published_at, publish_at, '') >= ?
+       ORDER BY COALESCE(published_at, publish_at) DESC LIMIT ?`
+    ).all(cutoff, CONFIG.SWEEP_POST_LIMIT);
+    sch.close();
+    for (const r of rows) add(r.u, 'scheduler');
+  } catch (e) { log(`  ⚠️  Sweep scheduler.db: ${e.message}`); }
+  return out;
 }
 
-// ── PROMPT BUILDER ──────────────────────────────────────────────────────────
-
-const PL_WORDS = /\b(jak|jaki|jaka|jakie|co|czy|ile|kiedy|gdzie|dlaczego|kto|jest|są|tak|nie|moja|mój|moje|twoja|twój|ten|ta|to|już|teraz|więc|ale|bo|albo|lub|tylko|nawet|też|bardzo|dużo|mało|wszystko|jednak|jeśli|gdy|chociaż|ponieważ|aby|żeby|w|na|do|od|za|przez|po|przed|nad|pod|przy|bez|dla|między|wokół|obok|zamiast|oprócz|wobec)\b/i;
-
-function detectLanguage(text) {
-  if (!text) return 'polsku';
-  if (/[ąćęłńóśźżĄĆĘŁŃÓŚŹŻ]/.test(text)) return 'polsku';
-  const pl = (text.match(PL_WORDS) || []).length;
-  const en = (text.match(/\b(the|is|are|was|were|have|has|had|do|does|will|can|could|should|this|that|these|with|from|about|because|however|but|and|or|not|very|much|some|any|all|every)\b/gi) || []).length;
-  if (pl > en) return 'polsku';
-  if (en > pl) return 'angielsku';
-  return text.length < 30 ? 'polsku' : 'angielsku';
+// ── HEARTBEAT / HEALTH (H) ─────────────────────────────────────────────────────
+function writeHeartbeat({ postsChecked, proposalsCreated, ok }) {
+  if (DRY_RUN) return;
+  try {
+    const db = getDb();
+    db.exec(`CREATE TABLE IF NOT EXISTS daemon_health (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      last_run_at TEXT, last_ok_at TEXT,
+      posts_checked INTEGER, proposals_created INTEGER,
+      consecutive_zero INTEGER DEFAULT 0, updated_at TEXT
+    );`);
+    const prev = db.prepare("SELECT consecutive_zero FROM daemon_health WHERE id = 1").get();
+    const prevZero = prev?.consecutive_zero || 0;
+    const consecutiveZero = postsChecked === 0 ? prevZero + 1 : 0;
+    db.prepare(`
+      INSERT INTO daemon_health (id, last_run_at, last_ok_at, posts_checked, proposals_created, consecutive_zero, updated_at)
+      VALUES (1, datetime('now'), CASE WHEN ? THEN datetime('now') ELSE (SELECT last_ok_at FROM daemon_health WHERE id=1) END, ?, ?, ?, datetime('now'))
+      ON CONFLICT(id) DO UPDATE SET
+        last_run_at = datetime('now'),
+        last_ok_at = CASE WHEN ? THEN datetime('now') ELSE daemon_health.last_ok_at END,
+        posts_checked = excluded.posts_checked,
+        proposals_created = excluded.proposals_created,
+        consecutive_zero = excluded.consecutive_zero,
+        updated_at = datetime('now')
+    `).run(ok ? 1 : 0, postsChecked, proposalsCreated, consecutiveZero, ok ? 1 : 0);
+    db.close();
+  } catch (e) { log(`  ⚠️  Heartbeat zapis nieudany: ${e.message}`); }
 }
 
-function buildPrompt({ persona, postText, postAuthor, thread, ourReplies, targetComment }) {
-  const threadFormatted = thread.map((c, i) => {
-    const marker = c.isReply ? '  ↳ ' : '';
-    const ours = c.isOurs ? ' [TWOJA WCZEŚNIEJSZA ODPOWIEDŹ]' : '';
-    const target = c.commentUrn === targetComment.commentUrn ? ' ← [TEN KOMENTARZ — odpowiadasz]' : '';
-    return `${marker}${i + 1}. ${c.author}: "${c.text.slice(0, 300)}"${ours}${target}`;
-  }).join('\n');
+// loadPersona / loadGuideline / callClaude → przeniesione do lib/comment-gen.mjs (import na górze)
 
-  const ourRepliesFormatted = ourReplies.length > 0
-    ? ourReplies.map((r, i) => `${i + 1}. ${r}`).join('\n')
-    : '(brak — to pierwszy raz odpowiadasz w tym wątku)';
-
-  return `<persona>
-${persona}
-</persona>
-
-<oryginalny_post>
-Autor: ${postAuthor}
-Treść: ${(postText || '(brak treści)').slice(0, 800)}
-</oryginalny_post>
-
-<historia_watku>
-${threadFormatted || '(brak wcześniejszych komentarzy)'}
-</historia_watku>
-
-<twoje_poprzednie_odpowiedzi_w_tym_watku>
-${ourRepliesFormatted}
-</twoje_poprzednie_odpowiedzi_w_tym_watku>
-
-<zadanie>
-Komentarz do oceny: "${targetComment.text}"
-Autor: ${targetComment.author}
-
-KROK 1: Oceń komentarz (1-5):
-- lead_score: 5=konkretne zainteresowanie usługą/ceną/demo, 3=ogólne zainteresowanie, 1=brak
-- troll_risk: 5=agresja/spam/trolling, 2=neutralny, 1=konstruktywny
-- engagement_value: 5=otwarte pytanie wymuszające dyskusję, 3=merytoryczny, 1=emoji/one-word
-
-KROK 2: Decyzja "should_reply":
-- TAK jeśli (lead_score≥${CONFIG.MIN_LEAD_OR_ENGAGE} LUB engagement_value≥${CONFIG.MIN_LEAD_OR_ENGAGE}) AND troll_risk≤${CONFIG.MAX_TROLL_RISK}
-- NIE w przeciwnym razie
-
-KROK 3: Jeśli should_reply=TAK, napisz odpowiedź:
-- **JĘZYK:** wykryj język KOMENTARZA (nie postu, nie wątku — tylko "${targetComment.text}") i odpowiedz dokładnie w tym samym języku. PL → odpowiedź PL. EN → odpowiedź EN.
-- 50-120 słów
-- Logicznie kontynuuje wątek (nawiąż do poprzednich komentarzy jeśli są)
-- NIE powtarzaj się — sprawdź twoje poprzednie odpowiedzi
-- Zero "Świetny komentarz", "Dzięki za pytanie"
-- Zakończ pytaniem lub konkretną obserwacją wymuszającą dyskusję
-- Styl: bezpośredni, developer-like, lekka ironia OK
-
-ZWRÓĆ TYLKO JSON (nic poza nim):
-{"lead_score": N, "troll_risk": N, "engagement_value": N, "should_reply": true|false, "reply": "...", "reasoning": "1 krótkie zdanie"}
-</zadanie>`;
-}
-
-function parseClaudeJson(text) {
-  if (!text) return null;
-  // Spróbuj wyciągnąć JSON z odpowiedzi
-  const match = text.match(/\{[\s\S]*"should_reply"[\s\S]*\}/);
-  if (!match) return null;
-  try { return JSON.parse(match[0]); } catch { return null; }
-}
+// buildPrompt / detectLanguage / parseClaudeJson → przeniesione do lib/comment-gen.mjs (import na górze)
 
 // ── PLAYWRIGHT SCRAPING ─────────────────────────────────────────────────────
 
 async function fetchNotifications(page) {
   log('  Ładuję notyfikacje...');
-  await page.goto('https://www.linkedin.com/notifications/?filter=all', { waitUntil: 'domcontentloaded', timeout: 30000 });
+  // filter=my_posts_all — LinkedIn pokazuje TYLKO notyfikacje pod moimi postami (komentarze + wzmianki)
+  // dużo mniej hałasu niż filter=all (nie ma likes/follows/trendów cudzych)
+  await page.goto('https://www.linkedin.com/notifications/?filter=my_posts_all', { waitUntil: 'domcontentloaded', timeout: 30000 });
   await humanDelay();
 
   try {
@@ -381,25 +490,60 @@ async function fetchNotifications(page) {
   }));
 }
 
+// Nawigacja z retry (B0): LinkedIn / sieć potrafią rzucić ERR_INTERNET_DISCONNECTED / timeout.
+async function gotoWithRetry(page, url, opts = {}) {
+  const tries = (CONFIG.GOTO_RETRIES || 0) + 1;
+  let lastErr;
+  for (let i = 0; i < tries; i++) {
+    try {
+      return await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000, ...opts });
+    } catch (e) {
+      lastErr = e;
+      if (i < tries - 1) { log(`  ↻ goto retry ${i + 1}/${tries - 1} (${e.message.slice(0, 50)})`); await sleep(randInt(3000, 8000)); }
+    }
+  }
+  throw lastErr;
+}
+
 async function scrapePostThread(page, postUrl) {
   log(`  → ${postUrl.slice(0, 80)}`);
-  await page.goto(postUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+  await gotoWithRetry(page, postUrl);
   await humanDelay();
 
-  // Spróbuj rozwijać "View more comments"
-  for (let i = 0; i < 3; i++) {
+  // Rozwijaj "View more comments" AŻ ZNIKNIE (cel: WSZYSTKIE komentarze, nie pierwsze ~30)
+  for (let i = 0; i < 12; i++) {
     try {
-      const btn = await page.$('button.comments-comments-list__load-more-comments-button, button[aria-label*="more comments"]');
+      const btn = await page.$('button.comments-comments-list__load-more-comments-button, button[aria-label*="more comments"], button[aria-label*="więcej komentarzy"]');
       if (!btn) break;
       await btn.click();
-      await sleep(randInt(2000, 5000));
+      await sleep(randInt(1500, 4000));
     } catch { break; }
   }
 
-  // Rozwiń "Show N replies"
-  const replyButtons = await page.$$('button[aria-label*="repli"], button.comments-comment-item__show-replies-button');
-  for (const btn of replyButtons.slice(0, 8)) {
-    try { await btn.click(); await sleep(randInt(1500, 3500)); } catch {}
+  // Rozwiń WSZYSTKIE "Show N replies" (cap bezpieczeństwa 40) — odpowiedzi POD komentarzami też muszą wejść.
+  // Re-query po rozwinięciu "more comments" (nowe wątki dochodzą do DOM).
+  const replyButtons = await page.$$('button[aria-label*="repli"], button[aria-label*="odpowied"], button.comments-comment-item__show-replies-button');
+  for (const btn of replyButtons.slice(0, 40)) {
+    try { await btn.click(); await sleep(randInt(1000, 2500)); } catch {}
+  }
+
+  // DEFENSIVE: rozwiń obcięte komentarze ("więcej" / "see more")
+  for (let i = 0; i < 3; i++) {
+    const seeMoreBtns = await page.$$([
+      'button.comments-comment-item__see-more',
+      'button.comments-comment-text-collapsed__see-more-button',
+      'button[aria-label="See more"]',
+      'button[aria-label="see more"]',
+      'button[aria-label="…więcej"]',
+      'button[aria-label*="Zobacz więcej"]',
+      'button[aria-label*="See more, visually"]',
+    ].join(', '));
+    if (seeMoreBtns.length === 0) break;
+    log(`    📖 Rozwijam ${seeMoreBtns.length} obciętych komentarzy`);
+    for (const b of seeMoreBtns) {
+      try { await b.click({ timeout: 2000 }); await sleep(randInt(200, 500)); } catch {}
+    }
+    await sleep(randInt(800, 1500));
   }
 
   // Wyciągnij wszystkie komentarze z DOM (z kilkoma fallback selektorami)
@@ -440,9 +584,21 @@ async function scrapePostThread(page, postUrl) {
       const urnAttr = it.getAttribute('data-id') || it.getAttribute('data-urn') || '';
       const isReply = !!it.closest('.comments-comment-item--reply, .comments-comment-list__nested, .comments-comment-entity--reply');
       if (!text || !author) return;
+      // DETERMINISTYCZNE DRZEWKO: dla odpowiedzi znajdź URN komentarza-rodzica (najbliższy nadrzędny entity z data-id).
+      let parentCommentUrn = null;
+      if (isReply) {
+        let p = it.parentElement;
+        while (p) {
+          if (p.matches && p.matches('.comments-comment-entity, .comments-comment-item, article.comments-comment-item')) {
+            parentCommentUrn = p.getAttribute('data-id') || p.getAttribute('data-urn') || null;
+            break;
+          }
+          p = p.parentElement;
+        }
+      }
       comments.push({
         commentUrn: urnAttr || author + '_' + text.slice(0, 30),
-        author, text, isReply,
+        author, text, isReply, parentCommentUrn,
       });
     });
     return { postText, postAuthor, comments };
@@ -470,8 +626,9 @@ async function runCycle() {
   log('=== Start cyklu ===');
   if (DRY_RUN) log('⚠️  DRY-RUN MODE: bez zapisu do DB');
 
-  if (!isActiveHour()) {
-    log('  Poza godzinami aktywnymi (8:00-22:00 CEST). Skip.');
+  // G: generowanie 24/7 (SCAN_24_7). Wysyłkę i tak dławi sender (okno 8-22).
+  if (!CONFIG.SCAN_24_7 && !isActiveHour()) {
+    log('  Poza godzinami aktywnymi. Skip.');
     return { skipped: true };
   }
 
@@ -487,132 +644,155 @@ async function runCycle() {
 
   const cycleId = DRY_RUN ? null : startCycleLog();
   const stats = { postsChecked: 0, proposalsCreated: 0, errors: 0, notes: '' };
-  let context, page;
+  let context;
+  let timedOut = false;
 
-  try {
+  // B0: cała praca cyklu w jednym promisie + hard-timeout (anti-hang).
+  const work = (async () => {
     log('  Uruchamiam Playwright...');
+    await ensureProfileFree(CONFIG.PROFILE_DIR);
     context = await chromium.launchPersistentContext(CONFIG.PROFILE_DIR, {
       headless: CONFIG.HEADLESS,
       channel: 'chrome',
       viewport: CONFIG.VIEWPORT,
       userAgent: CONFIG.USER_AGENT,
-      args: [
-        '--disable-blink-features=AutomationControlled',
-        '--no-first-run',
-        '--no-default-browser-check',
-      ],
+      args: ['--disable-blink-features=AutomationControlled', '--no-first-run', '--no-default-browser-check'],
     });
-    page = context.pages()[0] || await context.newPage();
-
-    // Stealth
-    await page.addInitScript(() => {
-      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-    });
+    const page = context.pages()[0] || await context.newPage();
+    await page.addInitScript(() => { Object.defineProperty(navigator, 'webdriver', { get: () => undefined }); });
 
     const persona = loadPersona();
-    const notifs = await fetchNotifications(page);
 
-    for (const n of notifs) {
+    // ── ŹRÓDŁA POSTÓW: notyfikacje (szybka ścieżka) ∪ FULL-SWEEP (gwarancja „na wszystkie") ──
+    let notifs = [];
+    try { notifs = await fetchNotifications(page); }
+    catch (e) { log(`  ⚠️  Notyfikacje padły (${e.message.slice(0, 60)}) — lecę samym sweepem`); }
+    const sweep = getRecentPostsForSweep();
+    const seen = new Set();
+    const targets = [];
+    for (const t of [...notifs, ...sweep]) {
+      if (!t.notifId || seen.has(t.notifId)) continue;
+      seen.add(t.notifId);
+      targets.push(t);
+    }
+    log(`  📋 Posty do skanu: ${targets.length} (notif=${notifs.length} ∪ sweep=${sweep.length}, po dedup)`);
+
+    for (const t of targets) {
+      if (timedOut) break;
       if (stats.proposalsCreated >= CONFIG.MAX_PROPOSALS_PER_CYCLE) {
-        log(`  Limit ${CONFIG.MAX_PROPOSALS_PER_CYCLE} propozycji osiągnięty.`);
+        log(`  Limit ${CONFIG.MAX_PROPOSALS_PER_CYCLE} propozycji/cykl — reszta w kolejnym cyklu.`);
         break;
       }
-      if (isNotificationProcessed(n.notifId)) {
-        log(`  ↪ Pomijam (już przetworzone): ${n.snippet.slice(0, 40)}...`);
-        continue;
+      if (stats.postsChecked >= CONFIG.MAX_POSTS_PER_CYCLE) {
+        log(`  Limit ${CONFIG.MAX_POSTS_PER_CYCLE} postów/cykl.`);
+        break;
       }
-
       stats.postsChecked++;
       try {
-        const data = await scrapePostThread(page, n.postUrl);
-        if (data.skip) {
-          markNotificationProcessed(n.notifId, n.type || 'COMMENT', n.notifId, '');
-          continue;
-        }
-        if (!data.comments.length) { log('    Brak komentarzy do analizy'); continue; }
-
-        // Identyfikuj nasze poprzednie odpowiedzi (po nazwie)
-        const ourName = 'Bartosz Gaca';
-        const ourReplies = data.comments.filter(c => c.author.includes('Bartosz') || c.author.includes(ourName)).map(c => c.text);
-
-        // Zapisz wątek do pamięci
-        if (!DRY_RUN) {
-          saveThread({
-            postUrn: n.notifId,
-            postText: data.postText,
-            postAuthor: data.postAuthor,
-            postUrl: n.postUrl,
-            thread: data.comments,
-            ourReplies,
-          });
-        }
-
-        // Znajdź target comment (ostatni nie-nasz komentarz)
-        const targetComment = [...data.comments].reverse().find(c =>
-          !c.author.includes('Bartosz') && !c.author.includes(ourName)
-        );
-        if (!targetComment) { log('    Brak nowych komentarzy do odpowiedzi'); markNotificationProcessed(n.notifId, 'COMMENT', n.notifId, ''); continue; }
-
-        log(`    Target: ${targetComment.author}: "${targetComment.text.slice(0, 60)}..."`);
-
-        // Generuj odpowiedź przez Claude Opus
-        const prompt = buildPrompt({
-          persona,
-          postText: data.postText,
-          postAuthor: data.postAuthor,
-          thread: data.comments,
-          ourReplies,
-          targetComment,
-        });
-
-        log(`    🧠 Pytam Claude Opus (timeout ${CONFIG.CLAUDE_TIMEOUT_MS / 1000}s)...`);
-        const claudeOut = await callClaude(prompt);
-        const parsed = parseClaudeJson(claudeOut);
-
-        if (!parsed) {
-          log('    ⚠️  Claude nie zwrócił JSON');
-          stats.errors++;
-          continue;
-        }
-
-        log(`    Score: lead=${parsed.lead_score} troll=${parsed.troll_risk} engage=${parsed.engagement_value} | should_reply=${parsed.should_reply}`);
-
-        if (parsed.should_reply && parsed.reply) {
-          saveProposal({
-            commentUrn: targetComment.commentUrn,
-            commentText: targetComment.text,
-            commentAuthor: targetComment.author,
-            postUrn: n.notifId,
-            postText: data.postText,
-            proposedReply: parsed.reply,
-            scoring: { lead_score: parsed.lead_score, troll_risk: parsed.troll_risk, engagement_value: parsed.engagement_value },
-            threadContext: data.comments.map(c => `${c.author}: "${c.text}"`).join('\n'),
-          });
-          stats.proposalsCreated++;
-        } else {
-          log(`    ⊘ Skip (reasoning: ${parsed.reasoning})`);
-        }
-
-        if (!DRY_RUN) markNotificationProcessed(n.notifId, 'COMMENT', n.notifId, targetComment.author);
-
-        // Pauza między postami (jak człowiek przegląda)
-        await sleep(randInt(5000, 15000));
+        await processPost(page, persona, t, stats);
+        await sleep(randInt(4000, 10000)); // pauza jak człowiek
       } catch (e) {
-        log(`    ❌ Błąd przy poście: ${e.message}`);
+        log(`    ❌ Błąd przy poście ${String(t.notifId).slice(-18)}: ${e.message}`);
         stats.errors++;
       }
     }
+  })();
+
+  try {
+    await Promise.race([
+      work,
+      new Promise((_, rej) => setTimeout(() => {
+        timedOut = true;
+        rej(new Error(`CYCLE_TIMEOUT ${CONFIG.CYCLE_TIMEOUT_MS / 1000}s`));
+      }, CONFIG.CYCLE_TIMEOUT_MS)),
+    ]);
   } catch (e) {
-    log(`❌ Błąd cyklu: ${e.message}`);
+    log(`❌ Błąd/timeout cyklu: ${e.message}`);
     stats.errors++;
     stats.notes = e.message.slice(0, 500);
   } finally {
     if (context) await context.close().catch(() => {});
     if (cycleId) endCycleLog(cycleId, stats);
+    writeHeartbeat({ postsChecked: stats.postsChecked, proposalsCreated: stats.proposalsCreated, ok: stats.errors === 0 });
     log(`=== Koniec: ${stats.postsChecked} postów sprawdzonych, ${stats.proposalsCreated} propozycji, ${stats.errors} błędów ===\n`);
   }
 
   return stats;
+}
+
+// Przetwarza JEDEN post: scrape → zapis drzewka → odpowiedz na WSZYSTKIE nieobsłużone komentarze (B + C).
+async function processPost(page, persona, target, stats) {
+  const data = await scrapePostThread(page, target.postUrl);
+  if (data.skip) return;
+  if (!data.comments.length) { log('    Brak komentarzy do analizy'); return; }
+
+  const ourName = 'Bartosz Gaca';
+  const isOurs = (a) => !!a && (a.includes('Bartosz') || a.includes(ourName));
+  const ourReplies = data.comments.filter(c => isOurs(c.author)).map(c => c.text);
+
+  // Zapis drzewka → odświeża dashboard „drzewko" + pamięć wątku (KAŻDY cykl, nie tylko nowe)
+  if (!DRY_RUN) {
+    saveThread({ postUrn: target.notifId, postText: data.postText, postAuthor: data.postAuthor, postUrl: target.postUrl, thread: data.comments, ourReplies });
+    saveThreadComments(target.notifId, data.comments, ourName);
+  }
+
+  // B: WSZYSTKIE nieobsłużone, nie-nasze komentarze (top-level + odpowiedzi POD komentarzami).
+  // Dedup per-komentarz (B0) zamiast per-post → nowe komentarze pod starym postem też wejdą.
+  const todo = data.comments.filter(c => !isOurs(c.author) && c.text && !isCommentHandled(c.commentUrn));
+  if (!todo.length) { log(`    ↪ Wszystkie ${data.comments.length} komentarzy już obsłużone.`); return; }
+  log(`    🎯 ${todo.length} nieobsłużonych komentarzy (z ${data.comments.length} w wątku)`);
+
+  const threadContext = data.comments.map(c => `${c.author}: "${c.text}"`).join('\n');
+
+  for (const targetComment of todo) {
+    if (stats.proposalsCreated >= CONFIG.MAX_PROPOSALS_PER_CYCLE) break;
+    log(`    Target: ${targetComment.author}: "${targetComment.text.slice(0, 60)}..."`);
+
+    // RAG: dociągnij prawdziwe fakty z bazy wiedzy (stacki, projekty) pod ten komentarz
+    const kb = retrieveKnowledge(targetComment.text + ' ' + (data.postText || ''));
+    if (kb.sources.length) log(`    📚 Baza wiedzy: ${kb.sources.join(', ')}`);
+
+    const prompt = buildPrompt({ persona, postText: data.postText, postAuthor: data.postAuthor, thread: data.comments, ourReplies, targetComment, knowledge: kb.text });
+    log(`    🧠 Opus 4.8 generuje (timeout ${CONFIG.CLAUDE_TIMEOUT_MS / 1000}s)...`);
+    const parsed = parseClaudeJson(await callClaude(prompt, { log }));
+    if (!parsed || !parsed.reply) { log('    ⚠️  Brak poprawnego JSON/reply od Opusa — skip'); stats.errors++; continue; }
+
+    log(`    Score: lead=${parsed.lead_score} troll=${parsed.troll_risk} engage=${parsed.engagement_value} | temp=${parsed.temperature} tone=${parsed.tone}`);
+
+    // C: drugi przebieg Opus 4.8 — POTWIERDŹ, że odpowiedź nie kłamie (grounding gate, z bazą wiedzy).
+    let reply = parsed.reply;
+    const extraNotes = [];
+    try {
+      const fc = await factCheck({ postText: data.postText, threadContext, proposedReply: reply, persona, knowledge: kb.text }, { log });
+      if (fc.grounded === false) {
+        if (fc.fixed_reply) { log(`    🛡️  Fact-check: poprawiono (${fc.unsupported_claims.length} konkretów bez pokrycia)`); reply = fc.fixed_reply; }
+        else {
+          extraNotes.push('HALLUCINATION_RISK', ...fc.unsupported_claims.slice(0, 3).map(c => 'CLAIM:' + String(c).slice(0, 60)));
+          log(`    🚫 Fact-check: HALLUCINATION_RISK — blokuję (${fc.unsupported_claims.length} konkretów)`);
+        }
+      }
+    } catch (e) { log(`    ⚠️  Fact-check padł (${e.message.slice(0, 40)}) — przepuszczam do walidacji strukturalnej`); }
+
+    const status = saveProposal({
+      commentUrn: targetComment.commentUrn,
+      commentText: targetComment.text,
+      commentAuthor: targetComment.author,
+      postUrn: target.notifId,
+      postText: data.postText,
+      proposedReply: reply,
+      scoring: { lead_score: parsed.lead_score, troll_risk: parsed.troll_risk, engagement_value: parsed.engagement_value },
+      threadContext,
+      temperature: parsed.temperature || 3,
+      tone: parsed.tone || 'neutral',
+      contextUsed: Array.isArray(parsed.context_used) ? parsed.context_used : [],
+      reasoning: parsed.reasoning || '',
+      parentInTree: targetComment.commentUrn,
+      extraNotes,
+    });
+    if (status) stats.proposalsCreated++;
+
+    await sleep(randInt(2000, 5000));
+  }
 }
 
 // ── SCHEDULER ───────────────────────────────────────────────────────────────
@@ -632,7 +812,7 @@ async function scheduleNext() {
 log(`Auto-Comment Playwright v1 ${DRY_RUN ? '(DRY-RUN)' : ''}`);
 log(`Profile: ${CONFIG.PROFILE_DIR}`);
 log(`Limity: ${CONFIG.MAX_CYCLES_PER_DAY} cykli/dobę × ${CONFIG.MAX_PROPOSALS_PER_CYCLE} propozycji = max ${CONFIG.MAX_CYCLES_PER_DAY * CONFIG.MAX_PROPOSALS_PER_CYCLE}/dobę`);
-log(`Active hours UTC: ${CONFIG.ACTIVE_HOURS_UTC.start}-${CONFIG.ACTIVE_HOURS_UTC.end} (CEST: 8-22)`);
+log(`Skan: ${CONFIG.SCAN_24_7 ? '24/7 (generowanie)' : `${CONFIG.ACTIVE_HOURS_UTC.start}-${CONFIG.ACTIVE_HOURS_UTC.end} UTC`} | model: claude-opus-4-8 | wysyłkę dławi sender (okno 8-22)`);
 
 if (RUN_ONCE) {
   runCycle().then((stats) => {

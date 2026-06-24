@@ -11,7 +11,7 @@
     { "name": "insight_2", "description": "Drugi insight", "required": true },
     { "name": "insight_3", "description": "Trzeci insight", "required": false },
     { "name": "podsumowanie", "description": "Podsumowanie w 1-2 zdaniach", "required": true },
-    { "name": "cta", "description": "Pytanie angazujace. Np. 'Co o tym myslisz?', 'Masz podobne doswiadczenie?'", "required": true, "default": "Co o tym myslisz?" },
+    { "name": "cta", "description": "Zakoncz jednym zamknietym pytaniem-sporem, na ktore czytelnik moze sie zgodzic lub nie, np. 'Wdrozylbys to w piatek czy czekal do poniedzialku?' — nie otwartym 'co o tym myslisz?'.", "required": true, "default": "Wdrozylbys to od razu czy poczekal na lepszy moment?" },
     { "name": "hashtags", "description": "1-3 precyzyjne hashtagi. NIGDY wiecej niz 3.", "required": false, "default": "" }
   ],
   "tips": [

@@ -8,7 +8,7 @@
     { "name": "question", "description": "Provocative or thought-provoking question — first 210 chars before 'see more'", "required": true },
     { "name": "context", "description": "Why this question matters (2-3 sentences)", "required": true },
     { "name": "options", "description": "2-4 options or perspectives to choose from (use emoji bullets)", "required": false },
-    { "name": "cta", "description": "Engagement invitation. E.g. 'Share your perspective below.' Avoid engagement bait ('Comment YES').", "required": true, "default": "Share your perspective below." },
+    { "name": "cta", "description": "End with one closed, take-a-side question, e.g. 'Would you ship it on Friday or wait till Monday?' — not an open 'share your perspective'. Avoid engagement bait ('Comment YES').", "required": true, "default": "Which side are you on — ship it Friday or wait till Monday?" },
     { "name": "hashtags", "description": "1-3 precise hashtags. Never more than 3.", "required": false, "default": "" }
   ],
   "tips": [

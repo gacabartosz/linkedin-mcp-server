@@ -2,25 +2,32 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>Label</key>
-    <string>com.gaca.linkedin-analytics</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>/Users/gaca/.nvm/versions/node/v22.22.0/bin/node</string>
-        <string>/Users/gaca/projects/personal/linkedin-mcp-server/auto-analytics.mjs</string>
-    </array>
-    <key>StartCalendarInterval</key>
-    <dict>
-        <key>Hour</key>
-        <integer>22</integer>
-        <key>Minute</key>
-        <integer>0</integer>
-    </dict>
-    <key>StandardOutPath</key>
-    <string>/Users/gaca/projects/personal/linkedin-mcp-server/output/linkedin-mcp/analytics.log</string>
-    <key>StandardErrorPath</key>
-    <string>/Users/gaca/projects/personal/linkedin-mcp-server/output/linkedin-mcp/analytics-error.log</string>
-    <key>WorkingDirectory</key>
-    <string>/Users/gaca/projects/personal/linkedin-mcp-server</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/Users/gaca/.local/bin:/Users/gaca/.nvm/versions/node/v22.22.0/bin:/usr/local/bin:/usr/bin:/bin</string>
+	</dict>
+	<key>Label</key>
+	<string>com.gaca.linkedin-analytics</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/gaca/.nvm/versions/node/v22.22.0/bin/node</string>
+		<string>/Users/gaca/projects/personal/linkedin-mcp-server/auto-analytics.mjs</string>
+	</array>
+	<key>StandardErrorPath</key>
+	<string>/Users/gaca/projects/personal/linkedin-mcp-server/output/linkedin-mcp/analytics-error.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/gaca/projects/personal/linkedin-mcp-server/output/linkedin-mcp/analytics.log</string>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StartCalendarInterval</key>
+	<dict>
+		<key>Hour</key>
+		<integer>22</integer>
+		<key>Minute</key>
+		<integer>0</integer>
+	</dict>
+	<key>WorkingDirectory</key>
+	<string>/Users/gaca/projects/personal/linkedin-mcp-server</string>
 </dict>
 </plist>

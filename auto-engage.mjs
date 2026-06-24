@@ -249,6 +249,17 @@ function initEngageDB() {
       comments_processed INTEGER DEFAULT 0,
       errors INTEGER DEFAULT 0
     );
+    -- PROPOSALS-FIRST: insert w cyklu (:504) wymaga tej tabeli; bez niej propozycja
+    -- leciała w catch (:520) i ginęła cicho. Schema 1:1 z dashboard.mjs (źródło prawdy).
+    CREATE TABLE IF NOT EXISTS reply_proposals (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT NOT NULL,
+      source_id TEXT NOT NULL, source_text TEXT, source_author TEXT,
+      post_urn TEXT, post_text TEXT, proposed_reply TEXT NOT NULL,
+      lead_score INTEGER DEFAULT 0, troll_risk INTEGER DEFAULT 0,
+      engagement_value INTEGER DEFAULT 0, urgency INTEGER DEFAULT 0,
+      status TEXT DEFAULT 'pending', sent_at TEXT,
+      created_at TEXT DEFAULT (datetime('now')), updated_at TEXT DEFAULT (datetime('now'))
+    );
   `);
 
   // Extend processed_comments with new columns (idempotent)

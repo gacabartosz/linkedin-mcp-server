@@ -9,7 +9,7 @@
     { "name": "context", "description": "Why is this question relevant now? What prompted it?", "required": true },
     { "name": "question", "description": "The main question you're asking. Be specific — vague questions get vague answers.", "required": true },
     { "name": "your_answer", "description": "Share your own answer first to set the tone and encourage others.", "required": false, "default": "" },
-    { "name": "cta", "description": "Invitation to respond. E.g. 'Share your experience below.'", "required": true, "default": "Share your experience below." },
+    { "name": "cta", "description": "End with one closed, take-a-side question, e.g. 'Would you ship it on Friday or wait till Monday?' — not an open 'share your experience'.", "required": true, "default": "Would you ship it on Friday or wait till Monday?" },
     { "name": "hashtags", "description": "1-3 precise hashtags. Never more than 3.", "required": false, "default": "" }
   ],
   "tips": [

@@ -1,0 +1,160 @@
+{
+  "version": "2026.2",
+  "updated": "2026-06-23",
+  "purpose": "Operacyjne reguły 'nowego algorytmu LinkedIn' wymuszane PRZED publikacją w qa-gate.mjs. Uzupełnia (nie zastępuje) guidelines/linkedin-strategy.json i ~/.linkedin-mcp/brand-voice.json. Cel: zatrzymać spadek zasięgu, niepełne/wadliwe posty i ciągłe usuwanie. 2026.2: dołożono twarde bramki audience_fit (język≠PL / off-niche / bait → HOLD) i wymiar scoringu 'commentability' — uzasadnione danymi analytics konta (EN po polskim profilu = martwy zasięg; off-niche = rozjazd; bait = zakopanie; pytanie-spór = 190 komentarzy).",
+
+  "manifesto": {
+    "one_liner": "Przewaga nad AI = naprawdę to przeżyłeś. Pisz to, co PRZEŻYŁEŚ, nie to, co należy robić.",
+    "principles": [
+      "Zamiast pisać CO ZROBIĆ — napisz CO TY ZROBIŁEŚ.",
+      "Zamiast pisać CO MYŚLEĆ — napisz CO TY MYŚLISZ.",
+      "Zamiast dawać gotowe rozwiązanie — napisz JAK DO NIEGO DOSZEDŁEŚ (droga, błędy, zwrot).",
+      "AI napisze ładne '10 sposobów na produktywność'. Nie napisze, że o 3 w nocy zasnąłeś na klawiaturze przed deadlinem. Ta konkretna, przeżyta scena = Twój jedyny moat.",
+      "Algorytm nie odróżnia dobrego tekstu od złego. Odróżnia tekst, który ludzie CHCĄ czytać, od tego, który przescrollują.",
+      "Ludzie komentują to, co CZUJĄ, nie to, co wiedzą. Post ma wywołać uczucie (frustracja, ulga, zaskoczenie, duma, niezgoda), nie wyłożyć wiedzę.",
+      "Przestań pisać jak ekspert. Zacznij pisać jak człowiek."
+    ]
+  },
+
+  "scoring": {
+    "scale": "0-5 dla każdego wymiaru, oceniane na TEKŚCIE PO przepisaniu (humanizedText)",
+    "dimensions": {
+      "experience": "Pierwszoosobowe, przeżyte. Jest konkretna scena/moment/decyzja autora ('zrobiłem', 'zobaczyłem', 'wkurzyło mnie', 'o 2 w nocy'), a nie ogólna porada w trybie rozkazującym. 0 = czysty poradnik 'jak robić X'; 5 = wciągająca relacja z własnego doświadczenia.",
+      "emotion": "Czy budzi reakcję, którą da się skomentować uczuciem? Napięcie, porażka przed sukcesem, kontrowersyjna teza, ulga. 0 = obojętne, encyklopedyczne; 5 = aż chce się odpisać.",
+      "specificity": "Konkret zamiast ogólnika: realne liczby, nazwa systemu/stacku, moment w czasie, dokładny koszt/wynik. 0 = 'dużo/szybko/wiele firm'; 5 = '8 firm, 2400 zł/mc, 3 skrypty, 3500 zł jednorazowo'.",
+      "commentability": "Komentarzogenność — czy post daje konkretny POWÓD DO ODPISANIA: oś sporu, zamknięte pytanie z którym da się (nie)zgodzić, albo osobistą historię, którą czytelnik chce dorzucić od siebie. Dowód z konta: PL + porażka + liczby + pytanie-spór = 190 komentarzy; encyklopedyczny wykład 'X reguł' = 0-2 kom. mimo zasięgu. 0 = nie ma o co zaczepić, czyta się i scrolluje; 3 = jest jedno wyraźne zamknięte pytanie albo teza do kontry; 5 = aż się prosi o kontrę lub własną historię w komentarzu."
+    },
+    "thresholds": {
+      "experience_min": 3,
+      "specificity_min": 3,
+      "emotion_min": 2,
+      "commentability_min": 2,
+      "sum_min": 10,
+      "note": "Aby APPROVED: experience>=3 AND specificity>=3 AND emotion>=2 AND commentability>=2 AND suma(exp+emo+spec)>=10 — liczone na tekście po przepisaniu. commentability to OSOBNA bramka (NIE wchodzi do sumy, żeby nie ruszać kalibracji sum_min) — dane z konta pokazały, że to komentarzogenność, nie sama 'jakość', robi zasięg."
+    },
+    "hold_when_below": "Jeśli po uczciwym przepisaniu (bez zmyślania) progi nie są spełnione, bo w treści NIE MA realnego przeżycia/konkretu do wydobycia — HOLD z konkretnym feedbackiem, czego dopisać. NIGDY nie wymyślaj sceny ani liczb, żeby podbić wynik."
+  },
+
+  "ai_red_flags": {
+    "note": "Wzorce 'piszę jak ekspert/AI' które zbijają zasięg. Wykryj i usuń przy przepisywaniu; jeśli post jest z nich ZBUDOWANY w całości i nie ma pod spodem realnego doświadczenia — HOLD.",
+    "patterns": [
+      "Tytuł-listicle: 'X sposobów / X rzeczy / X lekcji / X błędów', 'Oto co...'",
+      "Tryb rozkazujący-poradnikowy zamiast relacji: 'Rób X', 'Pamiętaj o Y', 'Powinieneś Z' bez 'ja zrobiłem'",
+      "Ogólniki bez liczb: 'dużo', 'wiele', 'znacząco', 'rewolucyjnie', 'w dzisiejszych czasach'",
+      "Korpo-mowa i sztuczny entuzjazm: 'I'm thrilled', 'game changer', 'leveraging', 'thought leadership'",
+      "Myślnik em (—) jako efekciarska pauza, 'nie tylko... ale także', trójdzielne wyliczenia na siłę",
+      "Pytanie-bait na końcu: 'A Ty co myślisz?', 'Zgadzasz się?' (otwarte, puste) — zamiast konkretnego, zamkniętego",
+      "Morał-frazes zamiast wniosku z własnego doświadczenia",
+      "Hook obiecujący sensację bez pokrycia: 'Nie uwierzysz...', 'Czy wiesz, że 85%...'"
+    ]
+  },
+
+  "completeness_gate": {
+    "note": "TWARDA bramka. Każdy z poniższych = HOLD (status 'hold'), bo to jest właśnie 'głupoty / niepełne dane' i powód ciągłego usuwania postów. Wypisz dokładnie, co jest wadliwe.",
+    "hard_fail": [
+      "Placeholdery / niewypełnione zmienne: {{cokolwiek}}, [wstaw...], <...>, TODO, TBD, XXX, lorem ipsum, 'INSERT', '???', 'placeholder'",
+      "Puste liczby-szkielety: 'X zł', 'N grup', 'Y%', '__', '0 (do uzupełnienia)' — liczba w roli placeholdera zamiast realnej wartości",
+      "Ucięcie / urwanie: tekst kończy się w połowie zdania, wisi na 'i', '-', '...', niedomknięte nawiasy/cudzysłowy, niedokończona lista",
+      "Hook obiecuje, treść nie dowozi: zapowiada listę/liczbę/historię, której w treści nie ma",
+      "Rozjazd hook↔treść: pierwsza linia o czym innym niż reszta (algorytm karze rozjazd tematyczny)",
+      "Sprzeczność wewnętrzna lub bełkot: dwie liczby/twierdzenia się wykluczają, zdania bez sensu",
+      "Niezgodność języka z deklarowanym (language) — np. deklaracja 'pl', a treść po angielsku",
+      "Surowe artefakty generacji: 'Oto przepisany tekst:', 'Jako AI', markdown nagłówki ###, ```bloki```, podwójne hashtagi, znaczniki promptu",
+      "Brak realnej treści: sam hook + hashtagi, albo < 200 znaków bez wartości"
+    ]
+  },
+
+  "audience_fit": {
+    "note": "TWARDE bramki dopasowania posta do TEGO KONTA (nie do treści w oderwaniu). Wymuszane w kodzie qa-gate.mjs PO werdykcie modelu — model je tylko wykrywa. Uzasadnienie = dane z analytics profilu: każdy post EN po polskim profilu = martwy zasięg (0-4 kom. mimo 3k+ wyświetleń, ludzie scrollują, algorytm zakopuje); off-niche (crypto/iPhone/geopolityka) = rozjazd z tym, po co ludzie obserwują; bait/lead-magnet = jawne zakopanie. qa-gate dotąd sprawdzał kompletność/przeżycie/fakty, ale TE trzy anty-wzorce przepuszczał — ta sekcja domyka lukę między 'wiem co działa' a 'system to wymusza'.",
+    "language": {
+      "target": "pl",
+      "hold_on_non_target": true,
+      "reason": "Profil jest polskojęzyczny. Post w innym języku → HOLD (nie delete) — żeby nie wyszedł niezauważony na martwy zasięg. Autor może świadomie opublikować ręcznie, jeśli naprawdę chce. NIE auto-tłumaczyć przy przepisywaniu — detekcja na oryginale, decyzja należy do autora."
+    },
+    "niche": {
+      "hold_off_niche": true,
+      "topics": [
+        "AI engineering / agenci / automatyzacja procesów",
+        "build-in-public własnych systemów, botów i pipeline'ów",
+        "e-gov / KSeF / cyfryzacja administracji / prawo w praktyce IT (działa zasięgowo)",
+        "Claude Code / MCP / LLM w realnej robocie, nie w teorii",
+        "rynek pracy IT / proces aplikowania / freelance / JDG / R&D",
+        "konkretne case studies własnych projektów z liczbami"
+      ],
+      "off_niche_examples": [
+        "krypto / web3 / NFT bez związku z własną robotą",
+        "recenzje sprzętu konsumenckiego (iPhone, gadżety)",
+        "geopolityka / polityka / wojny",
+        "generyczne 'X sposobów na produktywność' bez własnego case",
+        "czysty news-reshare o cudzych firmach bez własnej analizy/przeżycia (zwłaszcza po angielsku)"
+      ],
+      "reason": "Topical fit decyduje o zasięgu. e-gov/KSeF działa; crypto/iPhone/geopolityka to rozjazd z niszą konta. Off-niche → HOLD, chyba że temat jest powiązany z własną robotą AI/automatyzacją."
+    },
+    "bait": {
+      "hold_on_bait": true,
+      "patterns": [
+        "Lead-magnet w treści: 'napisz HASŁO w komentarzu', 'wpisz [słowo] a wyślę', 'DM po szablon/PDF/checklistę', 'komentarz = wyślę ci...'",
+        "Odsyłanie po link do komentarza: 'link w pierwszym komentarzu', 'link w komentarzach', 'wrzucam link niżej' — sprzeczne z polityką linków (komentarz = ~80% kara) i z taktyką, której uczył nieaktualny już post autora",
+        "Engagement-bait: 'oznacz znajomego', 'udostępnij dalej', 'kto się zgadza — łapka', 'zapisz ten post, żeby nie zgubić'",
+        "Follow-bait: 'obserwuj po więcej', 'follow for more', 'zostaw + w komentarzu'"
+      ],
+      "reason": "Lead-magnet i engagement-bait LinkedIn jawnie zakopuje. To też taktyka ze starego posta autora ('komentarz z linkiem'), dziś nieaktualna wobec polityki linków. Bait → HOLD: usuń wezwanie i nie odsyłaj po link do komentarza."
+    }
+  },
+
+  "formats": {
+    "note": "Reguły per format. media_kind z DB: null/text = tekst, image/IMAGE = obraz, video/VIDEO = wideo, carousel/pdf = karuzela, banner = grafika generowana.",
+    "text": {
+      "requires": [
+        "Mocny hook < 100 znaków w pierwszej linii: problem albo PORAŻKA pierwsza, nie sukces",
+        "Jedna myśl = jeden akapit, dużo enterów (czyta się na mobile)",
+        "Zakończenie: jedno konkretne, ZAMKNIĘTE pytanie do dyskusji (nie 'co myślisz?')"
+      ]
+    },
+    "image": {
+      "requires": [
+        "Obraz musi być AUTENTYCZNY (terminal, panel, dashboard, realna rozmowa bota) — buduje dwell time i wiarygodność",
+        "Tekst nie może odwoływać się do rzeczy, której na obrazie nie ma (fałszywa atrybucja)"
+      ],
+      "warn_on_generated": "media_kind='banner' lub banner_preset ustawiony = grafika generowana. Test #11 autora: generowane bannery/Canva zbijają zasięg jak generykowi. Oznacz ostrzeżeniem.",
+      "hold_on_generated": false
+    },
+    "video": {
+      "requires": [
+        "Dynamiczne wejście w pierwsze 3 sekundy — pierwsza linia opisu/scenariusza musi być hookiem, nie wstępem",
+        "Krótko: < 90 s",
+        "Napisy obowiązkowe (większość ogląda bez dźwięku)"
+      ],
+      "hold_on_missing": false
+    },
+    "carousel": {
+      "requires": [
+        "Realna wartość krok-po-kroku / framework / checklist z ORYGINALNYMI danymi (nie ogólniki)",
+        "Pierwszy slajd = hook, ostatni slajd = jedno konkretne CTA",
+        "Najwyższy dwell time, ale tylko gdy slajdy niosą konkret — pusta karuzela = gorzej niż tekst"
+      ],
+      "hold_on_missing": false
+    }
+  },
+
+  "rewrite_directives": [
+    "Przepisz w stronę pierwszoosobowej relacji: wydobądź z treści realne 'ja zrobiłem / zobaczyłem / wkurzyło mnie / zaskoczyło mnie' i postaw to na początku.",
+    "Zamień tryb rozkazujący ('rób X') na relację ('zrobiłem X, bo...').",
+    "Pokaż drogę i błąd przed wynikiem: najpierw co poszło nie tak, potem zwrot.",
+    "ZACHOWAJ BEZWZGLĘDNIE wszystkie fakty, liczby, nazwy i hashtagi z oryginału. NIE wymyślaj nowych liczb, scen, dat ani anegdot.",
+    "Jeśli żeby było 'przeżyte' trzeba by COKOLWIEK zmyślić — nie zmyślaj. Zostaw to czym jest i zgłoś HOLD z feedbackiem, co autor ma dopisać z własnej głowy.",
+    "Trzymaj polski, ton build-in-public, krótkie zdania, zero korpo-mowy.",
+    "Max 3 hashtagi na końcu. Stosuj politykę linków z sekcji 'links' — NIGDY nie przenoś linku do komentarza."
+  ],
+
+  "links": {
+    "note": "Strategia HYBRYDA per-post (2026). Komentarz = najgorsze miejsce na link (~80% kara) — NIGDY tam. W treści posta link kosztuje ~19% zasięgu, więc dajemy go TYLKO gdy jest sednem wartości.",
+    "policy": [
+      "Link w pierwszym komentarzu = ZAKAZANY (auto-komentarze i tak są czyszczone w auto-publish).",
+      "Link w treści posta = TYLKO gdy link jest sednem wartości posta (repo/narzędzie/launch = cały punkt, czytelnik realnie po niego przyszedł).",
+      "Post-historia / refleksja / porażka / opinia = BEZ linka (max zasięg). Jak ktoś chce — link w DM/profilu.",
+      "Maksymalnie 1 link w treści. Link na końcu, nie w hooku."
+    ],
+    "judge": "Oceń linkJustified: czy link w treści jest sednem wartości tego konkretnego posta. Jeśli link jest, ale NIE jest sednem → linkJustified=false + zaproponuj w formatNotes: usunąć z treści, dać w DM/profilu. Nie przenoś do komentarza. Nie HOLD za to — tylko rekomendacja."
+  }
+}

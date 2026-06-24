@@ -42,6 +42,14 @@ function log(msg) {
   console.log(`[${new Date().toISOString()}] ${msg}`);
 }
 
+// Śledzimy aktywny kontekst, żeby zamknąć Chrome przy SIGTERM/SIGINT — inaczej osierocony Chrome
+// trzyma SingletonLock profilu i blokuje scrape-analytics (współ-powód 75-dniowego zamrożenia wykresów).
+let activeContext = null;
+async function closeActive() {
+  try { if (activeContext) await activeContext.close(); } catch {}
+  activeContext = null;
+}
+
 async function refreshCookie() {
   log('Starting cookie refresh...');
 
@@ -63,6 +71,7 @@ async function refreshCookie() {
     locale: 'pl-PL',
     timezoneId: 'Europe/Warsaw',
   });
+  activeContext = context;
 
   try {
     const page = context.pages()[0] || await context.newPage();
@@ -147,6 +156,11 @@ async function refreshCookie() {
 }
 
 async function main() {
+  // Zamknij Chrome przy stopie launchd (SIGTERM) lub Ctrl-C — bez tego zostaje osierocony Chrome z lockiem.
+  for (const sig of ['SIGINT', 'SIGTERM']) {
+    process.on(sig, async () => { log(`${sig} — zamykam przeglądarkę…`); await closeActive(); process.exit(0); });
+  }
+
   if (isKeepAlive) {
     log('KEEP-ALIVE mode — refreshing every 4 hours');
 
@@ -158,10 +172,6 @@ async function main() {
       log('--- Scheduled cookie refresh ---');
       await refreshCookie();
     }, KEEP_ALIVE_INTERVAL);
-
-    // Keep process alive
-    process.on('SIGINT', () => { log('Stopped.'); process.exit(0); });
-    process.on('SIGTERM', () => { log('Stopped.'); process.exit(0); });
   } else {
     // Single refresh
     const ok = await refreshCookie();
