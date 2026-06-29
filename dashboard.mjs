@@ -344,6 +344,7 @@ function migrateDb() {
       slug TEXT UNIQUE NOT NULL,
       title TEXT NOT NULL,
       hook TEXT,
+      hook_variants TEXT,
       language TEXT DEFAULT 'pl',
       publish_at TEXT NOT NULL,
       status TEXT DEFAULT 'plan',
@@ -381,6 +382,8 @@ function migrateDb() {
 
   // Iter8: backup oryginałów post_text przed regeneracją (anti-halucynacje)
   try { db.exec("ALTER TABLE media_plan_items ADD COLUMN original_post_text TEXT"); } catch {}
+  // Hook Lab: warianty hooka (JSON) — idempotentnie, dla istniejących baz
+  try { db.exec("ALTER TABLE media_plan_items ADD COLUMN hook_variants TEXT"); } catch {}
 
   db.close();
 }
@@ -1316,53 +1319,33 @@ async function handleRequest(req, res) {
       if (!post) { db.close(); return json(res, { error: 'Not found' }, 404); }
       db.close();
 
+      // FIX 2026-06-29: ręczny "Publish" duplikował uproszczoną ścieżkę publikacji
+      // (callMCP linkedin_post_create/media_upload), która:
+      //   1) NIE escapowała tekstu → LinkedIn ucinał post na pierwszym "(" (reserved char),
+      //   2) sklejała join(MCP_DIR, media_preview_path) z ABSOLUTNĄ ścieżką → zła ścieżka,
+      //      błąd połykany (try/catch bez re-throw) → post szedł BEZ zdjęcia,
+      //   3) nie czekała na asset AVAILABLE i nie zapisywała media_ids.
+      // Zamiast utrzymywać drugą, gorszą ścieżkę — DELEGUJEMY do działającego daemona
+      // (auto-publish.mjs, resident): escapuje (escapeLinkedInText), uploaduje z pollingiem
+      // AVAILABLE i ma bramkę assertPublishable("nie publikuję bez zdjęcia"). Jedna ścieżka
+      // = determinizm: ZAWSZE wychodzi cały tekst + zdjęcie, albo nic (status=failed + alert).
       try {
-        const createArgs = { text: post.text };
-        const mediaIds = [];
-        if (post.media_ids) {
-          try { mediaIds.push(...JSON.parse(post.media_ids)); } catch {}
-        }
-        // Iter2: jeśli mamy uploaded media_preview_path, upload teraz do LinkedIn → URN do media_ids
-        if (post.media_preview_path) {
-          try {
-            const absPath = join(MCP_DIR, post.media_preview_path);
-            const mediaType = post.media_kind === 'video' ? 'VIDEO' : 'IMAGE';
-            const up = await callMCP('linkedin_media_upload', { file_path: absPath, media_type: mediaType });
-            const urn = up?.media_urn || up?.urn || up?.asset_urn;
-            if (urn) mediaIds.push(urn);
-          } catch (e) {
-            console.error('Pre-publish media upload failed:', e.message);
-          }
-        }
-        if (mediaIds.length > 0) createArgs.media_ids = mediaIds;
-        const result = await callMCP('linkedin_post_create', createArgs);
-
         const dbw = getDb(false);
-        dbw.prepare("UPDATE scheduled_posts SET status = 'published', post_urn = ?, published_at = ?, updated_at = datetime('now') WHERE id = ?")
-          .run(result.post_urn, new Date().toISOString(), id);
-
-        // Auto-link to media_plan_items + auto-trigger GSC pipeline (if linked + auto-submit ON)
-        const linkedItem = dbw.prepare("SELECT * FROM media_plan_items WHERE scheduled_post_id = ?").get(id);
-        if (linkedItem) {
-          dbw.prepare("UPDATE media_plan_items SET linkedin_post_urn = ?, status = ?, updated_at = datetime('now') WHERE id = ?")
-            .run(result.post_urn, 'opublikowane', linkedItem.id);
-          const setting = dbw.prepare("SELECT value FROM media_plan_settings WHERE key = 'gsc_auto_submit'").get();
-          dbw.close();
-          if (setting?.value === '1' && linkedItem.wiki_slug) {
-            // Fire-and-forget GSC pipeline (response returns to caller immediately)
-            (async () => {
-              try {
-                const r = await fetch(`http://localhost:${PORT}/api/media-plan/${linkedItem.id}/gsc-submit`, { method: 'POST' });
-                console.log('Auto GSC submit:', linkedItem.slug, r.status);
-              } catch (e) {
-                console.error('Auto GSC error:', e.message);
-              }
-            })();
-          }
-        } else {
-          dbw.close();
-        }
-        return json(res, { ok: true, post_urn: result.post_urn });
+        // Reset wiersza → daemon złapie go w ≤60 s (status=scheduled, qa=approved,
+        // publish_at w przeszłości). media_ids=NULL wymusza świeży upload z media_preview_path.
+        dbw.prepare(`UPDATE scheduled_posts
+          SET status = 'scheduled', qa_status = 'approved',
+              post_urn = NULL, published_at = NULL, media_ids = NULL,
+              error = NULL, retry_count = 0,
+              publish_at = datetime('now','-1 minute'),
+              updated_at = datetime('now')
+          WHERE id = ?`).run(id);
+        dbw.close();
+        return json(res, {
+          ok: true,
+          queued: true,
+          message: 'Zakolejkowano do publikacji przez daemon (escaping + upload media + bramka). Wyjdzie w ≤60 s (+0–7 min jitter).'
+        });
       } catch (err) {
         return json(res, { error: err.message }, 500);
       }
@@ -3030,7 +3013,7 @@ Po zakończeniu wypisz raport: które zaproszenia wysłane, które nie (np. już
 
       // 2) Pomysły (status='plan' w media_plan_items, jeszcze nie napisane)
       const proposed = db.prepare(`
-        SELECT id, slug, topic_number, title, hook, format, language, publish_at,
+        SELECT id, slug, topic_number, title, hook, hook_variants, format, language, publish_at,
                source_project, lead_trigger, cta, hashtags,
                banner_path, visual_asset_path, visual_asset_type, banner_concept
         FROM media_plan_items
@@ -4572,6 +4555,15 @@ function renderMediaIdeas(data) {
     var titleEsc = esc(it.title || it.slug || '(brak tytułu)');
     var hookEsc = esc((it.hook || '').slice(0, 240));
     var fmtEsc = esc(it.format || 'thought-leadership');
+    var variants = [];
+    try { variants = JSON.parse(it.hook_variants || '[]'); } catch (e) { variants = []; }
+    var variantsHtml = '';
+    if (Array.isArray(variants) && variants.length > 1) {
+      variantsHtml = '<details style="margin-bottom:10px"><summary style="cursor:pointer;font-size:11px;color:var(--yel)">🧪 Hook Lab (' + variants.length + ' warianty)</summary>' +
+        '<ol style="margin:6px 0 0 16px;padding:0;font-size:11px;color:var(--txt);opacity:.8;line-height:1.5">' +
+        variants.map(function(v){ return '<li style="margin-bottom:4px">' + esc(String(v).slice(0, 200)) + '</li>'; }).join('') +
+        '</ol></details>';
+    }
     var dateLabel = it.publish_at ? new Date(it.publish_at).toLocaleDateString('pl-PL', {day:'numeric', month:'short'}) : '';
     var langBadge = it.language === 'en' ? 'EN' : 'PL';
     var mediaHtml = '';
@@ -4590,6 +4582,7 @@ function renderMediaIdeas(data) {
       mediaHtml +
       '<div style="font-weight:600;margin-bottom:6px;font-size:13px;line-height:1.3">' + titleEsc + '</div>' +
       '<div style="font-size:12px;color:var(--txt);opacity:.85;line-height:1.5;margin-bottom:12px">' + hookEsc + (it.hook && it.hook.length > 240 ? '...' : '') + '</div>' +
+      variantsHtml +
       '<div style="display:flex;gap:6px;flex-wrap:wrap">' +
         '<button class="btn primary sm" data-act="idea-regenerate" data-slug="' + esc(it.slug) + '" data-id="' + esc(it.id) + '">⚡ Przerób na post</button>' +
         '<button class="btn sm" data-act="idea-details" data-slug="' + esc(it.slug) + '">👁️ Szczegóły</button>' +

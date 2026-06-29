@@ -45,6 +45,21 @@ function log(m) { console.log(`[${new Date().toISOString()}] ${m}`); }
 
 const algo = JSON.parse(readFileSync(ALGO_PATH, 'utf8'));
 const brand = existsSync(BRAND_VOICE_PATH) ? JSON.parse(readFileSync(BRAND_VOICE_PATH, 'utf8')) : {};
+const SWIPE_PATH = join(homedir(), '.linkedin-mcp', 'swipe-file.json');
+
+// Swipe-file: STRUKTURY (nie treść) od referencyjnych twórców. Wstrzykujemy kilka
+// pasujących do formatu szkieletów jako inspirację KĄTA, nigdy jako treść do skopiowania.
+function swipeExemplars(format, max = 3) {
+  if (!existsSync(SWIPE_PATH)) return '';
+  let pats = [];
+  try { pats = JSON.parse(readFileSync(SWIPE_PATH, 'utf8')).patterns || []; } catch { return ''; }
+  if (!pats.length) return '';
+  const fmt = String(format || 'text').toLowerCase();
+  const ranked = [...pats.filter((p) => (p.format || 'text') === fmt), ...pats.filter((p) => (p.format || 'text') !== fmt)].slice(0, max);
+  if (!ranked.length) return '';
+  const lines = ranked.map((p, i) => `${i + 1}. [${p.hook_archetype}] otwarcie: ${p.opening_loop}; szkielet: ${p.structure_skeleton}; CTA: ${p.cta_style}`);
+  return `\nWZORCE STRUKTURY (swipe-file — podpatrzone u najlepszych; użyj KĄTA/SZKIELETU, NIGDY ich słów/liczb/przykładów; treść WYŁĄCZNIE z seeda poniżej):\n${lines.join('\n')}`;
+}
 
 // Wybór szablonu po formacie/niszy. Szablon daje STRUKTURĘ (nie wypełniamy {{}} mechanicznie —
 // model pisze pełny post wg intencji szablonu + reguł algorytmu).
@@ -69,6 +84,12 @@ function buildDraftPrompt(mpi, tmpl) {
     ? `\nSTRUKTURA REFERENCYJNA (szablon "${tmpl.name}", trzymaj się ducha, nie wstawiaj literalnie {{pól}}):\n- ${(tmpl.tips || []).join('\n- ')}`
     : '';
   const numbers = mpi.post_text || '';
+  let variants = [];
+  try { variants = JSON.parse(mpi.hook_variants || '[]'); } catch { variants = []; }
+  const variantsHint = Array.isArray(variants) && variants.length > 1
+    ? `\nWARIANTY HOOKA (Hook Lab — wybierz NAJMOCNIEJSZY jako pierwszą linię, resztę zignoruj; nie skłejaj ich):\n${variants.map((v, i) => `${i + 1}. ${v}`).join('\n')}`
+    : '';
+  const swipeHint = swipeExemplars(mpi.format);
   return `Jesteś redaktorem LinkedIn dla profilu Bartosza Gacy (build-in-public, język POLSKI).
 Masz SEED (surowiec z realnego commita) i masz napisać PEŁNY, gotowy do publikacji post po polsku.
 
@@ -87,11 +108,11 @@ TWARDE REGUŁY:
 - Max 3 hashtagi na końcu, trafione w niszę (${mpi.icp || 'ai-automation'}).
 - LINKI: ${links.join(' ')} (NIGDY linka w komentarzu; w treści tylko gdy link JEST sednem — tu raczej bez linka).
 - ZERO baitu/lead-magnetu ("napisz HASŁO", "DM po PDF", "zapisz/udostępnij", "oznacz znajomego").
-- Cel jakościowy bramki (pisz tak, by przejść): experience≥${T.experience_min}, specificity≥${T.specificity_min}, emotion≥${T.emotion_min}, commentability≥${T.commentability_min}.${tmplHint}
+- Cel jakościowy bramki (pisz tak, by przejść): experience≥${T.experience_min}, specificity≥${T.specificity_min}, emotion≥${T.emotion_min}, commentability≥${T.commentability_min}.${tmplHint}${swipeHint}
 
 SEED:
 - Tytuł roboczy: ${mpi.title || ''}
-- Hook (propozycja): ${mpi.hook || ''}
+- Hook (propozycja): ${mpi.hook || ''}${variantsHint}
 - Materiał (scena + liczby + pytanie-spór):
 ${numbers}
 - Problem odbiorcy (lead): ${mpi.lead_trigger || ''}

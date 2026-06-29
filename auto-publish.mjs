@@ -17,6 +17,7 @@ import { join, extname } from 'node:path';
 import { homedir } from 'node:os';
 import { execSync } from 'node:child_process';
 import Database from 'better-sqlite3';
+import { humanizeText } from './lib/humanize.mjs';
 
 const DB_PATH = join(homedir(), '.linkedin-mcp', 'scheduler.db');
 const AUTH_PATH = join(homedir(), '.linkedin-mcp', 'auth.json');
@@ -110,6 +111,35 @@ async function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
 }
 
+// ── Determinizm publikacji: escaping treści + bramki pre-publish ─────────────
+// BUG potwierdzony: LinkedIn parsuje `commentary` jak "little text" — znaki
+// ( ) [ ] { } < > | ~ _ * \ są ZAREZERWOWANE i tekst URYWA SIĘ na pierwszym
+// nieescapowanym wystąpieniu (objaw: post ucięty na pierwszym "("). Escapujemy
+// je backslashem (\( renderuje się jako "("). # i @ ZOSTAWIAMY nietknięte, by
+// zachować klikalne hashtagi/wzmianki. Posty bez tych znaków = bez zmian (no-op).
+const LI_RESERVED = /[\\<>~_*{}()\[\]|]/g;
+function escapeLinkedInText(text) {
+  return String(text).replace(LI_RESERVED, (c) => '\\' + c);
+}
+
+// Czy post DEKLARUJE media (gdy tak — publikacja bez zdjęcia to BŁĄD, nie "ok").
+function postDeclaresMedia(post, postKey) {
+  try { if (post.media_ids && JSON.parse(post.media_ids).length > 0) return true; } catch {}
+  if (post.media_preview_path && existsSync(post.media_preview_path)) return true;
+  if (postKey && POST_IMAGES[postKey] && existsSync(POST_IMAGES[postKey])) return true;
+  if (postKey && POST_CAROUSELS[postKey] && existsSync(POST_CAROUSELS[postKey])) return true;
+  return false;
+}
+
+// Bramka pre-publish: albo komplet poprawny, albo throw (→ retry/failed + alert).
+// Gwarancja: nigdy nie wychodzi post z pustą treścią ani media-post bez zdjęcia.
+function assertPublishable({ post, postKey, text, mediaUrns, mediaCategory }) {
+  if (!text || !text.trim()) throw new Error('GATE: pusta treść posta');
+  if (postDeclaresMedia(post, postKey) && (mediaUrns.length === 0 || mediaCategory === 'NONE')) {
+    throw new Error('GATE: post deklaruje media, ale upload nie dał URN — NIE publikuję bez zdjęcia');
+  }
+}
+
 // ── Media Upload (direct API) ───────────────────────────────────────────────
 
 async function uploadMedia(filePath, mediaType) {
@@ -180,18 +210,28 @@ async function uploadMedia(filePath, mediaType) {
 
   log(`  Binary uploaded (${Math.round(fileBuffer.length / 1024)} KB, ${mime})`);
 
-  // Step 3: Wait and verify asset status
-  log(`  Waiting 5s for asset processing...`);
-  await sleep(5000);
-
-  const checkRes = await linkedinFetch(`/assets/${encodeURIComponent(assetUrn)}`);
-  if (checkRes.ok) {
+  // Step 3: czekaj aż asset będzie AVAILABLE. Attach niegotowego asseta = LinkedIn
+  // publikuje post BEZ zdjęcia (potwierdzony objaw). Pollujemy status; gdy brak
+  // scope do GET /assets (403) — best-effort dłuższe czekanie zamiast 5s.
+  log(`  Waiting for asset to become AVAILABLE...`);
+  let assetReady = false;
+  let noScopeReads = 0;
+  for (let i = 0; i < 20; i++) { // do ~60s
+    await sleep(3000);
+    const checkRes = await linkedinFetch(`/assets/${encodeURIComponent(assetUrn)}`);
+    if (!checkRes.ok) {
+      noScopeReads++;
+      log(`  Asset status check ${checkRes.status} (brak scope) — czekam dłużej (${noScopeReads})`);
+      if (noScopeReads >= 4) { assetReady = true; break; } // ~12s best-effort gdy nie da się odczytać
+      continue;
+    }
     const checkData = await checkRes.json();
     const status = checkData.recipes?.[0]?.status || checkData.status || 'UNKNOWN';
     log(`  Asset status: ${status}`);
-  } else {
-    log(`  Asset status check returned ${checkRes.status} (non-critical, proceeding)`);
+    if (/AVAILABLE|PROCESSED|READY/i.test(status)) { assetReady = true; break; }
+    if (/FAILED|CLIENT_ERROR|SERVER_ERROR/i.test(status)) throw new Error(`Asset processing failed: ${status}`);
   }
+  if (!assetReady) throw new Error('Asset nie osiągnął AVAILABLE w limicie — przerywam (nie publikuję bez zdjęcia)');
 
   return assetUrn;
 }
@@ -201,8 +241,14 @@ async function uploadMedia(filePath, mediaType) {
 async function createPost(text, mediaUrns = [], mediaCategory = 'NONE') {
   const personUrn = getPersonUrn();
 
+  // Humanizer (deterministyczny, niezależny od LLM) PRZED escapowaniem — łapie też
+  // posty wpisane ręcznie / spoza qa-gate. Kolejność: humanize → escape (nie odwrotnie,
+  // bo escape dodaje backslashe, których humanizer nie powinien dotykać).
+  const humanText = humanizeText(text);
+  // Escapujemy znaki zarezerwowane — bez tego LinkedIn ucina tekst na pierwszym "(" itd.
+  const safeText = escapeLinkedInText(humanText);
   const shareContent = {
-    shareCommentary: { text },
+    shareCommentary: { text: safeText },
     shareMediaCategory: mediaCategory,
   };
 
@@ -224,7 +270,8 @@ async function createPost(text, mediaUrns = [], mediaCategory = 'NONE') {
     },
   };
 
-  log(`  Creating post via v2/ugcPosts (${text.length} chars, ${mediaUrns.length} media, category=${mediaCategory})...`);
+  const escapedCount = safeText.length - humanText.length;
+  log(`  Creating post via v2/ugcPosts (${text.length} chars, +${escapedCount} escaped, ${mediaUrns.length} media, category=${mediaCategory})...`);
 
   const res = await linkedinFetch('/ugcPosts', {
     method: 'POST',
@@ -309,7 +356,36 @@ async function verifyPostLive(postUrn) {
 
 // ── Comment Creation (direct API) ───────────────────────────────────────────
 
+// 2026: link w PIERWSZYM komentarzu = ~80% kara zasięgu (dawny "trik" już nie działa).
+// Sterowane przez brand-voice.json `link_in_comment` (domyślnie false). Wartość zostaje, link wychodzi.
+const LINK_IN_COMMENT = (() => {
+  try {
+    const home = process.env.HOME || '/Users/gaca';
+    const bv = JSON.parse(readFileSync(`${home}/.linkedin-mcp/brand-voice.json`, 'utf-8'));
+    return bv.link_in_comment === true;
+  } catch { return false; }
+})();
+
+function sanitizeComment(text) {
+  if (LINK_IN_COMMENT) return text;
+  let t = String(text);
+  const m = t.match(/https?:\/\/\S+/i);
+  if (m) {
+    // Utnij CAŁĄ klauzulę, w której był link (zwykle "... Source: url" / "Kod: url").
+    const before = t.slice(0, m.index);
+    const cut = Math.max(before.lastIndexOf('. '), before.lastIndexOf('! '),
+                         before.lastIndexOf('? '), before.lastIndexOf('\n'));
+    t = cut >= 0 ? before.slice(0, cut + 1) : before;
+  }
+  t = t.replace(/https?:\/\/\S+/gi, '');                 // wytnij ewentualne resztki URL-i
+  t = t.replace(/[\s|–—:\-]+$/g, '').trim();             // posprzątaj wiszące separatory/dwukropek
+  t = humanizeText(t);                                    // myślniki/artefakty AI też w komentarzu
+  if (t && !/[.!?…]$/.test(t)) t += '.';                 // domknij zdanie
+  return t;
+}
+
 async function createComment(shareUrn, postUrn, text) {
+  text = sanitizeComment(text);                           // 2026: zero linków w pierwszym komentarzu
   // Try multiple URN formats — LinkedIn is inconsistent about which one works
   const personUrn = getPersonUrn();
   const urnsToTry = [shareUrn, postUrn].filter(Boolean);
@@ -536,9 +612,19 @@ async function checkAndPublish() {
     const db = new Database(DB_PATH, { readonly: true });
     // Fetch all scheduled, filter in JS for timezone-aware comparison
     // (SQLite string comparison fails with +01:00 offsets vs UTC)
+    // Iter12: pobieramy też media_preview_path + media_kind dla obrazów wygenerowanych
+    // przez NVIDIA FLUX (gen-image-nvidia.mjs zapisuje do media_plan_items.visual_asset_path,
+    // a regenerate-posts.mjs synchronizuje do scheduled_posts.media_preview_path).
+    // BRAMKA QA: publikujemy WYŁĄCZNIE posty z qa_status='approved'
+    // (humanizer + Opus 4.8 fact-check w qa-gate.mjs). Brak QA / hold / error = nie wychodzi.
     const allScheduled = db.prepare(
-      "SELECT id, text, media_ids, publish_at, status FROM scheduled_posts WHERE status = 'scheduled'"
+      "SELECT id, text, media_ids, publish_at, status, media_preview_path, media_kind, auto_comment_override FROM scheduled_posts WHERE status = 'scheduled' AND qa_status = 'approved'"
     ).all();
+    // Log diagnostyczny: ile due-postów czeka na QA (żeby nie wyglądało na 'zawieszone')
+    const awaitingQA = db.prepare(
+      "SELECT COUNT(*) c FROM scheduled_posts WHERE status='scheduled' AND (qa_status IS NULL OR qa_status NOT IN ('approved')) AND publish_at <= ?"
+    ).get(now.toISOString())?.c || 0;
+    if (awaitingQA > 0) log(`  ${awaitingQA} due-post(ów) czeka na QA (qa-gate.mjs) — nie publikuję bez approved`);
     db.close();
     const candidates = allScheduled.filter(p => new Date(p.publish_at).getTime() <= now.getTime());
 
@@ -561,6 +647,49 @@ async function checkAndPublish() {
         // Determine media URNs — either from DB or by uploading
         let mediaUrns = post.media_ids ? JSON.parse(post.media_ids) : [];
         let mediaCategory = 'NONE';
+
+        // ── Iter12: scheduled_posts.media_preview_path = direct path (NVIDIA FLUX z gen-image-nvidia) ──
+        if (mediaUrns.length === 0 && post.media_preview_path && existsSync(post.media_preview_path)) {
+          const mediaType = (post.media_kind === 'VIDEO' || isVideoFile(post.media_preview_path)) ? 'VIDEO' : 'IMAGE';
+          log(`  Uploading ${mediaType} from scheduled_posts.media_preview_path: ${post.media_preview_path}`);
+          try {
+            const urn = await uploadMedia(post.media_preview_path, mediaType);
+            mediaUrns = [urn];
+            mediaCategory = mediaType;
+            log(`  ${mediaType} uploaded: ${urn}`);
+          } catch (err) {
+            logError(`  Direct media upload failed: ${err.message} — falling back to media_plan join`);
+          }
+        }
+
+        // ── Fallback: try media_plan_items.banner_path or visual_asset_path via text match ──
+        if (mediaUrns.length === 0) {
+          try {
+            const mpDb = new Database(DB_PATH, { readonly: true });
+            const mpRow = mpDb.prepare(`SELECT banner_path, visual_asset_path
+              FROM media_plan_items
+              WHERE (hook IS NOT NULL AND ? LIKE '%' || substr(hook, 1, 40) || '%')
+                 OR (post_text IS NOT NULL AND length(post_text) > 20 AND ? LIKE '%' || substr(post_text, 1, 40) || '%')
+              LIMIT 1`).get(post.text, post.text);
+            mpDb.close();
+            // Iter12: fallback też do visual_asset_path (NVIDIA FLUX), nie tylko banner_path
+            const mpBanner = (mpRow?.banner_path && existsSync(mpRow.banner_path)) ? mpRow.banner_path :
+                             (mpRow?.visual_asset_path && existsSync(mpRow.visual_asset_path)) ? mpRow.visual_asset_path : null;
+            if (mpBanner) {
+              log(`  Uploading image from media_plan_items: ${mpBanner}`);
+              try {
+                const urn = await uploadMedia(mpBanner, 'IMAGE');
+                mediaUrns = [urn];
+                mediaCategory = 'IMAGE';
+                log(`  Image uploaded: ${urn}`);
+              } catch (err) {
+                logError(`  Image upload failed: ${err.message} — falling back to POST_IMAGES`);
+              }
+            }
+          } catch (err) {
+            logError(`  media_plan lookup failed: ${err.message}`);
+          }
+        }
 
         if (mediaUrns.length === 0 && postKey) {
           // Try carousel/video from POST_CAROUSELS first
@@ -604,18 +733,27 @@ async function checkAndPublish() {
               }
             }
           }
-        } else if (mediaUrns.length > 0) {
-          // Pre-loaded media_ids from SQLite — detect category from post config or default
+        } else if (mediaUrns.length > 0 && mediaCategory === 'NONE') {
+          // Pre-loaded media_ids from SQLite (no upload above set the category) —
+          // detect category. NEVER overwrite a category already set by an upload
+          // path above (that bug published VIDEO assets as IMAGE → LinkedIn dropped
+          // the video). Honor media_kind / media_preview_path first, then hints.
           const postImagePath = postKey && POST_IMAGES[postKey];
           const postCarouselPath = postKey && POST_CAROUSELS[postKey];
           const hintPath = postCarouselPath || postImagePath;
-          if (hintPath && isVideoFile(hintPath)) {
+          const kindIsVideo =
+            String(post.media_kind || '').toUpperCase() === 'VIDEO' ||
+            isVideoFile(post.media_preview_path || '');
+          if (kindIsVideo || (hintPath && isVideoFile(hintPath))) {
             mediaCategory = 'VIDEO';
           } else {
             mediaCategory = 'IMAGE';
           }
           log(`  Using ${mediaUrns.length} pre-loaded media URN(s) from DB (category=${mediaCategory})`);
         }
+
+        // Bramka determinizmu: albo komplet poprawny, albo throw (→ retry/failed + alert).
+        assertPublishable({ post, postKey, text: post.text, mediaUrns, mediaCategory });
 
         // Create post (with or without media)
         const { postUrn, shareUrn } = await createPost(post.text, mediaUrns, mediaCategory);
@@ -654,18 +792,28 @@ async function checkAndPublish() {
         }
 
         // Queue auto-comment for 12-22 min later (randomized)
-        const commentText = postKey ? (AUTO_COMMENTS[postKey] || AUTO_COMMENTS.default) : AUTO_COMMENTS.default;
-        const commentDelay = randomMinutes(12, 22);
-        const commentDelayMin = Math.round(commentDelay / 60000);
-        commentQueue.push({
-          share_urn: shareUrn,
-          post_urn: postUrn,
-          comment_at: new Date(Date.now() + commentDelay),
-          text: commentText,
-        });
-        log(`  Comment queued for ~${commentDelayMin} min later (${postKey || 'default'})`);
+        // Per-post override: if auto_comment_override is set, it wins over the
+        // keyed/default mapping. Sentinel '__NONE__' disables the comment entirely.
+        const override = (post.auto_comment_override || '').trim();
+        const commentText = override
+          ? override
+          : (postKey ? (AUTO_COMMENTS[postKey] || AUTO_COMMENTS.default) : AUTO_COMMENTS.default);
+        if (override === '__NONE__') {
+          log(`  Auto-comment disabled for this post (override __NONE__)`);
+        } else {
+          const commentDelay = randomMinutes(12, 22);
+          const commentDelayMin = Math.round(commentDelay / 60000);
+          commentQueue.push({
+            share_urn: shareUrn,
+            post_urn: postUrn,
+            comment_at: new Date(Date.now() + commentDelay),
+            text: commentText,
+          });
+          log(`  Comment queued for ~${commentDelayMin} min later (${override ? 'override' : (postKey || 'default')})`);
+        }
       } catch (err) {
         logError(`  Failed to publish ${post.id}: ${err.message}`);
+        notify('LinkedIn ⚠️ Publikacja wstrzymana', err.message.slice(0, 120));
         // Mark as failed after 3 retries
         const dbw = new Database(DB_PATH);
         const current = dbw.prepare("SELECT retry_count FROM scheduled_posts WHERE id = ?").get(post.id);

@@ -42,6 +42,17 @@ const LIMIT = Number(argVal('--limit', '0')) || Infinity;
 
 const cfg = JSON.parse(readFileSync(CONFIG_PATH, 'utf8'));
 const algo = JSON.parse(readFileSync(ALGO_PATH, 'utf8'));
+const SWIPE_PATH = join(homedir(), '.linkedin-mcp', 'swipe-file.json');
+
+// Swipe-file: archetypy hooków podpatrzone u najlepszych (struktura, nie treść).
+// Wstrzykiwane do Hook Lab jako inspiracja KĄTÓW — nigdy jako treść do skopiowania.
+function swipeArchetypes(max = 6) {
+  try {
+    const pats = JSON.parse(readFileSync(SWIPE_PATH, 'utf8')).patterns || [];
+    const arche = [...new Set(pats.map((p) => String(p.hook_archetype || '').trim()).filter(Boolean))].slice(0, max);
+    return arche.length ? `\nINSPIRACJA KĄTÓW (swipe-file — archetypy hooków u najlepszych; użyj kąta, NIGDY ich słów/przykładów; materiał wyłącznie z commitów):\n- ${arche.join('\n- ')}` : '';
+  } catch { return ''; }
+}
 // Lekki „qa-pre-check": odetnij słabe seedy na starcie (t=5 min), zanim ktoś je ręcznie zdrafuje (t=60 min).
 // Liczony na ESTYMACIE modelu z seeda; progi dziedziczone z bramki (algorithm-2026.json).
 const PRE = {
@@ -53,6 +64,7 @@ const DAYS = Number(argVal('--days', cfg.defaults?.days ?? 14));
 const MAX_COMMITS = cfg.defaults?.max_commits_per_repo ?? 50;
 const MAX_PER_REPO = Number(argVal('--max-per-repo', cfg.defaults?.max_ideas_per_repo ?? 3));
 const MIN_SUBJ = cfg.defaults?.min_subject_len ?? 12;
+const HOOK_VARIANTS = Math.max(1, Number(cfg.defaults?.hook_variants ?? 3)); // Hook Lab: ile wariantów hooka/seed
 
 function log(m) { console.log(`[${new Date().toISOString()}] ${m}`); }
 
@@ -83,6 +95,7 @@ function buildPrompt(project, digest) {
   const nicheTopics = fit.niche?.topics || [];
   const offNiche = fit.niche?.off_niche_examples || [];
   const baitPatterns = fit.bait?.patterns || [];
+  const fmtMix = cfg.format_mix || {};
   return `Jesteś researcherem treści build-in-public dla profilu LinkedIn Bartosza Gacy.
 Nisze (tylko te): AI-automation (MCP/Claude Code/boty/automatyzacje) oraz polskie e-gov/open-data (KSeF/ZUS/ARiMR/IRZ/dane publiczne).
 
@@ -110,9 +123,18 @@ ZAKAZ baitu/lead-magnetu (NIE proponuj takich CTA): ${baitPatterns.join(' | ')}.
 
 KOMENTARZOGENNOŚĆ: każdy pomysł MUSI mieć closing_question — JEDNO zamknięte pytanie-spór, z którym da się (nie)zgodzić (nie puste „a co myślisz?"). To główny driver komentarzy.
 
+DOBÓR FORMATU (research 2026 — dokument/karuzela = #1, napędza save'y):
+- format="carousel" GDY ${fmtMix.prefer_carousel_when || 'materiał układa się w framework/checklistę/krok-po-kroku z realnymi liczbami'}.
+- format="image" GDY ${fmtMix.prefer_image_when || 'jest autentyczny screen (terminal/dashboard/realna rozmowa bota) ilustrujący scenę'}.
+- inaczej format="text" (historia/porażka/refleksja).
+- NIE proponuj: ${(fmtMix.avoid || ['video', 'poll']).join(', ')} (krótkie wideo spadło ~36% r/r; ankieta zabija engagement).
+
+HOOK LAB (wariant Greg Isenberg „ship wiele hooków, algo wybierze zwycięzcę"): dla każdego pomysłu podaj hook_variants — ${HOOK_VARIANTS} RÓŻNE wersje pierwszej linii tego samego posta, każda inny kąt zaczepienia (np. porażka / kontrariańska teza / konkretna liczba-szok / scena „o 2 w nocy"). Każdy ≤ 200 zn, każdy otwiera pętlę (nie domyka tematu). Pole hook = najmocniejszy z nich.${swipeArchetypes()}
+
 Dla każdego pomysłu zwróć:
 - title: krótki tytuł roboczy (≤ 60 zn)
-- hook: pierwsza linia posta (problem/porażka, ≤ 200 zn)
+- hook: NAJMOCNIEJSZA pierwsza linia posta (problem/porażka, ≤ 200 zn)
+- hook_variants: tablica ${HOOK_VARIANTS} różnych wersji hooka (w tym ten z pola hook), każda ≤ 200 zn
 - scene: 2-4 zdania surowca — co się realnie wydarzyło wg commitów (to jest materiał do napisania posta)
 - numbers: tablica realnych liczb/faktów z commitów (np. "timeout 360→600s", "3 grupy naraz"); [] jeśli brak
 - closing_question: jedno zamknięte pytanie-spór na koniec posta
@@ -121,7 +143,7 @@ Dla każdego pomysłu zwróć:
 - lead_trigger: jaki problem odbiorcy ten post adresuje (1 zdanie)
 - est_experience, est_specificity, est_commentability: UCZCIWA estymacja 0-5, jak mocno ten surowiec wypadnie w bramce (experience=przeżyta scena, specificity=realne liczby, commentability=czy pytanie-spór realnie prowokuje kontrę). Bądź surowy — to filtr, nie autoreklama.
 
-Wypisz WYŁĄCZNIE surowy JSON (bez markdown): {"ideas":[{"title":"","hook":"","scene":"","numbers":[],"closing_question":"","niche":"","format":"","lead_trigger":"","est_experience":0,"est_specificity":0,"est_commentability":0}]}
+Wypisz WYŁĄCZNIE surowy JSON (bez markdown): {"ideas":[{"title":"","hook":"","hook_variants":[],"scene":"","numbers":[],"closing_question":"","niche":"","format":"","lead_trigger":"","est_experience":0,"est_specificity":0,"est_commentability":0}]}
 
 COMMITY:
 <<<GIT
@@ -159,6 +181,8 @@ function tentativeSlot(i) {
 
 function main() {
   const db = new Database(DB_PATH);
+  // Hook Lab: idempotentna migracja kolumny na warianty hooka (wzorzec z store.ts/qa-gate).
+  try { db.exec("ALTER TABLE media_plan_items ADD COLUMN hook_variants TEXT"); } catch { /* istnieje */ }
   let projects = cfg.projects || [];
   if (ONLY_PROJECT) projects = projects.filter(p => p.name === ONLY_PROJECT);
   if (!projects.length) { log(`Brak projektów (filtr --project ${ONLY_PROJECT}?).`); db.close(); return; }
@@ -202,12 +226,16 @@ function main() {
         (idea.numbers?.length ? 'Liczby: ' + idea.numbers.join('; ') : ''),
         (idea.closing_question ? 'Pytanie-spór: ' + idea.closing_question : ''),
       ].filter(Boolean).join('\n\n');
+      // Hook Lab: zbierz unikalne warianty (zawsze z głównym hookiem w środku), przytnij do limitu.
+      const variants = [...new Set([idea.hook, ...(Array.isArray(idea.hook_variants) ? idea.hook_variants : [])]
+        .map(h => String(h || '').trim()).filter(Boolean))].slice(0, HOOK_VARIANTS);
       const row = {
         id: randomUUID(),
         topic_number: nextTopic++,
         slug: `${nextTopic - 1}-${slugify(idea.title)}`,
         title: idea.title.slice(0, 120),
         hook: idea.hook.slice(0, 300),
+        hook_variants: JSON.stringify(variants),
         language: 'pl', // profil polskojęzyczny — wymuszone (EN = HOLD w bramce, martwy cykl)
         status: 'plan',
         publish_at: tentativeSlot(total),
@@ -225,8 +253,8 @@ function main() {
 
       if (!DRY) {
         db.prepare(`INSERT INTO media_plan_items
-          (id, topic_number, slug, title, hook, language, status, publish_at, post_text, cta, lead_trigger, format, icp, source_project, live_signal, created_at, updated_at)
-          VALUES (@id,@topic_number,@slug,@title,@hook,@language,@status,@publish_at,@post_text,@cta,@lead_trigger,@format,@icp,@source_project,@live_signal,datetime('now'),datetime('now'))`)
+          (id, topic_number, slug, title, hook, hook_variants, language, status, publish_at, post_text, cta, lead_trigger, format, icp, source_project, live_signal, created_at, updated_at)
+          VALUES (@id,@topic_number,@slug,@title,@hook,@hook_variants,@language,@status,@publish_at,@post_text,@cta,@lead_trigger,@format,@icp,@source_project,@live_signal,datetime('now'),datetime('now'))`)
           .run(row);
       }
       perRepo++; total++;

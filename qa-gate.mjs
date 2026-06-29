@@ -29,6 +29,7 @@ import { homedir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { execFileSync } from 'node:child_process';
 import Database from 'better-sqlite3';
+import { humanizeText } from './lib/humanize.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const DB_PATH = join(homedir(), '.linkedin-mcp', 'scheduler.db');
@@ -112,6 +113,7 @@ ZADANIE 4 — SCORING (oceniaj TEKST PO przepisaniu, skala 0-5):
 - emotion: ${algo.scoring.dimensions.emotion}
 - specificity: ${algo.scoring.dimensions.specificity}
 - commentability: ${algo.scoring.dimensions.commentability}
+- saveability: ${algo.scoring.dimensions.saveability} (To MIĘKKI sygnał — NIE wpływa na werdykt approved/hold; służy tylko rekomendacji formatu.)
 
 ZADANIE 5 — FORMAT: formatOk=true jeśli tekst spełnia wymogi formatu wyżej; inaczej false + co poprawić w formatNotes.
 
@@ -136,7 +138,7 @@ c) BAIT: ustaw bait=true i wypisz konkretne frazy w baitIssues, jeśli post zawi
 - type="private"/"ok" nie blokują. type="unverifiable" nie blokuje, ale dopisz ostrzeżenie w summary.
 
 Na końcu wypisz WYŁĄCZNIE surowy JSON (bez markdown, bez \`\`\`), dokładnie wg schematu:
-{"complete": true|false, "completenessIssues": ["..."], "humanizedText": "<przepisany tekst>", "factIssues": [{"claim":"...","type":"ok|hallucination|unverifiable|private","evidence":"...","sourceUrl":"..."}], "scores": {"experience": 0, "emotion": 0, "specificity": 0, "commentability": 0}, "formatOk": true|false, "formatNotes": ["..."], "linkJustified": true|false, "language": "pl", "onNiche": true|false, "topic": "<1-3 słowa>", "bait": true|false, "baitIssues": ["..."], "approved": true|false, "holdReason": "<konkretny feedback po polsku albo pusty string>", "summary": "<1 zdanie po polsku>"}
+{"complete": true|false, "completenessIssues": ["..."], "humanizedText": "<przepisany tekst>", "factIssues": [{"claim":"...","type":"ok|hallucination|unverifiable|private","evidence":"...","sourceUrl":"..."}], "scores": {"experience": 0, "emotion": 0, "specificity": 0, "commentability": 0, "saveability": 0}, "formatOk": true|false, "formatNotes": ["..."], "linkJustified": true|false, "language": "pl", "onNiche": true|false, "topic": "<1-3 słowa>", "bait": true|false, "baitIssues": ["..."], "approved": true|false, "holdReason": "<konkretny feedback po polsku albo pusty string>", "summary": "<1 zdanie po polsku>"}
 
 TEKST POSTA DO OBRÓBKI:
 <<<POST
@@ -173,6 +175,14 @@ function processPost(db, post) {
   log(`QA → ${post.id} (${post.text.length} zn., format=${fmt.kind}${fmt.isGenBanner ? '/gen-banner' : ''})`);
   const verdict = runClaude(buildPrompt(post.text, fmt));
 
+  // Deterministyczny humanizer NA WYJŚCIU modelu — gwarancja, że myślniki i
+  // artefakty AI znikną niezależnie od tego, czy LLM posłuchał promptu. URL-e i
+  // liczby chronione. Robione PRZED scoringiem/grepem, żeby decyzje liczyły się
+  // na tekście realnie idącym do publikacji. Wyłączalne flagą brand-voice.humanize.
+  if (typeof verdict.humanizedText === 'string') {
+    verdict.humanizedText = humanizeText(verdict.humanizedText, { enabled: brand.humanize !== false });
+  }
+
   // --- Zbierz sygnały ---
   const issues = Array.isArray(verdict.factIssues) ? verdict.factIssues
     : (Array.isArray(verdict.issues) ? verdict.issues : []); // wsteczna zgodność
@@ -186,6 +196,7 @@ function processPost(db, post) {
   const T = algo.scoring.thresholds;
   const exp = Number(s.experience ?? 0), emo = Number(s.emotion ?? 0), spec = Number(s.specificity ?? 0);
   const comm = Number(s.commentability ?? 0);
+  const save = Number(s.saveability ?? 0); // MIĘKKI sygnał — nie wchodzi do werdyktu
   const sum = exp + emo + spec; // commentability NIE wchodzi do sumy (osobna bramka, żeby nie ruszać kalibracji sum_min)
   const commMin = T.commentability_min ?? 0;
   const viralOk = exp >= T.experience_min && spec >= T.specificity_min && emo >= T.emotion_min && comm >= commMin && sum >= T.sum_min;
@@ -199,6 +210,13 @@ function processPost(db, post) {
   const bodyHasLink = /https?:\/\/\S+/i.test(verdict.humanizedText || post.text || '');
   if (bodyHasLink && verdict.linkJustified === false && !formatNotes.some(n => /link/i.test(n))) {
     formatNotes.push('Link w treści nie jest sednem posta (~19% kary zasięgu) — rozważ usunięcie i podanie w DM/profilu. Komentarz i tak bez linka.');
+  }
+  // Saveability (research 2026: save ≈ 5× like = top sygnał dystrybucji) — MIĘKKA rekomendacja, NIE blokuje.
+  // Gęsty, zapisywalny materiał wrzucony jako goły tekst = zmarnowany format → zaproponuj karuzelę/dokument.
+  if (save >= 4 && fmt.kind === 'text' && !formatNotes.some(n => /karuzel|saveab|zapis/i.test(n))) {
+    formatNotes.push(`Wysoka saveability (${save}/5) jako goły tekst — to materiał na KARUZELĘ/dokument (PDF = #1 format, napędza save'y). Rozważ format=carousel.`);
+  } else if (fmt.kind === 'carousel' && save <= 2 && !formatNotes.some(n => /karuzel|saveab|zapis/i.test(n))) {
+    formatNotes.push(`Karuzela o niskiej saveability (${save}/5) — pusta karuzela wypada gorzej niż tekst. Dodaj konkretny framework/checklistę albo zmień na tekst.`);
   }
   // format hard-fail tylko gdy reguła JSON tak mówi (domyślnie wszystko = ostrzeżenie, nie blokuje)
   const formatHardFail =
@@ -239,7 +257,7 @@ function processPost(db, post) {
   else if (formatHardFail) holdReason = `Format ${fmt.kind}: ${formatNotes.join('; ')}`;
 
   const scoresBlob = {
-    scores: { experience: exp, emotion: emo, specificity: spec, commentability: comm, sum },
+    scores: { experience: exp, emotion: emo, specificity: spec, commentability: comm, saveability: save, sum },
     viralOk, complete, completenessIssues,
     language: detLang || null, languageOk,
     onNiche, nicheOk, topic: verdict.topic || null,
@@ -250,7 +268,7 @@ function processPost(db, post) {
     holdReason, at: new Date().toISOString(),
   };
 
-  log(`   verdict: ${approved ? 'APPROVED ✅' : 'HOLD ⛔'} | exp ${exp} emo ${emo} spec ${spec} comm ${comm} (Σ${sum}) | lang=${detLang || '?'} niche=${onNiche ? 'ok' : 'OFF'} bait=${isBait ? 'YES' : 'no'} | complete=${complete} halluc=${halluc.length} | ${verdict.summary || ''}`);
+  log(`   verdict: ${approved ? 'APPROVED ✅' : 'HOLD ⛔'} | exp ${exp} emo ${emo} spec ${spec} comm ${comm} save ${save} (Σ${sum}) | lang=${detLang || '?'} niche=${onNiche ? 'ok' : 'OFF'} bait=${isBait ? 'YES' : 'no'} | complete=${complete} halluc=${halluc.length} | ${verdict.summary || ''}`);
   if (completenessIssues.length) for (const c of completenessIssues) log(`   ⚠ kompletność: ${String(c).slice(0, 90)}`);
   if (!languageOk) log(`   ✗ [język] treść ≠ ${targetLang.toUpperCase()} (wykryto ${detLang || '?'})`);
   if (!nicheOk) log(`   ✗ [nisza] off-niche: ${verdict.topic || '?'}`);

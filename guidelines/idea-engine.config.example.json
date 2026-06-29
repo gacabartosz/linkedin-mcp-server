@@ -1,0 +1,15 @@
+{
+  "note": "PRZYKŁAD configu Idea Engine. Skopiuj do guidelines/idea-engine.config.json (gitignored) i uzupełnij własnymi ścieżkami. WYŁĄCZNIE własne projekty build-in-public. NIGDY repozytoriów klientów ani poufnych (anonimizacja: zero nazwisk/danych klientów w treści LinkedIn).",
+  "defaults": { "days": 14, "max_commits_per_repo": 50, "max_ideas_per_repo": 3, "min_subject_len": 12, "hook_variants": 3 },
+  "format_mix": {
+    "note": "Cel rozkładu formatów na tydzień (operacjonalizacja algorithm-2026.json → format_priority). Idea Engine preferuje carousel gdy materiał to framework/checklista/krok-po-kroku (save-driver, PDF=#1), obraz gdy jest autentyczny wizual (terminal/panel), inaczej text. Krótkiego wideo nie proponować.",
+    "weekly_target": { "carousel": 1, "image": 1, "text": 1 },
+    "prefer_carousel_when": "materiał da się ułożyć w framework / checklistę / krok-po-kroku z realnymi liczbami (wtedy wysoka saveability — wrzuć jako karuzelę, nie goły tekst)",
+    "prefer_image_when": "istnieje autentyczny screen (terminal, dashboard, realna rozmowa bota) wprost ilustrujący scenę",
+    "avoid": ["video", "poll"]
+  },
+  "projects": [
+    { "name": "your-project", "path": "/path/to/your/project", "niche": "ai-automation", "lang": "pl" }
+  ],
+  "blocklist_reason": "NIE dodawaj tu repozytoriów klientów ani poufnych — wyłącznie własne projekty build-in-public. Repo klienta na liście = ryzyko wycieku tożsamości/danych klienta w treści publikowanej na LinkedIn."
+}

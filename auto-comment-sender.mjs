@@ -42,6 +42,29 @@ const ACTIVE_HOURS_UTC = { start: 6, end: 20 };
 const log = (m) => console.log(`[sender] ${new Date().toISOString().slice(11,19)} ${m}`);
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const randInt = (a, b) => Math.floor(Math.random() * (b - a + 1)) + a;
+
+// Timeouts to prevent silent hangs (Playwright operations that never resolve)
+const SEND_TIMEOUT_MS = 90 * 1000;
+const CYCLE_TIMEOUT_MS = 8 * 60 * 1000;
+const HEARTBEAT_MS = 30 * 1000;
+
+async function sleepWithHeartbeat(ms, label) {
+  let remaining = ms;
+  while (remaining > 0) {
+    const step = Math.min(remaining, HEARTBEAT_MS);
+    await sleep(step);
+    remaining -= step;
+    if (remaining > 0) log(`  ⏳ ${label} (${Math.round(remaining/1000)}s left)`);
+  }
+}
+
+function withTimeout(promise, ms, label) {
+  let timer;
+  const timeout = new Promise((_, rej) => {
+    timer = setTimeout(() => rej(new Error(`${label} timeout ${Math.round(ms/1000)}s`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
 const isActiveHour = () => { const h = new Date().getUTCHours(); return h >= ACTIVE_HOURS_UTC.start && h < ACTIVE_HOURS_UTC.end; };
 
 const args = process.argv.slice(2);
@@ -63,11 +86,34 @@ function getApprovedProposals() {
   return rows;
 }
 
-function markSent(id, commentUrn) {
+function markSent(id, prop) {
   if (DRY_RUN) { log(`  [DRY] would mark sent: ${id}`); return; }
   const db = new Database(ENGAGE_DB);
+
+  // 1. Update reply_proposals status
   db.prepare(`UPDATE reply_proposals SET status='sent', sent_at=datetime('now'), sent_via='playwright', updated_at=datetime('now') WHERE id=?`).run(id);
+
+  // 2. Dodaj NASZ komentarz do drzewka thread_comments
+  // parent_comment_urn = source_id (komentarz na który odpowiedzieliśmy)
+  // To zachowuje strukturę drzewka — nasze odpowiedzi są dziećmi komentarza target
+  const ourCommentUrn = `our_reply_${id}_${Date.now()}`;
+  db.prepare(`
+    INSERT OR IGNORE INTO thread_comments
+      (post_urn, comment_urn, parent_comment_urn, author_name, comment_text, comment_created_at, scraped_at, is_our_comment)
+    VALUES (?, ?, ?, ?, ?, datetime('now'), datetime('now'), 1)
+  `).run(prop.post_urn, ourCommentUrn, prop.source_id, 'Bartosz Gaca', prop.proposed_reply);
+
+  // 3. Zaktualizuj our_replies_json w thread_memory (cache)
+  const tm = db.prepare("SELECT our_replies_json FROM thread_memory WHERE post_urn=?").get(prop.post_urn);
+  if (tm) {
+    let ourReplies = [];
+    try { ourReplies = JSON.parse(tm.our_replies_json || '[]'); } catch {}
+    ourReplies.push(prop.proposed_reply);
+    db.prepare("UPDATE thread_memory SET our_replies_json=?, last_scraped_at=datetime('now') WHERE post_urn=?").run(JSON.stringify(ourReplies), prop.post_urn);
+  }
+
   db.close();
+  log(`  📝 Dodano do drzewka jako reply do ${prop.source_id.slice(0, 50)}...`);
 }
 
 function markFailed(id, reason) {
@@ -108,36 +154,71 @@ async function sendReply(page, prop) {
     try { await b.click(); await sleep(randInt(1500, 3000)); } catch {}
   }
 
-  // Znajdź target comment po autorze + tekście
-  // source_text z DB jest oryginalnym komentarzem
-  const sourceTextSnippet = (prop.source_text || '').slice(0, 60);
-  const targetAuthor = prop.source_author;
+  // ── TARGETOWANIE KOMENTARZA — KRYTYCZNE (komu odpowiadamy) ──────────────────
+  // Fix bugu „odpowiedź pod złym użytkownikiem": NIE matchujemy po imieniu+30zn (dwie
+  // osoby o tym samym imieniu / innerText rodzica zawiera tekst dzieci). Matchujemy po
+  // UNIKALNYM URN komentarza (data-id === source_id) — to samo data-id, które daemon
+  // zapisał jako commentUrn. Fallback tylko gdy PEWNY (pełne imię+nazwisko, ≥60 zn., 1 trafienie).
+  const sourceId = prop.source_id || '';
+  const sourceTextSnippet = (prop.source_text || '').slice(0, 80);
+  const targetAuthor = prop.source_author || '';
 
-  log(`  Szukam komentarza: "${targetAuthor}: ${sourceTextSnippet}..."`);
+  log(`  Szukam komentarza po URN: ${sourceId.slice(0, 55)} (autor: ${targetAuthor})`);
 
-  // Locator: znajdź element komentarza zawierający autora + fragment tekstu
-  const found = await page.evaluate(({ author, snippet }) => {
-    const items = document.querySelectorAll('.comments-comment-entity, .comments-comment-item, article.comments-comment-item');
-    for (const it of items) {
-      const authorEl = it.querySelector('.comments-comment-meta__description-title, .comments-post-meta__name-text');
-      const textEl = it.querySelector('.comments-comment-item__main-content, .comments-comment-entity__main-content, .update-components-text, .feed-shared-text');
-      if (!authorEl || !textEl) continue;
-      const a = authorEl.innerText.trim();
-      const t = textEl.innerText.trim();
-      if (a.includes(author.split(' ')[0]) && t.includes(snippet.slice(0, 30))) {
-        // Scroll do tego komentarza
-        it.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        it.setAttribute('data-sender-target', 'true');
-        return true;
+  const match = await page.evaluate(({ urn, author, snippet }) => {
+    document.querySelectorAll('[data-sender-target]').forEach(e => e.removeAttribute('data-sender-target'));
+    const ENTITY = '.comments-comment-entity, .comments-comment-item, article.comments-comment-item';
+
+    // 1) EXACT po URN (data-id) — jedyny pewny sposób
+    if (urn) {
+      let el = null;
+      try { el = document.querySelector('[data-id="' + (window.CSS && CSS.escape ? CSS.escape(urn) : urn.replace(/"/g, '\\"')) + '"]'); } catch {}
+      if (!el) {
+        // niektóre wersje DOM trzymają data-id na innym atrybucie / wrapperze
+        for (const e of document.querySelectorAll('[data-id],[data-urn]')) {
+          if (e.getAttribute('data-id') === urn || e.getAttribute('data-urn') === urn) { el = e; break; }
+        }
+      }
+      if (el) {
+        const entity = el.closest(ENTITY) || el;
+        entity.setAttribute('data-sender-target', 'true');
+        entity.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        return { ok: true, method: 'urn' };
       }
     }
-    return false;
-  }, { author: targetAuthor, snippet: sourceTextSnippet });
 
-  if (!found) {
-    log(`  ❌ Nie znaleziono komentarza w DOM`);
-    return { ok: false, reason: 'comment_not_found' };
+    // DETERMINIZM: jeśli mamy realny URN, a nie ma go w DOM (komentarz usunięty / nie doładowany),
+    // NIE robimy fuzzy-matchu — bo trafilibyśmy w innego użytkownika. Lepiej not_found.
+    if (urn && urn.indexOf('urn:') === 0) {
+      return { ok: false, reason: 'urn_not_in_dom' };
+    }
+
+    // 2) FALLBACK — TYLKO dla legacy source_id bez URN: pełne imię+nazwisko ORAZ ≥60 zn. ORAZ dokładnie 1 trafienie
+    if (author && snippet && snippet.length >= 30) {
+      const needle = snippet.slice(0, 60);
+      const hits = [];
+      for (const it of document.querySelectorAll(ENTITY)) {
+        const authorEl = it.querySelector('.comments-comment-meta__description-title, .comments-post-meta__name-text');
+        const textEl = it.querySelector('.comments-comment-item__main-content, .comments-comment-entity__main-content');
+        if (!authorEl || !textEl) continue;
+        if (authorEl.innerText.trim() === author && textEl.innerText.trim().includes(needle)) hits.push(it);
+      }
+      if (hits.length === 1) {
+        hits[0].setAttribute('data-sender-target', 'true');
+        hits[0].scrollIntoView({ behavior: 'smooth', block: 'center' });
+        return { ok: true, method: 'fallback-exact' };
+      }
+      if (hits.length > 1) return { ok: false, reason: 'ambiguous' };
+    }
+    return { ok: false, reason: 'not_found' };
+  }, { urn: sourceId, author: targetAuthor, snippet: sourceTextSnippet });
+
+  if (!match.ok) {
+    // Lepiej NIE wysłać niż wysłać pod złą osobę.
+    log(`  ❌ Target niepewny (${match.reason}) — NIE wysyłam (ochrona przed odpowiedzią pod złym użytkownikiem)`);
+    return { ok: false, reason: match.reason === 'ambiguous' ? 'target_ambiguous' : 'comment_not_found' };
   }
+  log(`  ✅ Target znaleziony (${match.method})`);
 
   await sleep(randInt(2000, 5000));
 
@@ -174,34 +255,95 @@ async function sendReply(page, prop) {
   await editor.click();
   await sleep(800);
 
-  // Wpisz z human-like delay
-  for (const char of prop.proposed_reply) {
-    await page.keyboard.type(char);
-    await sleep(randInt(40, 90));
-  }
+  // Wpisz tekst przez DOM (bez Accessibility API).
+  // Quill editor (LinkedIn) wymaga emisji input events żeby Send button się aktywował.
+  const typeResult = await editor.evaluate((el, text) => {
+    el.focus();
+    // Wyczyść istniejący content
+    while (el.firstChild) el.removeChild(el.firstChild);
+    // Wstaw tekst jako paragraphs (Quill format)
+    const lines = text.split('\n');
+    for (const line of lines) {
+      const p = document.createElement('p');
+      if (line.trim() === '') {
+        p.innerHTML = '<br>';
+      } else {
+        p.textContent = line;
+      }
+      el.appendChild(p);
+    }
+    // Emituj events których słucha Quill/React
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+    el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true }));
+    return { ok: true, length: el.innerText.length };
+  }, prop.proposed_reply);
 
-  await sleep(randInt(3000, 6000));
+  log(`  ✏️ Wstawiono ${typeResult.length} znaków przez DOM (bez Accessibility)`);
+
+  await sleep(randInt(2000, 4000));
 
   if (DRY_RUN) {
     log(`  [DRY-RUN] Nie klikam Post (dry run mode)`);
     return { ok: true, dryRun: true };
   }
 
-  // Kliknij Post / Opublikuj
-  log(`  Klikam Post...`);
+  // Kliknij Post / Odpowiedz / Opublikuj (różne języki + warianty UI)
+  log(`  Klikam Odpowiedz/Post...`);
   const postClicked = await page.evaluate(() => {
-    // Active state buttons
-    const buttons = document.querySelectorAll('button.comments-comment-box__submit-button, button[aria-label*="Post"], button[aria-label*="Opublikuj"]');
-    for (const b of buttons) {
-      if (!b.disabled) { b.click(); return true; }
+    // Pierwsza próba: konkretne selektory klas/aria-label
+    const buttonSelectors = [
+      'button.comments-comment-box__submit-button',
+      'button.comments-comment-box__submit-button--cr',
+      'button[data-test-comment-box-submit]',
+      'button[aria-label="Post"]',
+      'button[aria-label="Opublikuj"]',
+      'button[aria-label="Odpowiedz"]',
+      'button[aria-label="Reply"]',
+      'button[aria-label="Comment"]',
+      'button[aria-label="Komentarz"]',
+    ];
+    for (const sel of buttonSelectors) {
+      const btns = document.querySelectorAll(sel);
+      for (const b of btns) {
+        if (!b.disabled && b.offsetParent !== null) {
+          b.click();
+          return { ok: true, via: sel };
+        }
+      }
     }
-    return false;
+
+    // Druga próba: znajdź NIEBIESKI przycisk po tekście wewnątrz formularza komentarza
+    const containers = document.querySelectorAll('.comments-comment-texteditor, .comments-comment-box, .comments-comment-box--reply');
+    const replyTextRegex = /^(post|odpowiedz|odpowiedź|opublikuj|reply|comment|komentarz)$/i;
+    for (const container of containers) {
+      const allBtns = container.querySelectorAll('button');
+      for (const b of allBtns) {
+        const text = (b.innerText || b.textContent || '').trim();
+        if (replyTextRegex.test(text) && !b.disabled && b.offsetParent !== null) {
+          b.click();
+          return { ok: true, via: `text-match: "${text}"` };
+        }
+      }
+    }
+
+    // Trzecia próba: jakikolwiek primary blue button w formularzu komentarza
+    const allFormBtns = document.querySelectorAll('.comments-comment-box button.artdeco-button--primary, .comments-comment-texteditor button.artdeco-button--primary');
+    for (const b of allFormBtns) {
+      if (!b.disabled && b.offsetParent !== null) {
+        b.click();
+        return { ok: true, via: 'artdeco-primary' };
+      }
+    }
+
+    return { ok: false, reason: 'no-button-found' };
   });
 
-  if (!postClicked) {
-    log(`  ❌ Przycisk Post nieaktywny lub nie znaleziono`);
+  if (!postClicked.ok) {
+    log(`  ❌ Przycisk submit nie znaleziono (${postClicked.reason || 'unknown'})`);
     return { ok: false, reason: 'post_button_not_clickable' };
   }
+  log(`  ✅ Kliknięto via: ${postClicked.via}`);
 
   await sleep(randInt(3000, 6000));
   log(`  ✅ Wysłano`);
@@ -245,12 +387,14 @@ async function runCycle() {
     await page.addInitScript(() => Object.defineProperty(navigator, 'webdriver', { get: () => undefined }));
 
     let sent = 0;
-    for (const prop of ready.slice(0, MAX_PER_CYCLE)) {
-      log(`\n[${sent + 1}/${MAX_PER_CYCLE}] propozycja #${prop.id} (${prop.source_author})`);
+    const batch = ready.slice(0, MAX_PER_CYCLE);
+    for (let i = 0; i < batch.length; i++) {
+      const prop = batch[i];
+      log(`\n[${i + 1}/${batch.length}] propozycja #${prop.id} (${prop.source_author})`);
       try {
-        const result = await sendReply(page, prop);
+        const result = await withTimeout(sendReply(page, prop), SEND_TIMEOUT_MS, 'sendReply');
         if (result.ok) {
-          markSent(prop.id);
+          markSent(prop.id, prop);
           sent++;
         } else {
           markFailed(prop.id, result.reason);
@@ -260,17 +404,25 @@ async function runCycle() {
         markFailed(prop.id, 'exception');
       }
 
-      // Pauza między wysyłkami (human-like)
-      if (sent < MAX_PER_CYCLE) {
+      // Pauza między wysyłkami (human-like) — tylko jeśli będzie kolejna iteracja
+      if (i < batch.length - 1) {
         const pause = randInt(60, 180) * 1000;
         log(`  Pauza ${Math.round(pause/1000)}s przed kolejną...`);
-        await sleep(pause);
+        await sleepWithHeartbeat(pause, `Pauza przed ${i+2}/${batch.length}`);
       }
     }
 
     log(`\n=== Cycle done: ${sent} wysłanych ===`);
   } finally {
     if (ctx) await ctx.close().catch(() => {});
+  }
+}
+
+function handleCycleError(e) {
+  log(`Crash: ${e.message}`);
+  if (/timeout/i.test(e.message)) {
+    log('Fatal — exiting for launchd restart (clean browser context)');
+    process.exit(1);
   }
 }
 
@@ -282,7 +434,7 @@ async function scheduleNext() {
   const nextAt = new Date(Date.now() + delayMs);
   log(`Następny cykl: ${nextAt.toLocaleTimeString('pl-PL')} (za ${Math.round(delayMs/60000)} min)`);
   setTimeout(async () => {
-    await runCycle().catch(e => log(`Crash: ${e.message}`));
+    await withTimeout(runCycle(), CYCLE_TIMEOUT_MS, 'Cycle').catch(handleCycleError);
     scheduleNext();
   }, delayMs);
 }
@@ -296,7 +448,7 @@ if (RUN_ONCE) {
   const initDelay = randInt(2, 8) * 60 * 1000;
   log(`Start za ${Math.round(initDelay/60000)} min`);
   setTimeout(async () => {
-    await runCycle().catch(e => log(`Crash init: ${e.message}`));
+    await withTimeout(runCycle(), CYCLE_TIMEOUT_MS, 'Cycle').catch(handleCycleError);
     scheduleNext();
   }, initDelay);
 }

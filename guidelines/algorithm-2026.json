@@ -1,7 +1,7 @@
 {
-  "version": "2026.2",
-  "updated": "2026-06-23",
-  "purpose": "Operacyjne reguły 'nowego algorytmu LinkedIn' wymuszane PRZED publikacją w qa-gate.mjs. Uzupełnia (nie zastępuje) guidelines/linkedin-strategy.json i ~/.linkedin-mcp/brand-voice.json. Cel: zatrzymać spadek zasięgu, niepełne/wadliwe posty i ciągłe usuwanie. 2026.2: dołożono twarde bramki audience_fit (język≠PL / off-niche / bait → HOLD) i wymiar scoringu 'commentability' — uzasadnione danymi analytics konta (EN po polskim profilu = martwy zasięg; off-niche = rozjazd; bait = zakopanie; pytanie-spór = 190 komentarzy).",
+  "version": "2026.3",
+  "updated": "2026-06-29",
+  "purpose": "Operacyjne reguły 'nowego algorytmu LinkedIn' wymuszane PRZED publikacją w qa-gate.mjs. Uzupełnia (nie zastępuje) guidelines/linkedin-strategy.json i ~/.linkedin-mcp/brand-voice.json. Cel: zatrzymać spadek zasięgu, niepełne/wadliwe posty i ciągłe usuwanie. 2026.2: dołożono twarde bramki audience_fit (język≠PL / off-niche / bait → HOLD) i wymiar scoringu 'commentability'. 2026.3 (operacjonalizacja researchu algorytmu 2026): dołożono format_priority (dokument/karuzela = #1 save-driver, obraz #2, krótkie wideo demote, ankieta rzadko), wymiar scoringu 'saveability' (save ≈ 5× like = dziś top sygnał dystrybucji — MIĘKKI bonus/rekomendacja, NIE twarda bramka), sekcję hashtags (default 0-1; brak hashtagów +5-10% zasięgu), wyjątek 'resource post' w polityce linków (multi-link OK gdy linki SĄ sednem) oraz 'human_texture' (deterministyczny humanizer lib/humanize.mjs ZAWSZE czyści myślniki/artefakty na wyjściu — tu tylko wsparcie promptu).",
 
   "manifesto": {
     "one_liner": "Przewaga nad AI = naprawdę to przeżyłeś. Pisz to, co PRZEŻYŁEŚ, nie to, co należy robić.",
@@ -22,7 +22,8 @@
       "experience": "Pierwszoosobowe, przeżyte. Jest konkretna scena/moment/decyzja autora ('zrobiłem', 'zobaczyłem', 'wkurzyło mnie', 'o 2 w nocy'), a nie ogólna porada w trybie rozkazującym. 0 = czysty poradnik 'jak robić X'; 5 = wciągająca relacja z własnego doświadczenia.",
       "emotion": "Czy budzi reakcję, którą da się skomentować uczuciem? Napięcie, porażka przed sukcesem, kontrowersyjna teza, ulga. 0 = obojętne, encyklopedyczne; 5 = aż chce się odpisać.",
       "specificity": "Konkret zamiast ogólnika: realne liczby, nazwa systemu/stacku, moment w czasie, dokładny koszt/wynik. 0 = 'dużo/szybko/wiele firm'; 5 = '8 firm, 2400 zł/mc, 3 skrypty, 3500 zł jednorazowo'.",
-      "commentability": "Komentarzogenność — czy post daje konkretny POWÓD DO ODPISANIA: oś sporu, zamknięte pytanie z którym da się (nie)zgodzić, albo osobistą historię, którą czytelnik chce dorzucić od siebie. Dowód z konta: PL + porażka + liczby + pytanie-spór = 190 komentarzy; encyklopedyczny wykład 'X reguł' = 0-2 kom. mimo zasięgu. 0 = nie ma o co zaczepić, czyta się i scrolluje; 3 = jest jedno wyraźne zamknięte pytanie albo teza do kontry; 5 = aż się prosi o kontrę lub własną historię w komentarzu."
+      "commentability": "Komentarzogenność — czy post daje konkretny POWÓD DO ODPISANIA: oś sporu, zamknięte pytanie z którym da się (nie)zgodzić, albo osobistą historię, którą czytelnik chce dorzucić od siebie. Dowód z konta: PL + porażka + liczby + pytanie-spór = 190 komentarzy; encyklopedyczny wykład 'X reguł' = 0-2 kom. mimo zasięgu. 0 = nie ma o co zaczepić, czyta się i scrolluje; 3 = jest jedno wyraźne zamknięte pytanie albo teza do kontry; 5 = aż się prosi o kontrę lub własną historię w komentarzu.",
+      "saveability": "Czy post daje coś WIELOKROTNEGO UŻYTKU, co czytelnik zapisze, żeby wrócić: konkretny framework, checklistę, krok-po-kroku, zestaw liczb/progów, gotowy do skopiowania wzorzec. Save ≈ 5× zasięg like'a i jest dziś TOP sygnałem dystrybucji (research 2026). To MIĘKKI sygnał (bonus + rekomendacja formatu), NIE twarda bramka. 0 = czysta refleksja/historia bez nic-do-zapisania (to OK dla post-historii, niska saveability nie blokuje); 3 = jest jeden konkret wart zapisania; 5 = gęsty, samodzielny zasób (karuzela/checklista), który aż się prosi o zapis."
     },
     "thresholds": {
       "experience_min": 3,
@@ -102,6 +103,25 @@
     }
   },
 
+  "format_priority": {
+    "note": "Priorytet formatów wg researchu algorytmu 2026 (AuthoredUp 3M+ postów, van der Blom 1,3M). Używane przy DOBORZE formatu w idea-engine/draft (media_plan_items.format) i jako rekomendacja w qa-gate. Nie jest twardą bramką — tekst-historia bez wizuala dalej jest OK, gdy niesie przeżycie i komentarzogenność.",
+    "order": [
+      { "format": "carousel", "rank": 1, "why": "Dokument/karuzela (PDF) = #1: +39% zasięgu / +30% engagement vs średni post; napędza SAVE (top sygnał dystrybucji). Tylko ~5% twórców je robi = największa nisza. Warunek: realny framework/checklista/krok-po-kroku, nie ogólniki." },
+      { "format": "image", "rank": 2, "why": "Obraz = najwyższy mnożnik engagementu (1,33×), gdy AUTENTYCZNY (terminal/panel/realna rozmowa bota). Generowany banner/Canva zbija zasięg (test #11 autora)." },
+      { "format": "text", "rank": 3, "why": "Czysty tekst-historia: świetny do dwell-time i komentarzy, gorszy do save'ów. Najlepszy dla porażki/refleksji/opinii bez nic-do-zapisania." },
+      { "format": "video", "rank": 4, "why": "DEMOTE: krótkie wideo spadło ~36% r/r. Sensowne tylko long-form 3+ min z realną wartością. Domyślnie nie proponować." },
+      { "format": "poll", "rank": 5, "why": "RZADKO: ankieta daje zasięg (1,78×) ale zabija engagement (0,37×) — głosy to nie rozmowy. Pułapka zasięgowa, używać świadomie." }
+    ],
+    "weekly_mix": "Cel tygodniowy (3 posty Wt-Czw): 1× karuzela/dokument (save-driver) + 1× obraz autentyczny (engagement) + 1× tekst-historia (dwell+komentarze). Balansowane w idea-engine.config.json → format_mix."
+  },
+
+  "hashtags": {
+    "note": "Research 2026: posty BEZ hashtagów biją te z hashtagami o 5-10% (van der Blom); LinkedIn zdjął followowanie hashtagów. Hashtag to już nie dźwignia zasięgu.",
+    "default": "0-1 hashtaga (preferuj 0; ewentualnie 1 mocno trafiony w niszę na końcu)",
+    "hard_max": 3,
+    "rule": "Nigdy stackowania hashtagów ani #w #środku #zdania. Jeśli dodajesz — 1 na końcu, w niszy."
+  },
+
   "formats": {
     "note": "Reguły per format. media_kind z DB: null/text = tekst, image/IMAGE = obraz, video/VIDEO = wideo, carousel/pdf = karuzela, banner = grafika generowana.",
     "text": {
@@ -144,7 +164,9 @@
     "ZACHOWAJ BEZWZGLĘDNIE wszystkie fakty, liczby, nazwy i hashtagi z oryginału. NIE wymyślaj nowych liczb, scen, dat ani anegdot.",
     "Jeśli żeby było 'przeżyte' trzeba by COKOLWIEK zmyślić — nie zmyślaj. Zostaw to czym jest i zgłoś HOLD z feedbackiem, co autor ma dopisać z własnej głowy.",
     "Trzymaj polski, ton build-in-public, krótkie zdania, zero korpo-mowy.",
-    "Max 3 hashtagi na końcu. Stosuj politykę linków z sekcji 'links' — NIGDY nie przenoś linku do komentarza."
+    "LUDZKA TEKSTURA: pisz jak człowiek w pośpiechu, nie jak generator. Zmienna długość zdań (wrzuć krótkie, urywane obok dłuższego). Naturalne polskie spójniki ('no i', 'bo', 'więc', 'tyle że'). Bez efekciarskiej pauzy myślnikiem — jak chcesz pauzy, daj przecinek albo nowe zdanie. (Deterministyczny humanizer i tak wytnie myślniki/artefakty, ale pisz tak, żeby nie było czego ciąć.)",
+    "OTWARTA PĘTLA W HOOKU: pierwsza linia ma OTWORZYĆ napięcie/ciekawość (problem, porażka, sprzeczność), a NIE domknąć tematu. Czytelnik ma chcieć czytać dalej (dwell-time), nie 'wiedzieć już wszystko' z hooka.",
+    "Hashtagi wg sekcji 'hashtags': 0-1 na końcu (preferuj 0), twardy max 3. Stosuj politykę linków z sekcji 'links' — NIGDY nie przenoś linku do komentarza."
   ],
 
   "links": {
@@ -153,8 +175,9 @@
       "Link w pierwszym komentarzu = ZAKAZANY (auto-komentarze i tak są czyszczone w auto-publish).",
       "Link w treści posta = TYLKO gdy link jest sednem wartości posta (repo/narzędzie/launch = cały punkt, czytelnik realnie po niego przyszedł).",
       "Post-historia / refleksja / porażka / opinia = BEZ linka (max zasięg). Jak ktoś chce — link w DM/profilu.",
-      "Maksymalnie 1 link w treści. Link na końcu, nie w hooku."
+      "WYJĄTEK 'resource post' (research 2026: posty zbudowane wokół wielu wartościowych linków wypadają DOBRZE, w przeciwieństwie do 1 doklejonego linku): jeśli CAŁY post to kuratorowana lista zasobów, gdzie linki SĄ treścią (np. 'mój stack 5 narzędzi MCP + repo do każdego'), wiele linków jest OK i linkJustified=true. Pojedynczy link doklejony do zwykłej historii = nadal słabo.",
+      "Domyślnie maksymalnie 1 link w treści, na końcu, nie w hooku. Resource-post = wyjątek od limitu 1."
     ],
-    "judge": "Oceń linkJustified: czy link w treści jest sednem wartości tego konkretnego posta. Jeśli link jest, ale NIE jest sednem → linkJustified=false + zaproponuj w formatNotes: usunąć z treści, dać w DM/profilu. Nie przenoś do komentarza. Nie HOLD za to — tylko rekomendacja."
+    "judge": "Oceń linkJustified: czy link(i) w treści SĄ sednem wartości tego konkretnego posta. linkJustified=true gdy: (a) w treści nie ma linku, ALBO (b) link jest sednem (repo/narzędzie/launch), ALBO (c) to resource-post zbudowany wokół wielu wartościowych linków. linkJustified=false gdy pojedynczy link doklejony do historii/refleksji, która broni się bez niego → w formatNotes zaproponuj: usunąć z treści, dać w DM/profilu. Nie przenoś do komentarza. Nie HOLD za to — tylko rekomendacja."
   }
 }

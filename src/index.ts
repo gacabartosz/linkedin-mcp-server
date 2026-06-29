@@ -385,7 +385,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       inputSchema: {
         type: "object",
         properties: {
-          scopes: { type: "array", items: { type: "string" }, description: "OAuth scopes (default: openid, profile, w_member_social)" },
+          scopes: { type: "array", items: { type: "string" }, description: "OAuth scopes (default: openid, profile, w_member_social, r_member_postAnalytics)" },
         },
       },
     },
@@ -1356,7 +1356,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       // ── Auth ──────────────────────────────────────────────────────────
       case "linkedin_auth_start": {
         const input = AuthStartInput.parse(args);
-        const scopes = input.scopes || ["openid", "profile", "w_member_social"];
+        // r_member_postAnalytics → official impressions/reach per post (replaces the flaky
+        // Highcharts scrape). Requires the "Member Post Analytics" product enabled on the
+        // LinkedIn app; user must re-consent for the new scope to take effect.
+        const scopes = input.scopes || ["openid", "profile", "w_member_social", "r_member_postAnalytics"];
         const result = startAuth(scopes);
         return toolResult(result);
       }

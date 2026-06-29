@@ -35,6 +35,7 @@ const CLAUDE_BIN = '/Users/gaca/.local/bin/claude';
 
 const args = process.argv.slice(2);
 const DRY_RUN = args.includes('--dry-run');
+const SKIP_EXISTING = args.includes('--skip-existing');
 const limitIdx = args.indexOf('--limit');
 const POST_LIMIT = limitIdx >= 0 ? parseInt(args[limitIdx + 1], 10) : 100;
 
@@ -97,7 +98,7 @@ function callClaude(prompt) {
 
 function parseClaude(text) {
   if (!text) return null;
-  const m = text.match(/\{[\s\S]*"should_reply"[\s\S]*\}/);
+  const m = text.match(/\{[\s\S]*"reply"[\s\S]*\}/);
   if (!m) return null;
   try { return JSON.parse(m[0]); } catch { return null; }
 }
@@ -139,14 +140,21 @@ function saveThread(d) {
 function saveProposal(p) {
   if (DRY_RUN) { log(`  [DRY] proposal: ${p.proposedReply.slice(0, 60)}...`); return; }
   const db = new Database(ENGAGE_DB);
+  const now = new Date().toISOString();
   db.prepare(`
     INSERT OR IGNORE INTO reply_proposals
     (type, source_id, source_text, source_author, post_urn, post_text,
-     proposed_reply, lead_score, troll_risk, engagement_value, thread_context, status)
-    VALUES ('comment', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+     proposed_reply, original_reply, lead_score, troll_risk, engagement_value, thread_context,
+     temperature, tone, context_used, reasoning, parent_in_tree,
+     comment_created_at, post_created_at, status)
+    VALUES ('comment', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
   `).run(p.commentUrn, p.commentText, p.commentAuthor, p.postUrn, p.postText.slice(0, 500),
-         p.proposedReply, p.scoring.lead_score || 0, p.scoring.troll_risk || 0,
-         p.scoring.engagement_value || 0, p.threadContext.slice(0, 4000));
+         p.proposedReply, p.proposedReply, p.scoring.lead_score || 0, p.scoring.troll_risk || 0,
+         p.scoring.engagement_value || 0, p.threadContext.slice(0, 4000),
+         p.temperature || 3, p.tone || 'neutral',
+         JSON.stringify(p.contextUsed || []), (p.reasoning || '').slice(0, 500),
+         p.parentInTree || p.commentUrn,
+         p.commentTimestamp || now, p.postTimestamp || now);
   db.close();
 }
 
@@ -171,6 +179,25 @@ async function scrapePost(page, postUrn) {
   const replyBtns = await page.$$('button[aria-label*="repli"], button.comments-comment-item__show-replies-button');
   for (const b of replyBtns.slice(0, 10)) {
     try { await b.click(); await sleep(randInt(1500, 3000)); } catch {}
+  }
+
+  // DEFENSIVE: rozwiń obcięte komentarze — kliknij "więcej" / "see more" przy każdym
+  for (let i = 0; i < 3; i++) {
+    const seeMoreBtns = await page.$$([
+      'button.comments-comment-item__see-more',
+      'button.comments-comment-text-collapsed__see-more-button',
+      'button[aria-label="See more"]',
+      'button[aria-label="see more"]',
+      'button[aria-label="…więcej"]',
+      'button[aria-label*="Zobacz więcej"]',
+      'button[aria-label*="See more, visually"]',
+    ].join(', '));
+    if (seeMoreBtns.length === 0) break;
+    log(`    📖 Rozwijam ${seeMoreBtns.length} obciętych komentarzy ("więcej")`);
+    for (const b of seeMoreBtns) {
+      try { await b.click({ timeout: 2000 }); await sleep(randInt(200, 500)); } catch {}
+    }
+    await sleep(randInt(800, 1500));
   }
 
   return await page.evaluate(() => {
@@ -242,19 +269,21 @@ Oceń (1-5):
 - troll_risk: agresja/spam/trolling
 - engagement_value: pytanie/dyskusja
 
-should_reply = (lead≥${MIN_LEAD_OR_ENGAGE} OR engagement≥${MIN_LEAD_OR_ENGAGE}) AND troll≤${MAX_TROLL_RISK}
-
-UWAGA: To komentarz HISTORYCZNY (sprzed kilku tygodni). Odpowiadaj TYLKO jeśli:
-- konkretny lead (lead_score≥4)
-- ważne pytanie merytoryczne wciąż aktualne
-
 **JĘZYK ODPOWIEDZI:** wykryj język KOMENTARZA (nie postu, nie wątku — tylko komentarza "${targetComment.text}") i odpowiedz dokładnie w tym samym języku. Jeśli komentarz po polsku → odpowiedź po polsku. Jeśli po angielsku → odpowiedź po angielsku. Mieszany? — użyj dominującego.
 
-Jeśli should_reply=true, napisz odpowiedź 50-120 słów,
+ZAWSZE napisz odpowiedź 50-120 słów (user sam zdecyduje czy wysłać),
 bez "Świetny komentarz", "Dzięki za pytanie", zakończ pytaniem/obserwacją.
 
+UWAGA: To komentarz HISTORYCZNY (sprzed tygodni) — pamiętaj o kontekście.
+
+Dodaj metadane:
+- temperature: 1-5 (1=sucha, 5=mocna/ironiczna)
+- tone: formal|casual|ironic|empathetic|technical|provocative|neutral
+- context_used: lista max 4 KONKRETNYCH elementów które wykorzystałeś
+- reasoning: 1-2 zdania DLACZEGO ta odpowiedź
+
 ZWRÓĆ TYLKO JSON:
-{"lead_score": N, "troll_risk": N, "engagement_value": N, "should_reply": true|false, "reply": "...", "reasoning": "1 zdanie"}
+{"lead_score": N, "troll_risk": N, "engagement_value": N, "reply": "...", "temperature": N, "tone": "...", "context_used": ["..."], "reasoning": "..."}
 </zadanie>`;
 
   const out = await callClaude(prompt);
@@ -288,6 +317,12 @@ ZWRÓĆ TYLKO JSON:
       if (totalProposals >= MAX_PROPOSALS_TOTAL) {
         log(`Limit ${MAX_PROPOSALS_TOTAL} propozycji łącznie. Stop.`);
         break;
+      }
+      // Skip already scraped posts gdy flag --skip-existing
+      if (SKIP_EXISTING && alreadyInThreadMemory(post.post_urn)) {
+        log(`  ⊘ skip (już w thread_memory): ${post.post_urn.slice(0,40)}...`);
+        stats.skipped++;
+        continue;
       }
       stats.posts++;
       log(`\n[${stats.posts}/${posts.length}] ${post.post_urn}`);
@@ -333,20 +368,25 @@ ZWRÓĆ TYLKO JSON:
           const result = await generateProposal(cm, data.comments, ourReplies, data.postText || post.text, data.postAuthor || 'Bartosz Gaca', persona);
 
           if (!result) { log('    ⚠️  Claude nie zwrócił JSON'); stats.errors++; continue; }
-          log(`    lead=${result.lead_score} troll=${result.troll_risk} engage=${result.engagement_value} reply=${result.should_reply}`);
+          log(`    lead=${result.lead_score} troll=${result.troll_risk} engage=${result.engagement_value} temp=${result.temperature} tone=${result.tone}`);
 
-          if (result.should_reply && result.reply) {
+          if (result.reply) {
             saveProposal({
               commentUrn: cm.commentUrn, commentText: cm.text, commentAuthor: cm.author,
               postUrn: post.post_urn, postText: post.text,
               proposedReply: result.reply,
               scoring: { lead_score: result.lead_score, troll_risk: result.troll_risk, engagement_value: result.engagement_value },
               threadContext: data.comments.map(c => `${c.author}: "${c.text}"`).join('\n'),
+              temperature: result.temperature || 3,
+              tone: result.tone || 'neutral',
+              contextUsed: Array.isArray(result.context_used) ? result.context_used : [],
+              reasoning: result.reasoning || '',
+              parentInTree: cm.commentUrn,
             });
             totalProposals++; perPost++;
             log(`    ✅ Propozycja (${totalProposals}/${MAX_PROPOSALS_TOTAL})`);
           } else {
-            log(`    ⊘ Skip: ${result.reasoning}`);
+            log(`    ⊘ Skip: brak reply`);
             stats.skipped++;
           }
         }

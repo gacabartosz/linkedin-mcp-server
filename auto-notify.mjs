@@ -365,14 +365,23 @@ async function scheduleNext() {
 
 initDb();
 
-log('Auto-Notify Daemon uruchomiony');
-log(`Sprawdza notyfikacje co ~2h ± ${Math.round(JITTER_MAX_MS/60000)} min`);
-log(`Max ${MAX_PROPOSALS_PER_CYCLE} propozycji/cykl | threshold: lead/engage ≥ ${MIN_LEAD_OR_ENGAGE}, troll ≤ ${MAX_TROLL_RISK}`);
+// Tryb --once: pojedynczy sweep i wyjście (używany przez golden-hour.mjs w golden hour,
+// żeby propozycje odpowiedzi powstały od razu, a nie w następnym ~2h cyklu).
+if (process.argv.includes('--once')) {
+  log('Tryb --once: pojedynczy sweep notyfikacji (Golden Hour).');
+  checkNotifications()
+    .catch(e => log(`Błąd --once: ${e.message}`))
+    .finally(() => process.exit(0));
+} else {
+  log('Auto-Notify Daemon uruchomiony');
+  log(`Sprawdza notyfikacje co ~2h ± ${Math.round(JITTER_MAX_MS/60000)} min`);
+  log(`Max ${MAX_PROPOSALS_PER_CYCLE} propozycji/cykl | threshold: lead/engage ≥ ${MIN_LEAD_OR_ENGAGE}, troll ≤ ${MAX_TROLL_RISK}`);
 
-const initDelay = randInt(3, 12) * 60 * 1000;
-log(`Start za ${Math.round(initDelay/60000)} min...`);
+  const initDelay = randInt(3, 12) * 60 * 1000;
+  log(`Start za ${Math.round(initDelay/60000)} min...`);
 
-setTimeout(async () => {
-  await checkNotifications().catch(e => log(`Błąd inicjalny: ${e.message}`));
-  scheduleNext();
-}, initDelay);
+  setTimeout(async () => {
+    await checkNotifications().catch(e => log(`Błąd inicjalny: ${e.message}`));
+    scheduleNext();
+  }, initDelay);
+}

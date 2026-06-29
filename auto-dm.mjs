@@ -13,6 +13,10 @@ import { readFileSync, existsSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import Database from 'better-sqlite3';
+import {
+  buildDmPrompt, callClaude, parseClaudeJson, factCheck, retrieveKnowledge,
+  loadPersona as loadFullPersona,
+} from './lib/comment-gen.mjs';
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
@@ -238,32 +242,30 @@ Zwróć TYLKO JSON: {"action":"reply|skip|read_only","lead_score":N,"troll_risk"
   });
 }
 
-async function generateDMReply(msgText, senderName, persona) {
-  const prompt = `${persona.slice(0, 400)}
-
-Wiadomość od ${senderName}: "${msgText.slice(0, 400)}"
-
-Napisz krótką odpowiedź DM (40-100 słów). Zasady:
-- Bezpośrednio, po polsku (chyba że wiadomość po angielsku)
-- NIE zaczynaj od "Cześć ${senderName}," — za szablonowo
-- Odpowiedz na konkret, zadaj jedno pytanie jeśli potrzebne
-- Jeśli pyta o projekt/usługę: zaproponuj krótką rozmowę
-- Zero corporate BS
-
-Tylko treść wiadomości, nic więcej.`;
-
-  return new Promise((resolve) => {
-    const child = spawn('claude', ['-p', '--no-session-persistence', '--model', 'claude-haiku-4-5-20251001'], {
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
-    let out = '';
-    child.stdin.write(prompt);
-    child.stdin.end();
-    child.stdout.on('data', d => out += d);
-    child.on('close', () => resolve(out.trim() || 'Dzięki za wiadomość — odezwę się wkrótce.'));
-    child.on('error', () => resolve('Dzięki za wiadomość — odezwę się wkrótce.'));
-    setTimeout(() => { child.kill(); resolve('Dzięki za wiadomość — odezwę się wkrótce.'); }, 30000);
+// DM: ten sam pipeline co komentarze — Opus 4.8 + pełna persona + baza wiedzy + humanizer + fact-check.
+// Zwraca string (gotowa odpowiedź) albo null (gdy model nie zwrócił sensownej treści — wtedy NIE proponujemy).
+async function generateDMReply(msgText, senderName, persona, conversation) {
+  const kb = retrieveKnowledge(msgText || '');
+  if (kb.sources && kb.sources.length) log(`    📚 Baza wiedzy: ${kb.sources.join(', ')}`);
+  const prompt = buildDmPrompt({
+    persona, senderName,
+    lastMessage: (msgText || '').slice(0, 1500),
+    conversation, knowledge: kb.text,
   });
+  log(`    🧠 Opus 4.8 generuje odpowiedź DM...`);
+  const parsed = parseClaudeJson(await callClaude(prompt, { log: (m) => log(m.trim()) }));
+  let reply = (parsed && parsed.reply) ? String(parsed.reply).trim() : '';
+  if (!reply) { log('    ⚠️  DM: brak poprawnej odpowiedzi od Opusa — pomijam (nie proponuję śmiecia)'); return null; }
+
+  // Fact-check (potwierdź że nie kłamie) — z bazą wiedzy jako grounded
+  try {
+    const fc = await factCheck({ postText: '', threadContext: `${senderName}: ${msgText}`, proposedReply: reply, persona, knowledge: kb.text }, { log: (m) => log(m.trim()) });
+    if (fc.grounded === false) {
+      if (fc.fixed_reply) { log(`    🛡️  DM fact-check: poprawiono (${fc.unsupported_claims.length} konkretów)`); reply = fc.fixed_reply; }
+      else log(`    🚫 DM fact-check: HALLUCINATION_RISK — ${(fc.unsupported_claims || []).slice(0, 3).join('; ')} (do oceny w dashboardzie)`);
+    }
+  } catch {}
+  return reply;
 }
 
 // ── Daily limit check ────────────────────────────────────────────────────────
@@ -333,7 +335,7 @@ async function checkAndReply() {
   let liAt;
   try { liAt = getVoyagerCookie(); } catch (e) { log(`SKIP: ${e.message}`); return; }
 
-  const persona = loadPersona();
+  const persona = loadFullPersona();
   const messages = await fetchInboxMessages(liAt);
   log(`  Pobrano ${messages.length} konwersacji`);
 
@@ -376,6 +378,7 @@ async function checkAndReply() {
     await sleep(delay);
 
     const reply = await generateDMReply(msg.text, msg.senderName, persona);
+    if (!reply) { log('    Skip: brak sensownej odpowiedzi (nie proponuję).'); continue; }
     log(`    Odpowiedź: "${reply.slice(0, 80)}..."`);
 
     // PROPOSALS-FIRST: zapisz propozycję do DB, NIE wysyłaj automatycznie
