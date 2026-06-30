@@ -50,6 +50,18 @@ function isVideoFile(filePath) {
   return ext in VIDEO_MIME;
 }
 
+// Real-screenshot rule (user 2026-06-30: "dodawaj zawsze realne prtscr"):
+// the AUTOMATIC media fallbacks (media_plan text-match, POST_IMAGES by postKey)
+// must NEVER upload a generated banner/Gemini/stock image. Only curated real
+// screenshots live in .../images/posts/screens/ named real-* or shot-*.
+// Video files are allowed (real demos). media_preview_path is the trusted
+// explicit channel and is not gated here.
+function isRealScreenshot(p) {
+  if (!p) return false;
+  if (isVideoFile(p)) return true;
+  return /\/screens\/(real-|shot-)[^/]*\.(png|jpe?g)$/i.test(p);
+}
+
 // ── Logging ─────────────────────────────────────────────────────────────────
 
 function log(msg) {
@@ -673,8 +685,13 @@ async function checkAndPublish() {
               LIMIT 1`).get(post.text, post.text);
             mpDb.close();
             // Iter12: fallback też do visual_asset_path (NVIDIA FLUX), nie tylko banner_path
-            const mpBanner = (mpRow?.banner_path && existsSync(mpRow.banner_path)) ? mpRow.banner_path :
+            const mpCand = (mpRow?.banner_path && existsSync(mpRow.banner_path)) ? mpRow.banner_path :
                              (mpRow?.visual_asset_path && existsSync(mpRow.visual_asset_path)) ? mpRow.visual_asset_path : null;
+            // Real-screenshot gate: skip generated banners/Gemini stock images.
+            const mpBanner = isRealScreenshot(mpCand) ? mpCand : null;
+            if (mpCand && !mpBanner) {
+              log(`  Skipping media_plan visual (generated, not a real screenshot): ${mpCand}`);
+            }
             if (mpBanner) {
               log(`  Uploading image from media_plan_items: ${mpBanner}`);
               try {
@@ -719,7 +736,9 @@ async function checkAndPublish() {
           // Fallback to banner image or video
           if (mediaUrns.length === 0 && POST_IMAGES[postKey]) {
             const imgPath = POST_IMAGES[postKey];
-            if (existsSync(imgPath)) {
+            if (existsSync(imgPath) && !isRealScreenshot(imgPath)) {
+              log(`  Skipping POST_IMAGES (generated, not a real screenshot): ${imgPath}`);
+            } else if (existsSync(imgPath)) {
               const isVid = isVideoFile(imgPath);
               const mediaType = isVid ? 'VIDEO' : 'IMAGE';
               log(`  Uploading ${mediaType.toLowerCase()}: ${imgPath}`);
