@@ -102,6 +102,7 @@ PERSONA/TON: ${brand.voice?.persona ?? 'Builder-practitioner, nie influencer.'} 
 TWARDE REGUŁY:
 - JĘZYK: polski. Krótkie zdania, jedna myśl = jeden akapit, dużo enterów (mobile).
 - ZERO ZMYŚLANIA: użyj WYŁĄCZNIE faktów/liczb/scen z seeda. Brak materiału na konkret → napisz krócej i uczciwie, NIE dorabiaj liczb ani anegdot.
+- ANTY-PRZECHWAŁKA: NIE wymieniaj konkretnych integracji/źródeł (ZUS, KSeF, KRS, rejestr.io, CRBR, konkretne API rządowe) ani LICZBY narzędzi jako DZIAŁAJĄCYCH, jeśli seed tego wprost nie potwierdza. Część integracji jest wyłączona — wyliczanka „odpytuję X, Y, Z, 19 narzędzi" to halucynacja. Pisz OGÓLNIE ("po NIP sprawdzam w publicznych rejestrach"), bez nazw źródeł i liczników, których seed nie gwarantuje.
 - Hook (pierwsza linia, ≤ ${brand.hook_max_chars ?? 210} zn): problem albo PORAŻKA pierwsza, nie sukces.
 - Relacja pierwszoosobowa „zrobiłem/zobaczyłem/wkurzyło mnie", pokaż drogę i błąd PRZED wynikiem. NIE listicle („X sposobów"), NIE tryb rozkazujący.
 - Zakończ DOKŁADNIE tym zamkniętym pytaniem-sporem: "${(mpi.cta || '').replace(/"/g, "'")}" (jeśli puste — wymyśl jedno zamknięte pytanie-spór z treści).
@@ -162,7 +163,11 @@ function main() {
     log(`   → ${post.length} zn. | hook: ${post.split('\n')[0].slice(0, 90)}`);
     if (mediaKind(mpi.format) !== 'TEXT') log(`   ⓘ format ${mpi.format}: draft tekstowy gotowy; wizual (banner/screen) dorobić przed publikacją.`);
 
-    if (DRY) { log('   (--dry: nie zapisuję)'); ok++; continue; }
+    if (DRY) {
+      log('   (--dry: nie zapisuję) — pełny draft poniżej:');
+      console.log('\n──────── DRAFT ────────\n' + post + '\n───────────────────────\n');
+      ok++; continue;
+    }
 
     const postId = randomUUID();
     const tx = db.transaction(() => {

@@ -59,6 +59,7 @@ const PRE = {
   exp: algo.scoring?.thresholds?.experience_min ?? 3,
   spec: algo.scoring?.thresholds?.specificity_min ?? 3,
   comm: algo.scoring?.thresholds?.commentability_min ?? 2,
+  lead: Number(argVal('--min-lead', cfg.defaults?.lead_fit_min ?? 2)), // cel=klient: odetnij czysty peer-flex (0-1)
 };
 const DAYS = Number(argVal('--days', cfg.defaults?.days ?? 14));
 const MAX_COMMITS = cfg.defaults?.max_commits_per_repo ?? 50;
@@ -97,7 +98,7 @@ function buildPrompt(project, digest) {
   const baitPatterns = fit.bait?.patterns || [];
   const fmtMix = cfg.format_mix || {};
   return `Jesteś researcherem treści build-in-public dla profilu LinkedIn Bartosza Gacy.
-Nisze (tylko te): AI-automation (MCP/Claude Code/boty/automatyzacje) oraz polskie e-gov/open-data (KSeF/ZUS/ARiMR/IRZ/dane publiczne).
+Nisze (tylko te): AI-automation (MCP/Claude Code/boty/automatyzacje) oraz polskie rejestry/dane publiczne — ALE wyłącznie te realnie zintegrowane i DZIAŁAJĄCE w narzędziach autora (potwierdzone w commitach). NIE zakładaj, że jakaś integracja rządowa istnieje/działa, jeśli commity tego nie pokazują.
 
 Dostajesz PRAWDZIWE commity z projektu "${project.name}" (nisza: ${project.niche}).
 Wyciągnij od 0 do ${MAX_PER_REPO} POMYSŁÓW NA POST opartych na PRZEŻYTYCH momentach z tych commitów.
@@ -110,6 +111,7 @@ ${algo.manifesto.principles.map((p, i) => `${i + 1}. ${p}`).join('\n')}
 - TYLKO na podstawie commitów. ZERO ZMYŚLANIA. Jeśli commity są trywialne / nie ma z czego zrobić historii → zwróć pustą listę.
 - Każdy pomysł = prawdziwy moment: co się WYSYPAŁO / co NAPRAWIŁEŚ / jaką PODJĄŁEŚ decyzję / co ZASKOCZYŁO. Pierwszoosobowo.
 - Liczby TYLKO realne (z treści commitów). Nie wymyślaj metryk.
+- ANTY-PRZECHWAŁKA (twarde): NIE wymieniaj konkretnych integracji/źródeł (np. ZUS, KSeF, KRS, rejestr.io, CRBR, konkretnych API rządowych) ani LICZBY narzędzi ("19 tools") jako DZIAŁAJĄCYCH, jeśli commity wprost tego nie potwierdzają. Część integracji jest wyłączona/niedziałająca — wyliczanka „odpytuję X, Y, Z" to halucynacja, jeśli X/Y/Z realnie nie działają. W razie wątpliwości pisz OGÓLNIE o możliwości ("sprawdzam po NIP w publicznych rejestrach"), bez nazywania konkretnych źródeł i bez liczników.
 - NIGDY nazw klientów, nazwisk, danych identyfikujących osoby/firmy. Pisz o SWOIM narzędziu/automatyzacji.
 - JĘZYK: WYŁĄCZNIE polski. Profil jest polskojęzyczny — pomysł po angielsku ma martwy zasięg i bramka i tak go odrzuci. Pisz po polsku.
 - Hook: problem albo porażka pierwsza (nie sukces), ≤ 200 znaków.
@@ -122,6 +124,13 @@ POZA niszą (NIE proponuj) = ${offNiche.join(' | ')}.
 ZAKAZ baitu/lead-magnetu (NIE proponuj takich CTA): ${baitPatterns.join(' | ')}.
 
 KOMENTARZOGENNOŚĆ: każdy pomysł MUSI mieć closing_question — JEDNO zamknięte pytanie-spór, z którym da się (nie)zgodzić (nie puste „a co myślisz?"). To główny driver komentarzy.
+
+═══ CEL NADRZĘDNY = KLIENT, NIE SAM ZASIĘG ═══
+Zasięg to pojazd, nie cel. Cel: żeby pod postem wylądował POTENCJALNY KLIENT i pomyślał „ta osoba rozwiąże mój problem, chcę pogadać".
+- ICP (kto ma to przeczytać i chcieć kupić): właściciel/menedżer/founder polskiego MŚP z realnym bólem operacyjnym (ręczna powtarzalna robota, KSeF/ZUS/e-gov/papierologia, chaos w procesach, dane rozjechane po Excelach) — ktoś, kto ZAPŁACIŁBY za automatyzację albo konsulting AI/Claude Code/MCP.
+- Każdy pomysł musi nieść PRZEKŁADALNY EFEKT BIZNESOWY widoczny dla nie-technicznego decydenta: zaoszczędzony czas/pieniądze, zlikwidowany błąd, proces który „robi się sam". Ból klienta na wierzchu; technologia to DOWÓD, nie bohater.
+- ODRZUCAJ czysty flex techniczny zrozumiały tylko dla devów (debata o frameworku/ABI/składni), jeśli nie da się go przełożyć na korzyść dla klienta. Viral wśród peerów bez kupującego = porażka.
+- lead_trigger = konkretny ból ICP, który ten post nazywa po imieniu (tak, by klient pomyślał „to o mnie").
 
 DOBÓR FORMATU (research 2026 — dokument/karuzela = #1, napędza save'y):
 - format="carousel" GDY ${fmtMix.prefer_carousel_when || 'materiał układa się w framework/checklistę/krok-po-kroku z realnymi liczbami'}.
@@ -140,10 +149,12 @@ Dla każdego pomysłu zwróć:
 - closing_question: jedno zamknięte pytanie-spór na koniec posta
 - niche: "ai-automation" lub "e-gov"
 - format: "text" | "image" | "carousel"
-- lead_trigger: jaki problem odbiorcy ten post adresuje (1 zdanie)
+- lead_trigger: konkretny ból ICP (potencjalnego klienta), który ten post nazywa po imieniu (1 zdanie, język klienta nie dewelopera)
+- client_value: jednozdaniowy przekładalny efekt biznesowy, który klient z tego wyniesie (czas/pieniądze/mniej błędów/proces sam się robi)
 - est_experience, est_specificity, est_commentability: UCZCIWA estymacja 0-5, jak mocno ten surowiec wypadnie w bramce (experience=przeżyta scena, specificity=realne liczby, commentability=czy pytanie-spór realnie prowokuje kontrę). Bądź surowy — to filtr, nie autoreklama.
+- est_lead_fit: UCZCIWA estymacja 0-5 — czy POTENCJALNY KLIENT (ICP wyżej, nie peer-dev) przeczyta i pomyśli „chcę z tym gościem pogadać". 0 = tylko devów zainteresuje / czysty flex; 3 = klient widzi swój ból i że autor to ogarnia; 5 = klient aż chce napisać DM. Bądź surowy.
 
-Wypisz WYŁĄCZNIE surowy JSON (bez markdown): {"ideas":[{"title":"","hook":"","hook_variants":[],"scene":"","numbers":[],"closing_question":"","niche":"","format":"","lead_trigger":"","est_experience":0,"est_specificity":0,"est_commentability":0}]}
+Wypisz WYŁĄCZNIE surowy JSON (bez markdown): {"ideas":[{"title":"","hook":"","hook_variants":[],"scene":"","numbers":[],"closing_question":"","niche":"","format":"","lead_trigger":"","client_value":"","est_experience":0,"est_specificity":0,"est_commentability":0,"est_lead_fit":0}]}
 
 COMMITY:
 <<<GIT
@@ -190,7 +201,7 @@ function main() {
   let nextTopic = (db.prepare('SELECT COALESCE(MAX(topic_number),0) m FROM media_plan_items').get().m) + 1;
   const existing = new Set(db.prepare("SELECT title FROM media_plan_items").all().map(r => norm(r.title)));
 
-  log(`Idea Engine — ${projects.length} repo, okno ${DAYS} dni${DRY ? ' (DRY)' : ''} | pre-check exp≥${PRE.exp} spec≥${PRE.spec} comm≥${PRE.comm}`);
+  log(`Idea Engine — ${projects.length} repo, okno ${DAYS} dni${DRY ? ' (DRY)' : ''} | pre-check exp≥${PRE.exp} spec≥${PRE.spec} comm≥${PRE.comm} lead-fit≥${PRE.lead}`);
   let total = 0, skippedDup = 0, droppedWeak = 0;
 
   for (const p of projects) {
@@ -215,15 +226,22 @@ function main() {
       const eExp = Number(idea.est_experience ?? 0);
       const eSpec = Number(idea.est_specificity ?? 0);
       const eComm = Number(idea.est_commentability ?? 0);
+      const eLead = Number(idea.est_lead_fit ?? 0); // cel=klient, nie sam zasięg
       if (eExp < PRE.exp || eSpec < PRE.spec || eComm < PRE.comm) {
         droppedWeak++;
         log(`    ✗ słaby seed (est exp ${eExp}/spec ${eSpec}/comm ${eComm} < ${PRE.exp}/${PRE.spec}/${PRE.comm}): ${idea.title}`);
+        continue;
+      }
+      if (eLead < PRE.lead) {
+        droppedWeak++;
+        log(`    ✗ peer-flex, nie pod klienta (est lead-fit ${eLead} < ${PRE.lead}): ${idea.title}`);
         continue;
       }
 
       const seed = [
         idea.scene,
         (idea.numbers?.length ? 'Liczby: ' + idea.numbers.join('; ') : ''),
+        (idea.client_value ? 'Korzyść dla klienta: ' + idea.client_value : ''),
         (idea.closing_question ? 'Pytanie-spór: ' + idea.closing_question : ''),
       ].filter(Boolean).join('\n\n');
       // Hook Lab: zbierz unikalne warianty (zawsze z głównym hookiem w środku), przytnij do limitu.
@@ -248,8 +266,9 @@ function main() {
         live_signal: `git:${p.name} ${count} commitów / ${DAYS}d`,
       };
 
-      log(`    💡 [${row.icp}/${row.format}] ${row.title}`);
+      log(`    💡 [${row.icp}/${row.format}] lead-fit ${eLead}/5 (exp ${eExp} spec ${eSpec} comm ${eComm}) ${row.title}`);
       log(`        hook: ${row.hook.slice(0, 90)}`);
+      if (idea.client_value) log(`        klient: ${String(idea.client_value).slice(0, 90)}`);
 
       if (!DRY) {
         db.prepare(`INSERT INTO media_plan_items
