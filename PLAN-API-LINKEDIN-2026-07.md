@@ -99,6 +99,32 @@ Wykluczone jako przyczyny: wersja API (testowane 202503–202507, 202412, 202409
 
 → **Jedyna droga do impressions i zasięgu: `Products → Request upgrade` w portalu.** Zadanie po stronie Bartka.
 
+### Dev Tier: analityka ORG działa, analityka MEMBER nie (2026-07-27)
+
+Doprecyzowanie powyższego. Development Tier **nie jest** globalną blokadą analityki — dzieli ją po podmiocie:
+
+| Zasób | Wynik |
+|---|---|
+| `organizationAcls` FINDER roleAssignee | ✅ 200 — **3 strony z rolą ADMINISTRATOR** |
+| `organizations/{id}` | ✅ 200 |
+| `organizationalEntityShareStatistics` | ✅ 200 — **zwraca `impressionCount`, `uniqueImpressionsCount`, `clickCount`, `engagement`, `likeCount`, `commentCount`, `shareCount`** |
+| `organizationPageStatistics` | ✅ 200 — odsłony strony po urządzeniu/zakładce |
+| `organizationalEntityFollowerStatistics` | ✅ 200 — demografia po senioralności/branży/typie powiązania |
+| `posts` FINDER author (org URN) | ✅ 200 |
+| `memberCreatorPostAnalytics`, `memberFollowersCount` | ❌ 404 |
+| `networkSizes/{id}` | ❌ 400 — zły `edgeType`, do ustalenia |
+
+**Strony, na których Bartosz jest ADMINISTRATOR:**
+- `urn:li:organization:72198432` — **reklamacje24.pl** (vanity `reklamancje24` — literówka w vanity)
+- `urn:li:organization:109990139` — **OdpiszNaPismo.pl**
+- `urn:li:organization:134844053` — **bartoszgaca.pl** (ta z `.env`)
+
+**Ale wszystkie trzy mają 0 postów i 0 impressions.** Pipeline analityczny działa, tylko nie ma czego mierzyć — cała treść jest na profilu osobistym. `bartoszgaca.pl` ma 1 followersa.
+
+**Wykluczone hipotezy dla 404 (nie zgadywanie, testy):** wersja API (8 wariantów), nazwa findera (`me`/`entity`/`criteria`/brak), brak scope'a (introspekcja), zły token (`/rest/me` = 200), **brak nagłówka `X-RestLi-Method: FINDER`** (dodany — bez zmiany; kontrolnie `organizationAcls` działa i z nim, i bez).
+
+**Wniosek strategiczny:** impressions po API są osiągalne dziś, ale tylko dla treści publikowanej **jako strona**. Profil osobisty ma ~8801 followersów, strona ma 1 — przenoszenie tam publikacji byłoby autosabotażem przy celu „klienci". Właściwa droga to `Request upgrade` dla analityki profilu; strona firmowa jako **uzupełnienie** (cross-posting), nie zamiennik.
+
 ### Niewiadome rozstrzygnięte
 - **N1 (posts FINDER author dla person)** — częściowo: `400 „Member permissions must be used when using member as author"`. Finder istnieje dla członka, wymaga innego trybu uprawnień. Do dokończenia.
 - **N3 (eventSubscriptions)** — **hipoteza H1 potwierdzona**: `400 „Parameter 'eventType' is required"`. To realny zasób subskrypcji zdarzeń (webhooki), nie lista uczestników Events. Push zamiast pollingu jest możliwy.
