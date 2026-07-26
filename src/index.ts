@@ -10,7 +10,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 
-import { ensureDataDirs, config } from "./utils/config.js";
+import { ensureDataDirs, config, logConfigProblems } from "./utils/config.js";
 import { log } from "./utils/logger.js";
 import { toolError, toolResult } from "./utils/errors.js";
 import { startAuth } from "./api/auth.js";
@@ -2359,6 +2359,11 @@ async function main(): Promise<void> {
     );
     process.exit(0);
   }
+
+  // Surface credential/flag problems on stderr at startup instead of failing
+  // later with an opaque 401. Never fatal — a missing optional key degrades one
+  // feature, not the whole server.
+  logConfigProblems();
 
   // Start scheduler daemon alongside MCP server
   startSchedulerDaemon();

@@ -27,3 +27,7 @@ skills-cleanup/
 *.bak-v2
 INCIDENT-*.md
 scripts/insert-post-2026-06-08.mjs
+
+# zawiera sekrety OAuth — nigdy do repo (remote publiczny)
+.mcp.json
+.mcp.json.bak*
