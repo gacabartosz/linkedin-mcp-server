@@ -70,7 +70,70 @@ Reszta (feed, search, DM, zaproszenia, analityka, sieć)
 
 ---
 
+## 1.4 WYNIKI WERYFIKACJI — 2026-07-26 (nadrzędne nad resztą dokumentu)
+
+Faza 1 i 2 wykonane. Poniższe wyniki pochodzą z realnych wywołań API, nie z dokumentacji, i **unieważniają część założeń z sekcji 2 i 6**.
+
+### Token org — zdobyty
+- wszystkie **12 scope'ów** przyznane (potwierdzone `introspectToken`: `active=true`, `auth_type=3L`)
+- **`refresh_token` ważny do 2027-07-26** → koniec ręcznego odnawiania
+- access token: 2 miesiące (do 2026-09-24), odnawialny
+- tożsamość: `/rest/me` → `Bartosz Gaca` / `bartoszgaca` / `urn:li:person:PHp-Tl1fZw`
+  (uwaga: **inny person ID niż w apce osobistej** — LinkedIn nadaje ID per aplikacja)
+
+### Probe: 1/20 → 10/20 endpointów
+
+| Działa (200) | Nie działa |
+|---|---|
+| `/rest/me`, `/rest/industries`, `/rest/connections/{id}` | `memberCreatorPostAnalytics` → **404** |
+| `/rest/socialMetadata/{entity}` | `memberCreatorVideoAnalytics` → **404** |
+| `/rest/socialActions/{t}/comments`, `/likes` | `memberFollowersCount` → **404** |
+| `/rest/organizationAcls` | `/v2/userinfo` → 403 (brak `openid` w tej apce) |
+| `/rest/adTargetingFacets`, `/rest/geoTypeahead`, `/rest/seniorities` | `/rest/posts/{urn}` → 403 |
+
+### PRZYCZYNA BLOKADY: Development Tier
+Produkt **Community Management API** jest w apce w wersji **Development Tier** (jedyny dodany produkt).
+Dev Tier **przyznaje scope'y na ekranie zgody, ale nie udostępnia zasobów analityki członka.**
+Wykluczone jako przyczyny: wersja API (testowane 202503–202507, 202412, 202409, 202306), nazwa findera
+(`q=me`/`q=entity`/`q=criteria`/bez `q`), brak scope'a (introspekcja potwierdza), zły token (`/rest/me` = 200).
+
+→ **Jedyna droga do impressions i zasięgu: `Products → Request upgrade` w portalu.** Zadanie po stronie Bartka.
+
+### Niewiadome rozstrzygnięte
+- **N1 (posts FINDER author dla person)** — częściowo: `400 „Member permissions must be used when using member as author"`. Finder istnieje dla członka, wymaga innego trybu uprawnień. Do dokończenia.
+- **N3 (eventSubscriptions)** — **hipoteza H1 potwierdzona**: `400 „Parameter 'eventType' is required"`. To realny zasób subskrypcji zdarzeń (webhooki), nie lista uczestników Events. Push zamiast pollingu jest możliwy.
+- **N4 („Application 3-legged" bez scope'a)** — **TAK, ale nie darmowo.** Na tokenie osobistym: 403. Na tokenie org: **200**. Czyli wymagają produktu, nie scope'a. **Faza 8 (market intel, sizing ICP) jest wykonalna.**
+
+### ⚠️ KOREKTA ZAŁOŻENIA: API zaniża reakcje o 56%
+
+| Źródło (23 wspólne posty) | Suma reakcji |
+|---|---|
+| Eksport XLSX LinkedIna | **332** |
+| `socialMetadata` z API | **146** (44%) |
+
+**23 z 23 postów zaniżone, ani jeden zawyżony.** Systematyczne, nie szum. Przyczyna nieustalona (hipotezy: reakcje z usuniętych kont, reakcje na repostach pod innym URN) — **do zweryfikowania, nie do zgadywania**.
+
+**Skutek dla planu:** teza „API = źródło prawdy, XLSX = historia" z Fazy 3 jest **błędna dla liczb sumarycznych**.
+Nowa reguła:
+- **sumy reakcji → XLSX** (eksport LinkedIna jest kompletniejszy)
+- **typy reakcji (like/empathy/interest/praise) → API** (XLSX tego nie ma wcale — to unikalna wartość API)
+- **impressions/zasięg → XLSX**, dopóki nie ma upgrade'u tieru
+
+### Limity Development Tier — pierwszy twardy fakt
+**429 Too Many Requests po ~110 wywołaniach** w kilka minut. `API_DAILY_BUDGET=500` był zgadywanką i jest za wysoki. Faza 9 (throttling) przestaje być teorią.
+
+### Błąd popełniony i naprawiony (lekcja do zasady A)
+Pierwsza wersja `scripts/backfill-social-metadata.mjs` robiła upsert do `social_metadata` i **nadpisała 5 wierszy gorszymi danymi** (post `7434531282274992128`: 27 reakcji → 1). Złamanie zasady A przez własny skrypt.
+
+Naprawa strukturalna: `social_metadata` przywrócone z backupu (34 wiersze, wartości oryginalne), dane z API w **osobnej tabeli `api_social_metadata`** (90 wierszy), skrypt fizycznie nie może już dotknąć `social_metadata`.
+
+**Wniosek ogólny:** dwa źródła o różnej kompletności **nie mogą dzielić jednego wiersza**. Każde źródło = własna tabela. Bramka driftu wyłapała to zanim dane trafiły do dashboardu.
+
+---
+
 ## 2. Macierz zdolności — na podstawie OFICJALNEJ listy endpointów
+
+> ⚠️ Sekcja pisana przed weryfikacją. Gdzie kłóci się z **1.4**, obowiązuje 1.4.
 
 Sekcja przepisana. Nie ma tu już „kandydatów do zgadywania" — są potwierdzone ścieżki, metody i scope'y.
 
@@ -305,14 +368,23 @@ Nietknięte: `xlsx_top_posts` (100) · `creator_analytics` (2 202) · `post_metr
 | 3.7 | `scripts/api-backfill-analytics.mjs` 🆕 | 152 posty × 5 metryk, throttling, checkpoint (wznawialny) |
 | 3.8 | `scripts/drift-check.mjs` 🆕 | API vs XLSX vs scraper → `source_drift`; rozjazd > 10 % = alarm |
 
-### 6.3 Warstwa wyboru źródła
+### 6.3 Warstwa wyboru źródła — POPRAWIONA po weryfikacji 2026-07-26
 
-`resolveMetric(postUrn, metric)` → `{ value, source, fetched_at, stale }`. Hierarchia:
-```
-api (< 48 h) → api (starsze, z etykietą wieku) → xlsx („eksport ręczny z <data>")
-→ scraper („nieoficjalne") → null → UI pokazuje „—"
-```
+`resolveMetric(postUrn, metric)` → `{ value, source, fetched_at, stale }`.
+
+Pierwotnie hierarchia była „api → xlsx → scraper" dla wszystkich metryk. **To błąd** — probe wykazał, że API zaniża reakcje o 56%. Hierarchia jest teraz **per metryka**, nie globalna:
+
+| Metryka | Priorytet źródeł | Dlaczego |
+|---|---|---|
+| `impressions`, `members_reached` | xlsx → (api po upgrade tieru) → scraper | API niedostępne w Dev Tier (404) |
+| `reactions_total` | **xlsx** → scraper → api | API zaniża o 56% (332 vs 146 na 23 postach) |
+| `reactions_by_type` (like/empathy/interest/praise) | **api** → brak | jedyne źródło; XLSX tego nie ma |
+| `comments` | xlsx → api (1. poziom) → scraper | API nie zwraca `aggregatedTotalComments` |
+| `followers` | xlsx → (api po upgrade) | `memberFollowersCount` → 404 |
+
 **Nigdy nie zwraca liczby bez źródła.** To implementacja zasady D.
+
+**Zasada strukturalna wyciągnięta z incydentu:** każde źródło zapisuje do **własnej tabeli** (`social_metadata` = scraper, `api_social_metadata` = API, `xlsx_top_posts` = eksport). Żaden import nie robi upsertu do tabeli innego źródła. Porównania robi warstwa odczytu, nie zapis.
 
 ### DoD
 `api_post_analytics` ma dane dla ≥ 90 % postów z `post_urn` · wykresy impressions świeższe niż 48 h · `source_drift` policzony i opisany · `USE_API_ANALYTICS=0` przywraca dokładnie stare zachowanie.
@@ -546,17 +618,19 @@ Wszystkie stare route'y odpowiadają identycznie (snapshot-test przed/po) · 6 n
 
 | Faza | Zależy od | Rozmiar | Blokada |
 |---|---|---|---|
-| 0 — Higiena | — | S | **nowy secret od Bartosza** |
-| 1 — OAuth | 0 | S | **klik zgody w przeglądarce** |
-| 2 — Weryfikacja endpointów | 1 | M | — |
-| 3 — Analityka członka | 2 | **L** | — |
-| 4 — Social feed | 2 | M | — |
-| 5 — Media (dokumenty, wideo) | 2 | M | — |
-| 6 — Odcięcie scrapera | 3, 4 | M | N1 |
-| 7 — Company Page | 2 | **L** | rola admina |
-| 8 — Market intel | 2 | M | N4 |
-| 9 — Dyscyplina | 3 | M | — |
+| 0 — Higiena | — | S | ✅ **zamknięta** (commit `5661a48`) |
+| 1 — OAuth | 0 | S | ✅ **zamknięta** — token org, 12 scope'ów, refresh do 2027 |
+| 2 — Weryfikacja endpointów | 1 | M | ✅ **zamknięta** — 10/20, przyczyna blokady ustalona |
+| 3 — Analityka członka | 2 | **L** | 🔴 **ZABLOKOWANA: Development Tier** → `Request upgrade` |
+| 4 — Social feed | 2 | M | 🟡 **częściowo zrobiona** — `socialMetadata` działa, 90 postów w `api_social_metadata` |
+| 5 — Media (dokumenty, wideo) | 2 | M | gotowa do startu |
+| 6 — Odcięcie scrapera | 3, 4 | M | wstrzymana — API zaniża reakcje, scraper i XLSX zostają |
+| 7 — Company Page | 2 | **L** | `organizationAcls` = 200; brakuje `LINKEDIN_ORG_URN` w probe |
+| 8 — Market intel | 2 | M | ✅ **odblokowana** — N4 potwierdzone, endpointy 200 |
+| 9 — Dyscyplina | 3 | M | 🔺 **PRIORYTET** — 429 po ~110 wywołaniach, budżet 500 za wysoki |
 | 10 — Dashboard | 3–9 | **L** | — |
+
+**Zmiana priorytetów po weryfikacji:** Faza 9 (limity) awansuje przed Fazę 5 i 8 — bez throttlingu każdy backfill kończy się 429. Faza 3 czeka na decyzję LinkedIna o tierze i nie blokuje pozostałych.
 
 Fazy 3, 4, 5, 7, 8 są od siebie niezależne — mogą iść równolegle po Fazie 2. Faza 10 domyka całość.
 
@@ -566,11 +640,42 @@ Fazy 3, 4, 5, 7, 8 są od siebie niezależne — mogą iść równolegle po Fazi
 
 ## 16. Checklista wykonawcza
 
-**Faza 0** — [ ] regeneracja secretu (Bartosz) · [ ] redirect `:8586/callback` · [ ] status *Approved* + tier · [ ] podmiana secretu w `.env` · [ ] `LINKEDIN_ORG_SCOPES` + 5 flag · [ ] `config.ts` + walidacja · [ ] backup 5 baz · [ ] commit org-auth · [ ] `.nvmrc` + `npm rebuild` · [ ] regresja: 71 narzędzi, dashboard 200
+**Faza 0** — ✅ **ZAMKNIĘTA 2026-07-26**, commit `5661a48`, poza dwoma punktami z portalu
+- [~] regeneracja secretu — **Bartosz zdecydował zostawić obecny sekret** (podał go powtórnie). Decyzja świadoma, odnotowana.
+- [ ] **redirect `http://localhost:8586/callback`** (Bartosz, portal) ← blokuje Fazę 1
+- [ ] **status *Approved* + tier** (Bartosz, portal) ← blokuje Fazę 1
+- [x] sekret w `.env` — okazał się już identyczny z podanym, bez zmian
+- [x] `LINKEDIN_ORG_SCOPES` (12) + 5 flag, wszystkie domyślnie `0`
+- [x] `config.ts`: loader `.env`, `orgScopes`, flagi, `apiDailyBudget`, `dbPaths`, `validateConfig()` / `logConfigProblems()`
+- [x] `index.ts`: walidacja na starcie (stderr, nigdy fatalna)
+- [x] backup 5 baz → `*.db.bak-faza0-20260726`
+- [x] commit org-auth (`auth.ts`, `client.ts`) razem z konfiguracją
+- [x] `.nvmrc` = `22.22.0` — **korekta planu:** `npm rebuild` byłby błędem, binding jest zbudowany pod ABI 127 (Node 22); to shell miał złą wersję. Rebuild pod v20 zepsułby działający dashboard.
+- [x] regresja: build czysty, `tools/list` = **71**, `validateConfig()` = **0 problemów** w czystym env, dashboard `:6767` HTTP 200 na tym samym PID 2270
 
-**Faza 1** — [ ] `auth_start` z `app` · [ ] autoryzacja org (12 scope'ów) · [ ] weryfikacja `refresh_token` · [ ] auto-refresh · [ ] `auth_status` z dwoma tokenami · [ ] zadanie: reautoryzacja apki osobistej do 2026-08-15
+**Znalezione i naprawione poza planem (Faza 0):**
+- [x] **`.mcp.json` zawierał sekrety OAuth i nie był w `.gitignore`**, przy publicznym remote. Nigdy nie trafił do gita (`git log -S` = pusto) — dodany do `.gitignore` razem z backupami.
+- [x] **Rozjazd apek:** `.env` i `.mcp.json` miały **różne** Client ID apki osobistej. `introspectToken` (2026-07-26) potwierdził: token z `auth.json` należy do apki z `.env` (`active=true`), a apka z `.mcp.json` → `active=false`. Każda reautoryzacja przez MCP nadpisałaby `auth.json` tokenem **innej apki**, a refresh nigdy by nie zadziałał. Naprawione: sekrety usunięte z `.mcp.json`, `.env` = jedyne źródło prawdy, `GEMINI_API_KEY` przeniesiony do `.env`.
+- [ ] **Wymaga restartu serwera MCP** (`/mcp`), aby proces `priv-linkedin` przeszedł na credentiale z `.env`. Do czasu restartu działa na starych zmiennych wstrzykniętych przy starcie.
 
-**Faza 2** — [ ] `scripts/api-probe.mjs` · [ ] probe read-only wszystkich endpointów z sekcji 2 · [ ] probe zapisów na poście testowym · [ ] rozstrzygnięcie N1 · [ ] N2 · [ ] N3 · [ ] N4 · [ ] `docs/API-CAPABILITY-MATRIX.md`
+**Faza 1** — ✅ **ZAMKNIĘTA 2026-07-26**
+- [x] `scripts/org-auth.mjs` (zamiast parametru `app` w MCP — działający serwer trzymał starą konfigurację)
+- [x] autoryzacja org — **12/12 scope'ów** przyznanych
+- [x] `refresh_token` — **JEST**, ważny do 2027-07-26
+- [x] naprawiony bug: `scope.split(" ")` → LinkedIn zwraca scope'y **po przecinku** (dawało fałszywe „1/12")
+- [x] naprawiony bug: `/v2/userinfo` daje 403 dla apki org (brak `openid`) → fallback na `/rest/me`
+- [x] `LINKEDIN_OAUTH_TIMEOUT_MIN` — okno callbacku było zaszyte na 5 min, za krótko na ludzki workflow
+- [ ] `auth_status` z dwoma tokenami (do zrobienia)
+- [ ] **reautoryzacja apki osobistej po `refresh_token` — deadline 2026-08-15** (token wygasa 2026-09-02)
+
+**Faza 2** — ✅ **ZAMKNIĘTA 2026-07-26**
+- [x] `scripts/api-probe.mjs` — 20 endpointów, zapis do `api_endpoint_probe`
+- [x] probe na tokenie osobistym: **1/20** · na tokenie org: **10/20**
+- [x] `docs/API-CAPABILITY-MATRIX-member.md` + `-org.md`
+- [x] **N1** częściowo (400: member permissions) · **N3** = webhooki · **N4** = TAK, wymaga produktu nie scope'a
+- [x] N2 rozstrzygnięta: `/rest/connections/{personUrn}` → 200
+- [x] ustalona przyczyna blokady analityki: **Development Tier**
+- [ ] probe zapisów na poście testowym (odłożone — najpierw limity)
 
 **Faza 3** — [ ] migracje SQL (tylko dodające) · [ ] `analytics.ts` na token org · [ ] `video-analytics.ts` · [ ] `followers.ts` · [ ] `connections.ts` · [ ] `/rest/me` · [ ] 4 narzędzia → 75 · [ ] `resolveMetric()` · [ ] backfill 152 postów · [ ] `drift-check.mjs` · [ ] regresja z flagą wyłączoną
 

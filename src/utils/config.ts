@@ -86,6 +86,10 @@ export const config = {
   linkedinPersonUrn: process.env.LINKEDIN_PERSON_URN || "",
   geminiApiKey: process.env.GEMINI_API_KEY || "",
   callbackPort: parseInt(process.env.LINKEDIN_CALLBACK_PORT || "8585", 10),
+  // How long the OAuth callback server waits for the consent click. Five
+  // minutes is too short when a human has to open a portal tab first, so this
+  // is configurable; the default keeps the previous behaviour.
+  oauthTimeoutMs: Math.min(60, Math.max(1, parseInt(process.env.LINKEDIN_OAUTH_TIMEOUT_MIN || "5", 10) || 5)) * 60_000,
   apiVersion: process.env.LINKEDIN_API_VERSION || "202503",
 
   // Community Management API app, scoped to the bartoszgaca.pl Company Page

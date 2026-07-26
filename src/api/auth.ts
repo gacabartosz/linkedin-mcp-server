@@ -94,11 +94,11 @@ function startCallbackServer(expectedState: string): void {
     log("info", `OAuth callback server listening on http://localhost:${config.callbackPort}/callback`);
   });
 
-  // Auto-close after 5 minutes
+  // Auto-close after the configured window (default 5 min).
   setTimeout(() => {
     server.close();
-    log("warn", "OAuth callback server timed out after 5 minutes");
-  }, 300_000);
+    log("warn", `OAuth callback server timed out after ${config.oauthTimeoutMs / 60_000} min`);
+  }, config.oauthTimeoutMs);
 }
 
 async function exchangeCode(code: string): Promise<{
@@ -163,7 +163,7 @@ async function exchangeCode(code: string): Promise<{
       : undefined,
     person_urn: personUrn,
     user_name: userName,
-    scopes: tokenData.scope.split(" "),
+    scopes: tokenData.scope.split(/[,\s]+/).filter(Boolean),
   };
 
   clearTokenCache();
@@ -258,8 +258,8 @@ function startOrgCallbackServer(expectedState: string): void {
 
   setTimeout(() => {
     server.close();
-    log("warn", "Org OAuth callback server timed out after 5 minutes");
-  }, 300_000);
+    log("warn", `Org OAuth callback server timed out after ${config.oauthTimeoutMs / 60_000} min`);
+  }, config.oauthTimeoutMs);
 }
 
 async function exchangeOrgCode(code: string): Promise<{
@@ -294,12 +294,14 @@ async function exchangeOrgCode(code: string): Promise<{
     scope: string;
   };
 
+  // The org app is granted r_basicprofile, not openid/profile, so /v2/userinfo
+  // returns 403 for it. Fall back to /rest/me, which r_basicprofile does cover.
+  let userName = "LinkedIn User";
+  let personUrn = "";
+
   const userResponse = await fetchWithTimeout("https://api.linkedin.com/v2/userinfo", {
     headers: { Authorization: `Bearer ${tokenData.access_token}` },
   });
-
-  let userName = "LinkedIn User";
-  let personUrn = "";
 
   if (userResponse.ok) {
     const userData = await userResponse.json() as {
@@ -310,6 +312,26 @@ async function exchangeOrgCode(code: string): Promise<{
     };
     userName = userData.name || `${userData.given_name || ""} ${userData.family_name || ""}`.trim();
     personUrn = `urn:li:person:${userData.sub}`;
+  } else {
+    const meResponse = await fetchWithTimeout("https://api.linkedin.com/rest/me", {
+      headers: {
+        Authorization: `Bearer ${tokenData.access_token}`,
+        "LinkedIn-Version": config.apiVersion,
+        "X-Restli-Protocol-Version": "2.0.0",
+      },
+    });
+    if (meResponse.ok) {
+      const me = await meResponse.json() as {
+        id?: string;
+        localizedFirstName?: string;
+        localizedLastName?: string;
+      };
+      if (me.id) personUrn = `urn:li:person:${me.id}`;
+      const name = `${me.localizedFirstName || ""} ${me.localizedLastName || ""}`.trim();
+      if (name) userName = name;
+    } else {
+      log("warn", `Org auth: neither /v2/userinfo (${userResponse.status}) nor /rest/me (${meResponse.status}) returned identity`);
+    }
   }
 
   const expiresAt = new Date(Date.now() + tokenData.expires_in * 1000).toISOString();
@@ -323,7 +345,7 @@ async function exchangeOrgCode(code: string): Promise<{
       : undefined,
     person_urn: personUrn,
     user_name: userName,
-    scopes: tokenData.scope.split(" "),
+    scopes: tokenData.scope.split(/[,\s]+/).filter(Boolean),
   };
 
   clearOrgTokenCache();
