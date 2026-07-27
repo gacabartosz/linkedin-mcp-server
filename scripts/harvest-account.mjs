@@ -96,16 +96,17 @@ for (const org of ORGS) {
   await get(`/rest/posts?q=author&author=${e}&count=10`, `${org.name} — posty strony`, 'strona');
   await get(`/rest/organizationalEntityNotifications?q=criteria&organizationalEntity=${e}`, `${org.name} — powiadomienia strony`, 'strona');
   await get(`/rest/vanityUrl?q=vanityUrlAsOrganization&organization=${e}`, `${org.name} — vanity URL`, 'strona');
-  await get(`/rest/organizationBrands?q=parentOrganization&parentOrganization=${e}`, `${org.name} — marki podrzędne`, 'strona');
-  await get(`/rest/brandPageStatistics?q=brand&brand=${e}`, `${org.name} — statystyki brand page`, 'strona');
-  await get(`/rest/videoAnalytics?q=entity&entity=${e}`, `${org.name} — analityka wideo`, 'strona');
-  await get(`/rest/peopleTypeahead?q=organizationFollowers&organization=${e}`, `${org.name} — followersi (typeahead)`, 'strona');
+  await get(`/rest/organizationBrands?q=vanityName&vanityName=${org.name.replace(/\..*$/, '')}`, `${org.name} — marki podrzędne`, 'strona');
+  await get(`/rest/brandPageStatistics?q=brand&brand=${enc(`urn:li:organizationBrand:${org.id}`)}`, `${org.name} — statystyki brand page`, 'strona');
+  await get(`/rest/videoAnalytics?q=entity&entity=${e}&type=VIDEO_VIEW`, `${org.name} — analityka wideo`, 'strona');
+  await get(`/rest/peopleTypeahead?q=organizationFollowers&organization=${e}&keywords=bartosz`, `${org.name} — followersi (typeahead)`, 'strona');
 }
 
 // ── networkSizes: szukamy poprawnego edgeType ─────────────────────────────
 console.log('\n═══ networkSizes — dobieranie edgeType ═══');
-for (const et of ['CompanyFollowedByMember', 'MemberFollowedByCompany', 'CompanyFollowedByCompany']) {
-  await get(`/rest/networkSizes/${enc('urn:li:organization:134844053')}?edgeType=${et}`, `networkSizes edgeType=${et}`, 'intel');
+// Ustalone 2026-07-27: edgeType MUSI byc SCREAMING_SNAKE.
+for (const org of ORGS) {
+  await get(`/rest/networkSizes/${enc(`urn:li:organization:${org.id}`)}?edgeType=COMPANY_FOLLOWED_BY_MEMBER`, `${org.name} — followersi total`, 'strona');
 }
 
 // ── INTEL / TAKSONOMIE ────────────────────────────────────────────────────
@@ -115,7 +116,7 @@ await get('/rest/seniorities', 'seniorities — poziomy stanowisk', 'intel');
 await get('/rest/functions', 'functions — funkcje w firmie', 'intel');
 await get('/rest/degrees', 'degrees — stopnie naukowe', 'intel');
 await get('/rest/iabCategories', 'iabCategories — kategorie IAB', 'intel');
-await get('/rest/skills?q=', 'skills — umiejętności', 'intel');
+await get('/rest/skills?locale=(language:en,country:US)', 'skills — umiejętności', 'intel');
 await get('/rest/titles', 'titles — stanowiska', 'intel');
 await get('/rest/standardizedTitles', 'standardizedTitles', 'intel');
 await get('/rest/geoTypeahead?q=search&query=Warszawa', 'geoTypeahead — lokalizacje', 'intel');
@@ -131,9 +132,10 @@ for (const et of ['ORGANIZATION_SOCIAL_ACTION_NOTIFICATIONS', 'SHARE_STATISTICS'
 
 // ── MEDIA (czy da się wysyłać dokumenty/wideo) ─────────────────────────────
 console.log('\n═══ MEDIA ═══');
-await get(`/rest/documents?q=associatedAccount&associatedAccount=${enc('urn:li:organization:134844053')}`, 'documents — karuzele/PDF', 'media');
-await get(`/rest/videos?q=associatedAccount&associatedAccount=${enc('urn:li:organization:134844053')}`, 'videos — wideo', 'media');
-await get(`/rest/images?q=associatedAccount&associatedAccount=${enc('urn:li:organization:134844053')}`, 'images — obrazy', 'media');
+// FINDER associatedAccount przyjmuje wylacznie konta reklamowe ("Owner is not a
+// sponsored account urn"), wiec dla strony firmowej nie ma zastosowania. Upload
+// idzie przez ACTION initializeUpload (POST), a probe jest read-only.
+console.log('   pominiete: documents/videos/images FINDER associatedAccount — tylko konta reklamowe');
 
 // ── RAPORT ────────────────────────────────────────────────────────────────
 const ok = results.filter((r) => r.ok);

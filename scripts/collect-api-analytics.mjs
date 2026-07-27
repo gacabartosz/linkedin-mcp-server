@@ -67,6 +67,9 @@ CREATE TABLE IF NOT EXISTS api_org_posts (
 CREATE TABLE IF NOT EXISTS api_profile_stats (
   date TEXT, metric TEXT, value INTEGER, fetched_at TEXT,
   PRIMARY KEY (date, metric));
+CREATE TABLE IF NOT EXISTS api_org_followers_total (
+  date TEXT, org_urn TEXT, count INTEGER, fetched_at TEXT,
+  PRIMARY KEY (date, org_urn));
 CREATE TABLE IF NOT EXISTS api_social_metadata (
   post_urn TEXT PRIMARY KEY, like_count INT, praise_count INT, empathy_count INT,
   interest_count INT, appreciation_count INT, entertainment_count INT,
@@ -79,6 +82,7 @@ const put = {
   share: db.prepare(`INSERT OR REPLACE INTO api_org_share_stats VALUES (?,?,?,?,?,?,?,?,?,datetime('now'))`),
   post: db.prepare(`INSERT OR REPLACE INTO api_org_posts VALUES (?,?,?,datetime('now'))`),
   profile: db.prepare(`INSERT OR REPLACE INTO api_profile_stats VALUES (?,?,?,datetime('now'))`),
+  orgFollowers: db.prepare(`INSERT OR REPLACE INTO api_org_followers_total VALUES (?,?,?,datetime('now'))`),
   social: db.prepare(`INSERT OR REPLACE INTO api_social_metadata VALUES (?,?,?,?,?,?,?,?,?,datetime('now'))`),
   health: db.prepare(`INSERT OR REPLACE INTO data_health (metric, value, updated_at) VALUES (?,?,datetime('now'))`),
 };
@@ -136,6 +140,13 @@ for (const org of ORGS) {
     if (!DRY) put.share.run(TODAY, org.urn, t.impressionCount || 0, t.uniqueImpressionsCount || 0,
       t.clickCount || 0, t.likeCount || 0, t.commentCount || 0, t.shareCount || 0, t.engagement || 0);
     log(`   impressions=${t.impressionCount} klik=${t.clickCount} reakcje=${t.likeCount}`);
+  }
+
+  // edgeType MUSI byc SCREAMING_SNAKE — CamelCase daje 400 (ustalone 2026-07-27).
+  const ns = await api(`/networkSizes/${e}?edgeType=COMPANY_FOLLOWED_BY_MEMBER`, `${org.name} followersi total`);
+  if (typeof ns?.firstDegreeSize === 'number') {
+    if (!DRY) put.orgFollowers.run(TODAY, org.urn, ns.firstDegreeSize);
+    log(`   followersi total: ${ns.firstDegreeSize}`);
   }
 
   const po = await api(`/posts?q=author&author=${e}&count=25`, `${org.name} posty`);
