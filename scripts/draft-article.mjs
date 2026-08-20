@@ -69,9 +69,20 @@ const ArticleSchema = z.object({
   content_en_html: z.string().min(1200).describe('Full HTML EN, ~40-50% length of PL (hub-spoke). Same structure but condensed. Ends with <p>For full deep dive in Polish: <a href="https://bartoszgaca.pl/aktualnosci/{slug_pl}">Polish version →</a></p>'),
 });
 
+// Guidelines szuka najpierw w DATA_DIR (na VPS to zamontowany mirror
+// /data/linkedin-mcp), potem w homedir jako fallback dla Maca. Wczesniej bylo
+// tylko homedir — w kontenerze HOME=/root, wiec fact-checker i humanizer
+// ladowaly sie jako pusty string i draft leciał BEZ guardu anty-halucynacyjnego.
 function loadGuideline(name) {
-  const path = join(homedir(), '.linkedin-mcp', 'guidelines', `${name}.md`);
-  try { return readFileSync(path, 'utf-8').trim(); } catch { return ''; }
+  const candidates = [
+    join(DATA_DIR, 'guidelines', `${name}.md`),
+    join(homedir(), '.linkedin-mcp', 'guidelines', `${name}.md`),
+  ];
+  for (const p of candidates) {
+    try { return readFileSync(p, 'utf-8').trim(); } catch { /* next */ }
+  }
+  console.error(`[draft-article] WARN: brak guideline "${name}" w ${candidates.join(' | ')}`);
+  return '';
 }
 
 const HUMANIZER_GUIDE = loadGuideline('humanizer');
