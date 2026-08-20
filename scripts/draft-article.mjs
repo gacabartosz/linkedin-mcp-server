@@ -19,7 +19,7 @@
 
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { existsSync, writeFileSync, mkdirSync } from 'node:fs';
+import { existsSync, writeFileSync, mkdirSync, readFileSync } from 'node:fs';
 import Database from 'better-sqlite3';
 import Anthropic from '@anthropic-ai/sdk';
 import { z } from 'zod';
@@ -69,7 +69,30 @@ const ArticleSchema = z.object({
   content_en_html: z.string().min(1200).describe('Full HTML EN, ~40-50% length of PL (hub-spoke). Same structure but condensed. Ends with <p>For full deep dive in Polish: <a href="https://bartoszgaca.pl/aktualnosci/{slug_pl}">Polish version →</a></p>'),
 });
 
+// Guidelines szuka najpierw w DATA_DIR (na VPS to zamontowany mirror
+// /data/linkedin-mcp), potem w homedir jako fallback dla Maca. Wczesniej bylo
+// tylko homedir — w kontenerze HOME=/root, wiec fact-checker i humanizer
+// ladowaly sie jako pusty string i draft leciał BEZ guardu anty-halucynacyjnego.
+function loadGuideline(name) {
+  const candidates = [
+    join(DATA_DIR, 'guidelines', `${name}.md`),
+    join(homedir(), '.linkedin-mcp', 'guidelines', `${name}.md`),
+  ];
+  for (const p of candidates) {
+    try { return readFileSync(p, 'utf-8').trim(); } catch { /* next */ }
+  }
+  console.error(`[draft-article] WARN: brak guideline "${name}" w ${candidates.join(' | ')}`);
+  return '';
+}
+
+const HUMANIZER_GUIDE = loadGuideline('humanizer');
+const FACT_CHECKER_GUIDE = loadGuideline('fact-checker');
+
 const SYSTEM_PROMPT = `Jesteś autorem artykułów na bartoszgaca.pl, technicznym blogu Bartosza Gacy o Claude Code, optymalizacji tokenów, MCP i AI dev workflow.
+
+${HUMANIZER_GUIDE ? `## HUMANIZER — ton autora (PRIORYTET)\n${HUMANIZER_GUIDE}\n` : ''}
+${FACT_CHECKER_GUIDE ? `## FACT-CHECKER — anti-halucynacja (PRIORYTET)\n${FACT_CHECKER_GUIDE}\n` : ''}
+
 
 ZASADY TONU PL:
 - Polski, ciepło-po-imieniu (mówisz "ty/twój", nie "Państwo/Pana")

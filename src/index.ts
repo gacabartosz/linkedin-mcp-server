@@ -10,7 +10,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 
-import { ensureDataDirs, config } from "./utils/config.js";
+import { ensureDataDirs, config, logConfigProblems } from "./utils/config.js";
 import { log } from "./utils/logger.js";
 import { toolError, toolResult } from "./utils/errors.js";
 import { startAuth } from "./api/auth.js";
@@ -385,7 +385,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       inputSchema: {
         type: "object",
         properties: {
-          scopes: { type: "array", items: { type: "string" }, description: "OAuth scopes (default: openid, profile, w_member_social)" },
+          scopes: { type: "array", items: { type: "string" }, description: "OAuth scopes (default: openid, profile, w_member_social, r_member_postAnalytics)" },
         },
       },
     },
@@ -1356,7 +1356,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       // ── Auth ──────────────────────────────────────────────────────────
       case "linkedin_auth_start": {
         const input = AuthStartInput.parse(args);
-        const scopes = input.scopes || ["openid", "profile", "w_member_social"];
+        // r_member_postAnalytics → official impressions/reach per post (replaces the flaky
+        // Highcharts scrape). Requires the "Member Post Analytics" product enabled on the
+        // LinkedIn app; user must re-consent for the new scope to take effect.
+        const scopes = input.scopes || ["openid", "profile", "w_member_social", "r_member_postAnalytics"];
         const result = startAuth(scopes);
         return toolResult(result);
       }
@@ -2356,6 +2359,11 @@ async function main(): Promise<void> {
     );
     process.exit(0);
   }
+
+  // Surface credential/flag problems on stderr at startup instead of failing
+  // later with an opaque 401. Never fatal — a missing optional key degrades one
+  // feature, not the whole server.
+  logConfigProblems();
 
   // Start scheduler daemon alongside MCP server
   startSchedulerDaemon();

@@ -15,6 +15,7 @@ interface AuthTokens {
 }
 
 let cachedTokens: AuthTokens | null = null;
+let cachedOrgTokens: AuthTokens | null = null;
 
 export function loadTokens(): AuthTokens | null {
   if (cachedTokens) return cachedTokens;
@@ -53,6 +54,124 @@ export function getPersonUrn(): string {
   const tokens = loadTokens();
   if (!tokens) throw new Error("Not authenticated. Run linkedin_auth_start first.");
   return tokens.person_urn;
+}
+
+// Org-scoped tokens (Community Management API app, bartoszgaca.pl Company Page).
+// Separate file from the personal-profile tokens above so authorizing the org
+// app never overwrites the credentials auto-publish.mjs relies on.
+export function loadOrgTokens(): AuthTokens | null {
+  if (cachedOrgTokens) return cachedOrgTokens;
+  try {
+    const data = readFileSync(config.orgAuthFile, "utf-8");
+    cachedOrgTokens = JSON.parse(data) as AuthTokens;
+    return cachedOrgTokens;
+  } catch {
+    return null;
+  }
+}
+
+export function saveOrgTokens(tokens: AuthTokens): void {
+  writeFileSync(config.orgAuthFile, JSON.stringify(tokens, null, 2), { mode: 0o600 });
+  cachedOrgTokens = tokens;
+}
+
+export function clearOrgTokenCache(): void {
+  cachedOrgTokens = null;
+}
+
+export function getOrgUrn(): string {
+  if (!config.linkedinOrgUrn) throw new Error("Missing LINKEDIN_ORG_URN.");
+  return config.linkedinOrgUrn;
+}
+
+export async function orgLinkedinRequest<T>(
+  method: string,
+  path: string,
+  body?: unknown,
+  options?: { apiBase?: "rest" | "v2" },
+): Promise<T> {
+  const tokens = loadOrgTokens();
+  if (!tokens) throw new Error("Org app not authenticated. Run linkedin_org_auth_start first.");
+
+  const base = options?.apiBase === "v2"
+    ? "https://api.linkedin.com/v2"
+    : "https://api.linkedin.com/rest";
+  const url = path.startsWith("https://") ? path : `${base}${path}`;
+
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${tokens.access_token}`,
+    "X-Restli-Protocol-Version": "2.0.0",
+  };
+  if (options?.apiBase !== "v2") headers["LinkedIn-Version"] = config.apiVersion;
+  if (body) headers["Content-Type"] = "application/json";
+
+  log("info", `LinkedIn Org API ${method} ${url}`);
+
+  const response = await fetchWithTimeout(url, {
+    method,
+    headers,
+    body: body ? JSON.stringify(body) : undefined,
+  });
+
+  if (response.status === 401 && tokens.refresh_token) {
+    log("warn", "Org token expired, attempting refresh");
+    const refreshed = await refreshOrgAccessToken(tokens);
+    if (refreshed) return orgLinkedinRequest(method, path, body, options);
+  }
+
+  if (!response.ok) {
+    const errorBody = await response.json().catch(() => ({ status: response.status }));
+    throw new LinkedInApiError(response.status, errorBody);
+  }
+
+  if (response.status === 204) return {} as T;
+  const restliId = response.headers.get("x-restli-id") || "";
+  const text = await response.text();
+  if (!text && restliId) return { "x-restli-id": restliId } as T;
+  if (!text) return {} as T;
+  const parsed = JSON.parse(text) as Record<string, unknown>;
+  if (restliId && !parsed["x-restli-id"]) parsed["x-restli-id"] = restliId;
+  return parsed as T;
+}
+
+async function refreshOrgAccessToken(tokens: AuthTokens): Promise<boolean> {
+  if (!tokens.refresh_token || !config.linkedinOrgClientId) return false;
+  try {
+    const response = await fetchWithTimeout("https://www.linkedin.com/oauth/v2/accessToken", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "refresh_token",
+        refresh_token: tokens.refresh_token,
+        client_id: config.linkedinOrgClientId,
+        client_secret: config.linkedinOrgClientSecret,
+      }),
+    });
+    if (!response.ok) return false;
+    const data = await response.json() as {
+      access_token: string;
+      expires_in: number;
+      refresh_token?: string;
+      refresh_token_expires_in?: number;
+    };
+    const updated: AuthTokens = {
+      ...tokens,
+      access_token: data.access_token,
+      expires_at: new Date(Date.now() + data.expires_in * 1000).toISOString(),
+      ...(data.refresh_token ? {
+        refresh_token: data.refresh_token,
+        refresh_token_expires_at: data.refresh_token_expires_in
+          ? new Date(Date.now() + data.refresh_token_expires_in * 1000).toISOString()
+          : tokens.refresh_token_expires_at,
+      } : {}),
+    };
+    saveOrgTokens(updated);
+    log("info", "Org token refreshed successfully");
+    return true;
+  } catch (err) {
+    log("error", "Org token refresh failed", err);
+    return false;
+  }
 }
 
 export async function linkedinRequest<T>(

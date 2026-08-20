@@ -10,7 +10,7 @@
     { "name": "insight_1", "description": "First key insight, prefixed with emoji", "required": true },
     { "name": "insight_2", "description": "Second key insight", "required": true },
     { "name": "insight_3", "description": "Third key insight", "required": false },
-    { "name": "closing", "description": "Call to action or question. E.g. 'What's your experience?' or 'Which one resonates most?'", "required": true },
+    { "name": "closing", "description": "End with one closed, take-a-side question, e.g. 'Would you ship it on Friday or wait till Monday?' — not an open 'what's your experience?'.", "required": true },
     { "name": "hashtags", "description": "1-3 precise hashtags at end. Never more than 3.", "required": false, "default": "" }
   ],
   "tips": [
@@ -19,5 +19,5 @@
     "Be available in golden hour (first 60 min) to reply to comments",
     "Storytelling beats dry information — use personal experience"
   ],
-  "example_output": "I spent 3 years building MCP servers and here's what nobody tells you...\n\nAfter shipping 15 integrations across LinkedIn, Slack, and GitHub:\n\n1. The tool description is 80% of the battle\n2. Structured output beats raw text every time\n3. OAuth is harder than the actual API\n\nWhat's the most painful integration you've built?\n\n#MCP #DevTools #AI"
+  "example_output": "Last month a tool description I wrote broke our LinkedIn MCP server in production.\n\nThe model kept calling the wrong endpoint. I'd shipped 14 integrations before this one and assumed the API was the hard part. It wasn't.\n\nI spent two days adding OAuth refresh and structured-output schemas, only to find the real bug was one ambiguous line in the tool's description — the model couldn't tell 'post' from 'repost'. Rewrote that one sentence, and the misfires went to zero.\n\nThe API took an afternoon. The description took the rest of the week.\n\nWould you rather debug an OAuth flow or rewrite a tool description?\n\n#MCP #DevTools #AI"
 }

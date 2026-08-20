@@ -29,9 +29,16 @@ const MCP_DIR = '/Users/gaca/projects/personal/linkedin-mcp-server';
 const PERSON_URN = 'urn:li:person:FihAwG4y_B';
 
 const CHECK_INTERVAL = 2 * 60 * 60 * 1000; // 2 hours
-const MAX_REPLIES_PER_CYCLE = 10;
+const MAX_REPLIES_PER_CYCLE = 6;       // obniżone z 10 — w granicach rozsądku
+const MAX_REPLIES_PER_POST_DAY = 3;    // max 3 odpowiedzi na jeden post dziennie
+const REPLY_COOLDOWN_HOURS = 4;        // min 4h przerwa między odpowiedziami na tym samym poście
 const MAX_POSTS_TO_MONITOR = 10;
 const API_DELAY_MS = 2000;
+
+// Scoring thresholds — odpowiadaj tylko gdy warto
+const MIN_LEAD_SCORE = 3;    // 1-5, ≥3 = zainteresowanie usługą
+const MIN_ENGAGEMENT_VALUE = 4; // 1-5, ≥4 = pytanie otwarte / dyskusja
+const MAX_TROLL_RISK = 2;    // 1-5, ≤2 = bezpieczny komentarz
 
 // ── Persona Loader ──────────────────────────────────────────────────────────
 
@@ -115,19 +122,75 @@ function detectLanguage(text) {
   return hasPL ? 'pl' : 'en';
 }
 
-// ── Comment Classifier (via MCP → Gemini) ──────────────────────────────────
+// ── Comment Classifier z rankingiem (via MCP → Gemini) ──────────────────────
 
 async function classifyComment(commentText, postText, commentAuthor) {
   try {
-    return await callMCP('linkedin_comment_classify', {
+    const raw = await callMCP('linkedin_comment_classify', {
       comment_text: commentText,
       post_text: postText.substring(0, 400),
       comment_author: commentAuthor,
+      // Rozszerzony prompt — poproś o scoring JSON
+      extra_instructions: `Dodatkowo oceń komentarz na 3 osiach (1-5) i zwróć w polu "scoring":
+lead_score: 5=wyraźne zainteresowanie ceną/demo/usługą, 3=ogólne zainteresowanie, 1=brak związku z ofertą
+troll_risk: 5=agresywny/prowokacyjny/hate, 2=neutralny/konstruktywny, 1=przyjazny
+engagement_value: 5=otwarte pytanie wymuszające dyskusję, 3=komentarz merytoryczny, 1=emoji/one-word
+Format scoring: {"lead_score": N, "troll_risk": N, "engagement_value": N}`
     });
+    // Wyciągnij scoring z odpowiedzi (Gemini może go zwrócić różnie)
+    let scoring = { lead_score: 2, troll_risk: 1, engagement_value: 3 };
+    if (raw?.scoring) {
+      scoring = { ...scoring, ...raw.scoring };
+    } else if (typeof raw?.details === 'string') {
+      try {
+        const m = raw.details.match(/\{[^}]*lead_score[^}]*\}/);
+        if (m) scoring = { ...scoring, ...JSON.parse(m[0]) };
+      } catch {}
+    }
+    return { ...raw, scoring };
   } catch (err) {
     console.error(`    [classify] Error: ${err.message}`);
-    return { decision: 'like_only', sentiment: 'neutral' };
+    return { decision: 'like_only', sentiment: 'neutral', scoring: { lead_score: 1, troll_risk: 1, engagement_value: 1 } };
   }
+}
+
+// ── Decyzja czy odpowiadać na podstawie scoringu ─────────────────────────────
+
+function shouldReply(classification) {
+  const s = classification?.scoring || {};
+  const lead = s.lead_score || 0;
+  const troll = s.troll_risk || 5;
+  const engage = s.engagement_value || 0;
+  if (classification?.decision === 'skip_troll' || classification?.decision === 'skip_spam') return false;
+  if (troll > MAX_TROLL_RISK) return false;
+  return (lead >= MIN_LEAD_SCORE || engage >= MIN_ENGAGEMENT_VALUE);
+}
+
+// ── Claude CLI reply generator (fallback gdy Gemini MCP niedostępny) ─────────
+
+async function generateReplyWithClaude(commentText, postText, language, persona) {
+  return new Promise((resolve, reject) => {
+    const prompt = `${persona.profile.slice(0, 400)}
+
+Post: ${postText.slice(0, 300)}
+Komentarz: "${commentText}"
+
+Napisz odpowiedź ${language === 'pl' ? 'po polsku' : 'in English'}, 60-120 słów.
+Styl: bezpośredni, konkretny, zero corporate BS. Zakończ pytaniem lub wyzwaniem.
+NIE zaczynaj od "Świetny komentarz", "Dziękuję za komentarz" ani podobnych.
+Tylko treść odpowiedzi.`;
+
+    const child = spawn('claude', ['-p', '--no-session-persistence', '--model', 'claude-haiku-4-5-20251001'], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    let out = '';
+    child.stdin.write(prompt);
+    child.stdin.end();
+    child.stdout.on('data', d => out += d);
+    child.on('close', code => code === 0 ? resolve(out.trim()) : reject(new Error(`claude exit ${code}`)));
+    child.on('error', reject);
+    setTimeout(() => { child.kill(); reject(new Error('claude timeout')); }, 30000);
+  });
 }
 
 // ── Reply Generator (via MCP → Gemini + socjotechnika) ──────────────────────
@@ -185,6 +248,17 @@ function initEngageDB() {
       replies_sent INTEGER DEFAULT 0,
       comments_processed INTEGER DEFAULT 0,
       errors INTEGER DEFAULT 0
+    );
+    -- PROPOSALS-FIRST: insert w cyklu (:504) wymaga tej tabeli; bez niej propozycja
+    -- leciała w catch (:520) i ginęła cicho. Schema 1:1 z dashboard.mjs (źródło prawdy).
+    CREATE TABLE IF NOT EXISTS reply_proposals (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT NOT NULL,
+      source_id TEXT NOT NULL, source_text TEXT, source_author TEXT,
+      post_urn TEXT, post_text TEXT, proposed_reply TEXT NOT NULL,
+      lead_score INTEGER DEFAULT 0, troll_risk INTEGER DEFAULT 0,
+      engagement_value INTEGER DEFAULT 0, urgency INTEGER DEFAULT 0,
+      status TEXT DEFAULT 'pending', sent_at TEXT,
+      created_at TEXT DEFAULT (datetime('now')), updated_at TEXT DEFAULT (datetime('now'))
     );
   `);
 
@@ -387,7 +461,8 @@ async function checkAndEngage() {
             errors++;
           }
 
-          console.log(`    Decision: ${classification.decision} | Sentiment: ${classification.sentiment}`);
+          const scoring = classification?.scoring || {};
+          console.log(`    Decision: ${classification.decision} | Sentiment: ${classification.sentiment} | lead=${scoring.lead_score||0} troll=${scoring.troll_risk||0} engage=${scoring.engagement_value||0}`);
 
           // Step 2: LIKE (unless troll/spam)
           if (!['skip_troll', 'skip_spam'].includes(classification.decision)) {
@@ -402,44 +477,67 @@ async function checkAndEngage() {
             }
           }
 
-          // Step 3: Reply (only if classified as "reply")
+          // Step 3: Reply — tylko jeśli shouldReply() zwraca true + limity per-post
           let repliedText = null;
-          if (classification.decision === 'reply') {
-            try {
-              // Build thread context (previous replies in this comment chain)
-              let threadContext = '';
-              if (comment.replies && comment.replies.length > 0) {
-                threadContext = comment.replies
-                  .map(r => `${r.actor?.name || 'Unknown'}: "${r.message?.text || r.text || ''}"`)
-                  .join('\n');
+          const replyApproved = classification.decision === 'reply' && shouldReply(classification);
+
+          if (replyApproved) {
+            // Sprawdź limit per-post (max 3 odpowiedzi na ten post dzisiaj)
+            const engDb2 = new Database(ENGAGE_DB_PATH);
+            const todayReplies = engDb2.prepare(
+              `SELECT COUNT(*) as c FROM processed_comments WHERE post_urn = ? AND action = 'reply' AND processed_at >= datetime('now', '-1 day')`
+            ).get(post.post_urn);
+            engDb2.close();
+
+            if ((todayReplies?.c || 0) >= MAX_REPLIES_PER_POST_DAY) {
+              console.log(`    -> Skip: post limit reached (${todayReplies.c}/${MAX_REPLIES_PER_POST_DAY} today)`);
+            } else {
+              try {
+                let threadContext = '';
+                if (comment.replies?.length > 0) {
+                  threadContext = comment.replies
+                    .map(r => `${r.actor?.name || 'Unknown'}: "${r.message?.text || r.text || ''}"`)
+                    .join('\n');
+                }
+
+                // Claude CLI first, fallback do Gemini MCP
+                let reply;
+                try {
+                  reply = await generateReplyWithClaude(commentText, post.text, commentLang, persona);
+                  console.log(`    [reply] via Claude CLI`);
+                } catch {
+                  reply = await generateReply(commentText, post.text, commentLang, classification.sentiment, project, persona, threadContext);
+                  console.log(`    [reply] via Gemini MCP (fallback)`);
+                }
+
+                // PROPOSALS-FIRST: zapisz propozycję do DB, NIE wysyłaj automatycznie
+                const propDb = new Database(ENGAGE_DB_PATH);
+                propDb.prepare(`
+                  INSERT OR IGNORE INTO reply_proposals
+                  (type, source_id, source_text, source_author, post_urn, post_text,
+                   proposed_reply, lead_score, troll_risk, engagement_value, status)
+                  VALUES ('comment', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+                `).run(
+                  commentUrn, commentText, commentAuthor,
+                  post.post_urn, (post.text || '').slice(0, 500),
+                  reply, scoring.lead_score||0, scoring.troll_risk||0, scoring.engagement_value||0
+                );
+                propDb.close();
+
+                repliedText = '[proposal saved]';
+                repliesSent++;
+                console.log(`    -> 💾 Propozycja zapisana (${repliesSent}/${MAX_REPLIES_PER_CYCLE}): "${reply.substring(0, 100)}${reply.length > 100 ? '...' : ''}"`);
+                console.log(`    Zatwierdź na http://localhost:6767 → Propozycje`);
+              } catch (err) {
+                console.error(`    -> Proposal failed: ${err.message}`);
+                errors++;
               }
-
-              const reply = await generateReply(
-                commentText,
-                post.text,
-                commentLang,
-                classification.sentiment,
-                project,
-                persona,
-                threadContext,
-              );
-
-              await callMCP('linkedin_comment_create', {
-                post_urn: post.post_urn,
-                text: reply,
-                parent_comment_urn: commentUrn,
-              });
-
-              repliedText = reply;
-              repliesSent++;
-              console.log(`    -> Replied (${repliesSent}/${MAX_REPLIES_PER_CYCLE}): "${reply.substring(0, 100)}${reply.length > 100 ? '...' : ''}"`);
-            } catch (err) {
-              console.error(`    -> Reply failed: ${err.message}`);
-              errors++;
             }
+          } else if (classification.decision === 'reply' && !replyApproved) {
+            console.log(`    -> Skip reply: scoring below threshold (lead=${scoring.lead_score||0}, troll=${scoring.troll_risk||0}, engage=${scoring.engagement_value||0})`);
           }
 
-          // Step 4: Record
+          // Step 4: Record z scoring
           markProcessed(commentUrn, post.post_urn, classification.decision, {
             replied_text: repliedText,
             comment_text: commentText,
@@ -447,6 +545,15 @@ async function checkAndEngage() {
             language: commentLang,
             sentiment: classification.sentiment,
           });
+
+          // Zapisz scoring do processed_comments (jeśli kolumny istnieją)
+          try {
+            const engDbScore = new Database(ENGAGE_DB_PATH);
+            engDbScore.prepare(
+              `UPDATE processed_comments SET lead_score=?, troll_risk=?, engagement_value=? WHERE comment_urn=?`
+            ).run(scoring.lead_score||0, scoring.troll_risk||0, scoring.engagement_value||0, commentUrn);
+            engDbScore.close();
+          } catch {}
 
           // Rate limit delay between API calls
           await sleep(API_DELAY_MS);

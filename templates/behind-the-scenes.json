@@ -8,7 +8,7 @@
     { "name": "intro", "description": "Hook that reveals something personal — first 210 chars before 'see more'. Use curiosity or vulnerability.", "required": true },
     { "name": "story", "description": "The story or process being revealed. Use short paragraphs and dialogue.", "required": true },
     { "name": "lesson", "description": "What you learned or want others to take away", "required": true },
-    { "name": "cta", "description": "Question for engagement. E.g. 'Had a similar experience?' or 'What would you do?'", "required": true, "default": "Had a similar experience?" },
+    { "name": "cta", "description": "End with one closed, take-a-side question, e.g. 'Would you have shipped it or rolled it back?' — not an open 'had a similar experience?'.", "required": true, "default": "Would you have shipped it or rolled it back?" },
     { "name": "hashtags", "description": "1-3 precise hashtags. Never more than 3.", "required": false, "default": "" }
   ],
   "tips": [

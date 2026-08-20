@@ -26,6 +26,7 @@ import { getNetworkInfo, getProfileViews } from './dist/scraper/network.js';
 import { getPostMetricsBatch, getPostReactors } from './dist/api/social-metadata.js';
 import { searchPeople } from './dist/scraper/search.js';
 import { getPersonPosts } from './dist/scraper/activity.js';
+import { buildSnapshot } from './lib/analytics-snapshot.mjs';
 
 const MCP_DIR = '/Users/gaca/projects/personal/linkedin-mcp-server';
 const DB_PATH = join(homedir(), '.linkedin-mcp', 'analytics.db');
@@ -42,6 +43,7 @@ const args = process.argv.slice(2);
 const forceDayFlag = args.find(a => a.startsWith('--force-day='));
 const forceDay = forceDayFlag ? forceDayFlag.split('=')[1].toLowerCase() : null;
 const dryRun = args.includes('--dry-run');
+const force = args.includes('--force');
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // 2. DATABASE — ensureDb() with all tables
@@ -352,6 +354,10 @@ async function collectNetworkStats(db) {
   let followerCount = 0;
   let connectionCount = 0;
   let profileViews = 0;
+  // Staleness flags: true means the value below is a stale fallback, NOT a fresh fetch.
+  // Critical: never let a fallback value be persisted as if it were real (past bug — frozen series).
+  let followerStale = false;
+  let viewsStale = false;
 
   const network = await safeCall(db, 'getNetworkInfo', () => getNetworkInfo(PUBLIC_ID));
   if (network && network.follower_count > 0) {
@@ -359,11 +365,12 @@ async function collectNetworkStats(db) {
     connectionCount = network.connection_count || 0;
     log(`Followers: ${followerCount}, Connections: ${connectionCount}`);
   } else {
-    // Fallback: use last known value from daily_stats
+    // Fallback: reuse last known value ONLY for continuity, but flag it as stale.
     const lastKnown = db.prepare('SELECT follower_count FROM daily_stats WHERE follower_count > 0 ORDER BY date DESC LIMIT 1').get();
     if (lastKnown) {
       followerCount = lastKnown.follower_count;
-      log(`Voyager unavailable — using last known follower count: ${followerCount}`);
+      followerStale = true;
+      log(`Voyager unavailable — last known follower count (STALE, flagged): ${followerCount}`);
     }
   }
 
@@ -372,21 +379,36 @@ async function collectNetworkStats(db) {
     profileViews = views.total_views;
     log(`Profile views: ${profileViews}`);
   } else {
-    const lastViews = db.prepare('SELECT profile_views FROM daily_stats WHERE profile_views > 0 ORDER BY date DESC LIMIT 1').get();
-    if (lastViews) {
-      profileViews = lastViews.profile_views;
-      log(`Voyager unavailable — using last known profile views: ${profileViews}`);
-    }
+    // Endpoint is permanently 410 Gone. NEVER carry forward the last-known value —
+    // that produced a self-perpetuating fabricated constant (e.g. 38 every day).
+    // Record NULL + flag; the dashboard and LLM export render it as "unavailable".
+    profileViews = null;
+    viewsStale = true;
+    log('Profile views unavailable (LinkedIn endpoint 410 Gone) — persisting NULL, not fabricating.');
   }
 
-  return { followerCount, connectionCount, profileViews };
+  return { followerCount, connectionCount, profileViews, followerStale, viewsStale };
 }
 
 /**
  * DAILY: Save daily stats row, follower deltas, reaction types, post metrics history.
  */
-function saveDailyAggregates(db, today, followerCount, profileViews, totalReactions, totalComments) {
+function saveDailyAggregates(db, today, followerCount, profileViews, totalReactions, totalComments, meta = {}) {
   log('--- Saving daily aggregates ---');
+
+  const { followerStale = false, viewsStale = false } = meta;
+  // Row-level staleness marker for the follower series (the one the dashboard trusts).
+  // dashboard.mjs reads is_stale to exclude fabricated/frozen rows from growth + KPI.
+  const rowStale = followerStale ? 1 : 0;
+  const staleReason = followerStale
+    ? 'follower_fallback_frozen'
+    : (viewsStale ? 'profileviews_endpoint_dead' : null);
+
+  // data_health flags drive the dashboard staleness banner.
+  trackHealth(db, 'followers_stale', followerStale ? '1' : '0');
+  trackHealth(db, 'profileviews_stale', viewsStale ? '1' : '0');
+  if (!followerStale) trackHealth(db, 'followers_last_real_date', today);
+  if (!viewsStale) trackHealth(db, 'profileviews_last_real_date', today);
 
   // Posts published today
   let pubToday = 0;
@@ -403,18 +425,46 @@ function saveDailyAggregates(db, today, followerCount, profileViews, totalReacti
     ? ((totalReactions + totalComments) / Math.max(followerCount, 1) * 100).toFixed(1)
     : '0.0';
 
-  // daily_stats
-  db.prepare(`
-    INSERT OR REPLACE INTO daily_stats (date, follower_count, profile_views, posts_published, total_reactions, total_impressions, avg_engagement_rate)
-    VALUES (?, ?, ?, ?, ?, 0, ?)
-  `).run(today, followerCount, profileViews, pubToday, totalReactions, parseFloat(engRate));
-
-  // follower_deltas
+  // total_impressions: sum of freshly scraped per-post impressions (creator_top_posts).
+  // Official socialMetadata/profileView endpoints are dead (403/410), so this is the only
+  // real impressions source. 0 if no fresh scrape exists.
+  let totalImpressions = 0;
   try {
-    const prevDay = db.prepare("SELECT follower_count FROM daily_stats WHERE date < ? ORDER BY date DESC LIMIT 1").get(today);
-    const delta = prevDay ? followerCount - (prevDay.follower_count || 0) : 0;
-    db.prepare("INSERT OR REPLACE INTO follower_deltas (date, follower_count, delta) VALUES (?, ?, ?)").run(today, followerCount, delta);
-    log(`Follower delta: ${delta >= 0 ? '+' : ''}${delta}`);
+    const impr = db.prepare("SELECT SUM(impressions) AS s FROM creator_top_posts WHERE date(scraped_at) = ?").get(today);
+    totalImpressions = impr?.s || 0;
+  } catch {}
+
+  // daily_stats — now carries is_stale/stale_reason so fabricated fallback rows are
+  // distinguishable from real fetches (root-cause fix for the frozen-series bug).
+  db.prepare(`
+    INSERT OR REPLACE INTO daily_stats (date, follower_count, profile_views, posts_published, total_reactions, total_impressions, avg_engagement_rate, is_stale, stale_reason)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(today, followerCount, profileViews, pubToday, totalReactions, totalImpressions, parseFloat(engRate), rowStale, staleReason);
+
+  // 365-d wykres followers świeży MIĘDZY eksportami XLSX: dopisz dzisiejszy punkt do creator_analytics
+  // (źródło wykresu w dashboardzie). Tylko realny fetch (nie stale fallback). Impressions/engagements
+  // zostają z importu XLSX — per-post scrape jest zbyt szumny na dzienny total.
+  try {
+    if (!followerStale && followerCount > 0) {
+      const prev = db.prepare("SELECT value FROM creator_analytics WHERE metric='followers' AND chart_type='cumulative' AND date < ? ORDER BY date DESC LIMIT 1").get(today);
+      const ca = db.prepare("INSERT OR REPLACE INTO creator_analytics (date, metric, chart_type, value, scraped_at) VALUES (?, 'followers', ?, ?, datetime('now'))");
+      ca.run(today, 'cumulative', followerCount);
+      ca.run(today, 'daily', prev ? Math.max(followerCount - prev.value, 0) : 0);
+    }
+  } catch (e) { log(`creator_analytics daily append: ${e.message}`); }
+
+  // follower_deltas — only meaningful when the follower count is a REAL fetch.
+  // A stale fallback would otherwise produce a fake 0 (or a fake jump on the next real day).
+  try {
+    if (followerStale) {
+      db.prepare("INSERT OR REPLACE INTO follower_deltas (date, follower_count, delta) VALUES (?, ?, NULL)").run(today, followerCount);
+      log('Follower delta: skipped (stale follower count)');
+    } else {
+      const prevDay = db.prepare("SELECT follower_count FROM daily_stats WHERE date < ? AND is_stale = 0 ORDER BY date DESC LIMIT 1").get(today);
+      const delta = prevDay ? followerCount - (prevDay.follower_count || 0) : 0;
+      db.prepare("INSERT OR REPLACE INTO follower_deltas (date, follower_count, delta) VALUES (?, ?, ?)").run(today, followerCount, delta);
+      log(`Follower delta: ${delta >= 0 ? '+' : ''}${delta}`);
+    }
   } catch (err) { log(`Follower delta error: ${err.message}`); }
 
   // reaction_type_daily — aggregate from all social_metadata
@@ -557,7 +607,7 @@ async function collectTopEngagers(db, published) {
 
   for (const post of recentPosts) {
     const result = await safeCall(db, `getPostReactors(${post.post_urn})`, () =>
-      getPostReactors(post.post_urn, 30)
+      getPostReactors(post.post_urn, 10)
     );
 
     if (!result?.reactors) continue;
@@ -942,15 +992,11 @@ function getSchedule(dayName) {
     schedule.collectTopEngagers = true;
   }
 
-  // Tue/Fri: prospect activity scan (10 prospects)
-  if (['tuesday', 'friday'].includes(dayName)) {
-    schedule.scanProspectActivity = true;
-  }
-
-  // Wednesday: competitor monitoring
-  if (dayName === 'wednesday') {
-    schedule.monitorCompetitors = true;
-  }
+  // PROSPECTING WYŁĄCZONY (decyzja usera 2026-06): scanProspectActivity (Tue/Fri) + monitorCompetitors (Wed)
+  // robiły większość nieudanych calli (FACETED_SEARCH "CEO CTO" → 0 wyników, getPostReactors 404). To lead-gen,
+  // nie analityka, którą oglądasz na dashboardzie. Funkcje zostają w kodzie — odkomentuj, by przywrócić.
+  // if (['tuesday', 'friday'].includes(dayName)) schedule.scanProspectActivity = true;
+  // if (dayName === 'wednesday') schedule.monitorCompetitors = true;
 
   // Sunday: full weekly report + audience insights + demographic survey
   if (dayName === 'sunday') {
@@ -992,10 +1038,20 @@ async function main() {
   const now = new Date();
   const dayName = forceDay || getDayName(now);
 
-  // Reset daily health counters
+  // Restart-safe: launchd RunAtLoad odpala przy KAŻDYM logowaniu — nie powtarzaj, jeśli realny bieg
+  // (is_stale=0) już był dziś. To zamienia RunAtLoad w „dorób pominięty bieg" zamiast pętli przy każdym loginie.
+  if (!force && !dryRun && !forceDay) {
+    const ranToday = db.prepare("SELECT 1 FROM daily_stats WHERE date = ? AND is_stale = 0").get(today);
+    if (ranToday) { log(`Skip — realny bieg już był dziś (${today}). Użyj --force, by wymusić.`); db.close(); return; }
+  }
+
+  // Reset daily health counters. BUG (naprawiony): wcześniej last_run_date było nadpisywane PRZED
+  // porównaniem, więc warunek zawsze fałszywy → liczniki NIGDY się nie zerowały (stąd fałszywe „140 błędów"
+  // / 1185 calls > dzienny cap 150). Czytamy POPRZEDNI dzień przed nadpisaniem.
+  const prevRunDate = db.prepare("SELECT value FROM data_health WHERE metric = 'last_run_date'").get()?.value;
   trackHealth(db, 'last_run_date', today);
   trackHealth(db, 'last_run_start', now.toISOString());
-  if (db.prepare("SELECT value FROM data_health WHERE metric = 'last_run_date'").get()?.value !== today) {
+  if (prevRunDate !== today) {
     trackHealth(db, 'total_api_calls_today', '0');
     trackHealth(db, 'errors_today', '0');
   }
@@ -1024,17 +1080,21 @@ async function main() {
   // --- DAILY: Network stats (Voyager — 2 calls) ---
   let followerCount = 0;
   let profileViews = 0;
+  let followerStale = false;
+  let viewsStale = false;
 
   if (schedule.collectNetworkStats) {
     const network = await collectNetworkStats(db);
     followerCount = network.followerCount;
     profileViews = network.profileViews;
+    followerStale = network.followerStale;
+    viewsStale = network.viewsStale;
   }
 
   // --- DAILY: Save aggregates (local DB only, no API) ---
   let engRate = '0.0';
   if (schedule.saveDailyAggregates) {
-    const agg = saveDailyAggregates(db, today, followerCount, profileViews, totalReactions, totalComments);
+    const agg = saveDailyAggregates(db, today, followerCount, profileViews, totalReactions, totalComments, { followerStale, viewsStale });
     engRate = agg.engRate;
   }
 
@@ -1083,7 +1143,7 @@ async function main() {
   const msg = [
     'LinkedIn Daily Stats',
     `Followers: ${followerCount}`,
-    `Profile views: ${profileViews}`,
+    `Profile views: ${profileViews ?? 'n/a (410 Gone)'}`,
     `Reactions: ${totalReactions}`,
     `Comments: ${totalComments}`,
     `Engagement: ${engRate}%`,
@@ -1095,6 +1155,23 @@ async function main() {
   sendTelegram(msg);
 
   db.close();
+
+  // Regenerate the deterministic LLM-ready snapshot from the freshly-collected DB.
+  // Same builder the dashboard serves at /api/analytics/llm-export. Never let an
+  // export failure fail the collection run.
+  try {
+    const { writeFileSync, mkdirSync } = await import('node:fs');
+    const snap = buildSnapshot();
+    const jsonStr = JSON.stringify(snap, null, 2);
+    const outDir = join(homedir(), '.linkedin-mcp', 'exports');
+    mkdirSync(outDir, { recursive: true });
+    writeFileSync(join(outDir, 'analytics-latest.json'), jsonStr);
+    writeFileSync(join(outDir, `analytics-${snap.basis_date || 'unknown'}.json`), jsonStr);
+    log(`LLM export written (basis ${snap.basis_date}, ${(snap.data_quality?.health_alarms || []).length} alarms)`);
+  } catch (e) {
+    log(`LLM export failed (non-fatal): ${e.message}`);
+  }
+
   log(`=== Analytics done in ${elapsed}s ===`);
 }
 

@@ -12,6 +12,7 @@
     "dev": "tsx src/index.ts",
     "start": "node dist/index.js",
     "dashboard": "node dashboard.mjs",
+    "test": "node --test test/",
     "prepublishOnly": "npm run build"
   },
   "keywords": [

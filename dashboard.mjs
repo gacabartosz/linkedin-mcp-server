@@ -10,12 +10,28 @@
 
 import { createServer } from 'node:http';
 import { spawn, execSync } from 'node:child_process';
-import { readFileSync, existsSync, writeFileSync, statSync, readdirSync } from 'node:fs';
+import { readFileSync, existsSync, writeFileSync, statSync, readdirSync, mkdirSync, unlinkSync } from 'node:fs';
 import { join, extname, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+
+// Load .env from project root (for LINKEDIN_CLIENT_ID etc. when run via launchd)
+try {
+  const envPath = join(dirname(fileURLToPath(import.meta.url)), '.env');
+  if (existsSync(envPath)) {
+    readFileSync(envPath, 'utf-8').split('\n').forEach(line => {
+      const m = line.match(/^([A-Z_][A-Z0-9_]*)="?([^"]*)"?\s*$/);
+      if (m && !process.env[m[1]]) process.env[m[1]] = m[2];
+    });
+  }
+} catch {}
 import { homedir, platform } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import Database from 'better-sqlite3';
+import {
+  buildPrompt, callClaude, parseClaudeJson, factCheck, loadPersona, retrieveKnowledge,
+} from './lib/comment-gen.mjs';
+import { buildSnapshot } from './lib/analytics-snapshot.mjs';
+// uwaga: validateProposal jest lokalny w tym pliku (sygnatura z postUrn) — nie importujemy z modułu
 
 const PORT = parseInt(process.env.PORT, 10) || 6767;
 const IS_MACOS = platform() === 'darwin';
@@ -171,10 +187,147 @@ function getDb(readonly = true) {
   return new Database(DB_PATH, { readonly });
 }
 
+const ENGAGE_DB_PATH = join(homedir(), '.linkedin-mcp', 'engage.db');
+function getEngageDb(readonly = true) {
+  const db = new Database(ENGAGE_DB_PATH, { readonly });
+  if (!readonly) {
+    // Schema bootstrapping wykonujemy tylko w write mode — readonly handle
+    // rzuciłby "attempt to write a readonly database" na CREATE INDEX nawet z IF NOT EXISTS.
+    db.exec(`CREATE TABLE IF NOT EXISTS reply_proposals (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT NOT NULL,
+      source_id TEXT NOT NULL, source_text TEXT, source_author TEXT,
+      post_urn TEXT, post_text TEXT, proposed_reply TEXT NOT NULL,
+      lead_score INTEGER DEFAULT 0, troll_risk INTEGER DEFAULT 0,
+      engagement_value INTEGER DEFAULT 0, urgency INTEGER DEFAULT 0,
+      status TEXT DEFAULT 'pending', sent_at TEXT,
+      created_at TEXT DEFAULT (datetime('now')), updated_at TEXT DEFAULT (datetime('now'))
+    );
+    CREATE TABLE IF NOT EXISTS thread_comments (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      post_urn TEXT NOT NULL,
+      comment_urn TEXT UNIQUE,
+      parent_comment_urn TEXT,
+      author_name TEXT,
+      author_headline TEXT,
+      comment_text TEXT,
+      comment_created_at TEXT,
+      scraped_at TEXT DEFAULT (datetime('now')),
+      is_our_comment INTEGER DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS idx_tc_post ON thread_comments(post_urn);
+    CREATE INDEX IF NOT EXISTS idx_tc_parent ON thread_comments(parent_comment_urn);
+    CREATE INDEX IF NOT EXISTS idx_tc_ours ON thread_comments(post_urn, is_our_comment);`);
+    // Iter3: pre-send walidacja + composite scoring (idempotent ALTER — wrap try/catch)
+    try { db.exec("ALTER TABLE reply_proposals ADD COLUMN validation_notes TEXT"); } catch {}
+    try { db.exec("ALTER TABLE reply_proposals ADD COLUMN composite_score REAL"); } catch {}
+    try { db.exec("ALTER TABLE reply_proposals ADD COLUMN temperature INTEGER"); } catch {}
+    try { db.exec("ALTER TABLE reply_proposals ADD COLUMN tone TEXT"); } catch {}
+    try { db.exec("ALTER TABLE reply_proposals ADD COLUMN reasoning TEXT"); } catch {}
+    try { db.exec("ALTER TABLE reply_proposals ADD COLUMN context_used TEXT"); } catch {}
+    try { db.exec("ALTER TABLE reply_proposals ADD COLUMN thread_context TEXT"); } catch {}
+    try { db.exec("ALTER TABLE reply_proposals ADD COLUMN parent_in_tree TEXT"); } catch {}
+    try { db.exec("ALTER TABLE reply_proposals ADD COLUMN original_reply TEXT"); } catch {}
+    try { db.exec("ALTER TABLE reply_proposals ADD COLUMN approved_at TEXT"); } catch {}
+    try { db.exec("ALTER TABLE reply_proposals ADD COLUMN sent_via TEXT"); } catch {}
+    try { db.exec("ALTER TABLE reply_proposals ADD COLUMN comment_created_at TEXT"); } catch {}
+    try { db.exec("ALTER TABLE reply_proposals ADD COLUMN post_created_at TEXT"); } catch {}
+  }
+  return db;
+}
+
+// Iter3: composite score = ważona kombinacja 4 wymiarów normalizowana do 0-10
+// Wagi: +0.4 lead_score (chcemy okazji), -0.3 troll_risk (penalty), +0.2 engagement, +0.1 urgency
+// Każdy wymiar 1-5; raw range: 1*0.4 - 5*0.3 + 1*0.2 + 0*0.1 = -0.9 → 5*0.4 - 1*0.3 + 5*0.2 + 5*0.1 = 3.2 (= 4.1 spread)
+function computeComposite(p) {
+  const lead = +p.lead_score || 0;
+  const troll = +p.troll_risk || 0;
+  const eng = +p.engagement_value || 0;
+  const urg = +p.urgency || 0;
+  const raw = 0.4 * lead - 0.3 * troll + 0.2 * eng + 0.1 * urg;
+  const normalized = Math.max(0, Math.min(10, (raw + 0.9) * 10 / 4.1));
+  return Math.round(normalized * 10) / 10;
+}
+
+// Iter3: validateProposal — 5 sanity checków, zwraca array kodów błędów (pustа = passed)
+const VALIDATION_ALLOWED_URLS = ['bartoszgaca.pl', 'github.com/gacabartosz', 'linkedin.com', 'youtube.com/@gacabartosz'];
+function validateProposal({ proposedReply, sourceText, postUrn }, db) {
+  const notes = [];
+  const reply = (proposedReply || '').trim();
+  // 1. Długość
+  if (reply.length < 20) notes.push('TOO_SHORT');
+  if (reply.length > 1250) notes.push('TOO_LONG');
+  // 2. Anti-duplicate vs nasze ostatnie odpowiedzi (fuzzy match: pierwsze 100 chars lowercase)
+  try {
+    const prefix = reply.slice(0, 100).toLowerCase();
+    if (prefix.length >= 40) {
+      const dup = db.prepare(
+        "SELECT 1 FROM thread_comments WHERE is_our_comment = 1 AND LOWER(SUBSTR(comment_text, 1, 100)) = ? LIMIT 1"
+      ).get(prefix);
+      if (dup) notes.push('DUPLICATE');
+    }
+  } catch {}
+  // 3. Echo source — komentarz user'a wklejony do naszej odpowiedzi (>=50 chars contiguous)
+  if (sourceText && sourceText.length > 30 && reply.includes(sourceText.slice(0, 50))) {
+    notes.push('ECHO_SOURCE');
+  }
+  // 4. URL allow-list
+  const urls = reply.match(/https?:\/\/[^\s)\]]+/g) || [];
+  for (const u of urls) {
+    if (!VALIDATION_ALLOWED_URLS.some((a) => u.includes(a))) {
+      notes.push('UNAUTHORIZED_URL:' + u.slice(0, 60));
+    }
+  }
+  // 5. Spam patterns + CAPS overload
+  if (/\b(click here|amazing deal|buy now|limited time)\b/i.test(reply)) notes.push('SPAM_PATTERN');
+  if (/🔥{3,}|⚡{3,}|🚀{3,}/.test(reply)) notes.push('EMOJI_SPAM');
+  const capsRuns = (reply.match(/[A-ZĄĆĘŁŃÓŚŹŻ]{6,}/g) || []).length;
+  if (capsRuns > 2) notes.push('TOO_MANY_CAPS');
+  return notes;
+}
+
+// Iter7: shared builder drzewka komentarzy — używany przez /api/proposals/:id/context i /api/posts/:urn/comments-tree
+function buildCommentsTree(postUrn, targetCommentUrn) {
+  const db = getEngageDb(true);
+  let comments = [];
+  try {
+    comments = db.prepare(
+      "SELECT comment_urn, parent_comment_urn, author_name, author_headline, comment_text, comment_created_at, is_our_comment FROM thread_comments WHERE post_urn = ? ORDER BY id ASC"
+    ).all(postUrn);
+  } catch {}
+  db.close();
+  const byParent = new Map();
+  const topLevel = [];
+  for (const c of comments) {
+    if (c.parent_comment_urn && c.parent_comment_urn !== c.comment_urn) {
+      if (!byParent.has(c.parent_comment_urn)) byParent.set(c.parent_comment_urn, []);
+      byParent.get(c.parent_comment_urn).push(c);
+    } else {
+      topLevel.push(c);
+    }
+  }
+  const tree = [];
+  for (const top of topLevel) {
+    tree.push({ ...top, depth: 0, is_target: targetCommentUrn ? top.comment_urn === targetCommentUrn : false });
+    const children = byParent.get(top.comment_urn) || [];
+    for (const ch of children) {
+      tree.push({ ...ch, depth: 1, is_target: targetCommentUrn ? ch.comment_urn === targetCommentUrn : false });
+    }
+  }
+  return { tree, count: comments.length };
+}
+
+// Run schema bootstrap once on startup so subsequent readonly handles can SELECT freely.
+try { getEngageDb(false).close(); } catch (e) { console.error('Engage DB bootstrap:', e.message); }
+
 function migrateDb() {
   const db = new Database(DB_PATH);
   try { db.exec("ALTER TABLE scheduled_posts ADD COLUMN language TEXT"); } catch {}
   try { db.exec("ALTER TABLE scheduled_posts ADD COLUMN text_alt TEXT"); } catch {}
+  // Iter2: media preview path (local file in output/linkedin-mcp/posts/{id}/) + kind (image|video|banner|carousel)
+  try { db.exec("ALTER TABLE scheduled_posts ADD COLUMN media_preview_path TEXT"); } catch {}
+  try { db.exec("ALTER TABLE scheduled_posts ADD COLUMN media_kind TEXT"); } catch {}
+  // Iter2: per-post override pierwszego komentarza (NULL → użyj hardcoded AUTO_COMMENTS mapping)
+  try { db.exec("ALTER TABLE scheduled_posts ADD COLUMN auto_comment_override TEXT"); } catch {}
 
   const posts = db.prepare("SELECT id, text FROM scheduled_posts WHERE language IS NULL").all();
   const stmt = db.prepare("UPDATE scheduled_posts SET language = ? WHERE id = ?");
@@ -191,6 +344,7 @@ function migrateDb() {
       slug TEXT UNIQUE NOT NULL,
       title TEXT NOT NULL,
       hook TEXT,
+      hook_variants TEXT,
       language TEXT DEFAULT 'pl',
       publish_at TEXT NOT NULL,
       status TEXT DEFAULT 'plan',
@@ -226,6 +380,11 @@ function migrateDb() {
     INSERT OR IGNORE INTO media_plan_settings (key, value) VALUES ('gsc_auto_submit', '1');
   `);
 
+  // Iter8: backup oryginałów post_text przed regeneracją (anti-halucynacje)
+  try { db.exec("ALTER TABLE media_plan_items ADD COLUMN original_post_text TEXT"); } catch {}
+  // Hook Lab: warianty hooka (JSON) — idempotentnie, dla istniejących baz
+  try { db.exec("ALTER TABLE media_plan_items ADD COLUMN hook_variants TEXT"); } catch {}
+
   db.close();
 }
 
@@ -246,8 +405,11 @@ function getDaemonPid() {
   } catch { return null; }
 }
 
-function callMCPServer(spawnConfig, toolName, args) {
+function callMCPServer(spawnConfig, toolName, args, opts) {
   return new Promise((resolve, reject) => {
+    // Iter6: per-tool timeout — banner/carousel/media/screenshot z Puppeteer wymagają więcej czasu niż 60s
+    const heavyTools = /banner|carousel|media_upload|screenshot|casestudy|gemini_image/i;
+    const timeoutMs = (opts && opts.timeout) || (heavyTools.test(toolName) ? 180000 : 60000);
     const msgs = [
       JSON.stringify({jsonrpc:'2.0',id:1,method:'initialize',params:{protocolVersion:'2024-11-05',capabilities:{},clientInfo:{name:'dashboard',version:'2.0'}}}),
       JSON.stringify({jsonrpc:'2.0',id:2,method:'tools/call',params:{name:toolName,arguments:args}}),
@@ -287,8 +449,9 @@ function callMCPServer(spawnConfig, toolName, args) {
 
     proc.on('close', () => {
       if (!resolved) {
-        const stderrSnippet = stderr.slice(0, 500).trim();
-        reject(new Error(stderrSnippet || 'No MCP response'));
+        // Iter6: pełny stderr w error message (ostatnie 1500 znaków) — pomaga debugować banner failures
+        const stderrSnippet = stderr.slice(-1500).trim();
+        reject(new Error(stderrSnippet || 'No MCP response for tool: ' + toolName));
       }
     });
     // Write init first, then tools/call after small delay so server processes them in order
@@ -297,8 +460,15 @@ function callMCPServer(spawnConfig, toolName, args) {
       if (resolved) return;
       proc.stdin.write(JSON.stringify({jsonrpc:'2.0',id:2,method:'tools/call',params:{name:toolName,arguments:args}}) + '\n');
     }, 300);
-    // Keep stdin open — close only on resolve/reject. Some MCP servers exit on EOF before responding.
-    setTimeout(() => { if (!resolved) { resolved = true; proc.kill(); reject(new Error('Timeout 60s')); } }, 60000);
+    // Iter6: timeout zależny od narzędzia (heavyTools=180s, inne=60s)
+    setTimeout(() => {
+      if (!resolved) {
+        resolved = true;
+        proc.kill();
+        const stderrSnippet = stderr.slice(-1500).trim();
+        reject(new Error('Timeout ' + (timeoutMs/1000) + 's for ' + toolName + (stderrSnippet ? '\n--- stderr ---\n' + stderrSnippet : '')));
+      }
+    }, timeoutMs);
   });
 }
 
@@ -344,12 +514,67 @@ function json(res, data, status = 200) {
 }
 
 function enrichPost(p) {
-  p.auto_comment = getAutoComment(p.text);
+  // Iter2: per-post override pierwszego komentarza ma priorytet nad hardcoded mapowaniem
+  p.auto_comment = (p.auto_comment_override && p.auto_comment_override.trim())
+    || getAutoComment(p.text);
+  p.auto_comment_source = (p.auto_comment_override && p.auto_comment_override.trim()) ? 'custom' : 'auto';
   p.image_file = getImageFile(p.text);
   return p;
 }
 
-const MIME = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.webp': 'image/webp' };
+const MIME = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.webp': 'image/webp', '.mp4': 'video/mp4', '.webm': 'video/webm', '.mov': 'video/quicktime' };
+
+// Iter2: katalog na uploaded/generated media per scheduled post
+const POSTS_MEDIA_DIR = join(IMG_DIR, 'posts');
+
+// Iter2: minimalny multipart/form-data parser. Wystarczy dla plików <50MB.
+// Zwraca { fields: { name: string }, files: { name: { filename, contentType, data: Buffer } } }
+function parseMultipart(req) {
+  return new Promise((resolve, reject) => {
+    const ctype = req.headers['content-type'] || '';
+    const m = ctype.match(/boundary=([^;]+)/);
+    if (!m) return reject(new Error('Missing multipart boundary'));
+    const boundary = '--' + m[1];
+    const chunks = [];
+    req.on('data', (c) => chunks.push(c));
+    req.on('end', () => {
+      try {
+        const buf = Buffer.concat(chunks);
+        const parts = [];
+        const bbuf = Buffer.from(boundary);
+        let start = 0;
+        while (true) {
+          const idx = buf.indexOf(bbuf, start);
+          if (idx < 0) break;
+          if (start > 0) parts.push(buf.slice(start, idx - 2)); // -2 to strip CRLF
+          start = idx + bbuf.length;
+          if (buf.slice(start, start + 2).toString() === '--') break;
+          start += 2; // strip CRLF after boundary
+        }
+        const fields = {};
+        const files = {};
+        for (const part of parts) {
+          const headerEnd = part.indexOf('\r\n\r\n');
+          if (headerEnd < 0) continue;
+          const headerStr = part.slice(0, headerEnd).toString();
+          const body = part.slice(headerEnd + 4);
+          const disp = headerStr.match(/Content-Disposition:\s*form-data;\s*name="([^"]+)"(?:;\s*filename="([^"]*)")?/i);
+          if (!disp) continue;
+          const name = disp[1];
+          const filename = disp[2];
+          if (filename !== undefined) {
+            const ct = (headerStr.match(/Content-Type:\s*([^\r\n]+)/i) || [, 'application/octet-stream'])[1].trim();
+            files[name] = { filename, contentType: ct, data: body };
+          } else {
+            fields[name] = body.toString('utf-8');
+          }
+        }
+        resolve({ fields, files });
+      } catch (e) { reject(e); }
+    });
+    req.on('error', reject);
+  });
+}
 
 async function handleRequest(req, res) {
   const url = new URL(req.url, 'http://localhost:' + PORT);
@@ -381,8 +606,9 @@ async function handleRequest(req, res) {
       return;
     }
 
-    // GET /oauth/callback — production OAuth redirect target (replaces localhost:8585 callback in prod)
-    if (method === 'GET' && path === '/oauth/callback') {
+    // GET /oauth/callback — production OAuth redirect target
+    // Also handles /callback alias (registered in LinkedIn Developer App)
+    if (method === 'GET' && (path === '/oauth/callback' || path === '/callback')) {
       const code = url.searchParams.get('code');
       const errParam = url.searchParams.get('error');
       if (errParam) {
@@ -398,7 +624,7 @@ async function handleRequest(req, res) {
       try {
         const clientId = process.env.LINKEDIN_CLIENT_ID;
         const clientSecret = process.env.LINKEDIN_CLIENT_SECRET;
-        const redirectUri = process.env.OAUTH_PUBLIC_REDIRECT_URI || `http://localhost:${PORT}/oauth/callback`;
+        const redirectUri = process.env.OAUTH_PUBLIC_REDIRECT_URI || `http://localhost:${PORT}/callback`;
         if (!clientId || !clientSecret) throw new Error('LINKEDIN_CLIENT_ID/SECRET missing in env');
         const tokenResp = await fetch('https://www.linkedin.com/oauth/v2/accessToken', {
           method: 'POST',
@@ -443,7 +669,8 @@ async function handleRequest(req, res) {
       const clientId = process.env.LINKEDIN_CLIENT_ID;
       if (!clientId) { res.writeHead(500); res.end('LINKEDIN_CLIENT_ID missing'); return; }
       const redirectUri = process.env.OAUTH_PUBLIC_REDIRECT_URI || `http://localhost:${PORT}/oauth/callback`;
-      const scopes = (url.searchParams.get('scopes') || 'openid profile email w_member_social r_member_postAnalytics').split(/\s+/).join(' ');
+      // r_member_social: bez tego oficjalne API zwraca 403 na socialActions.GET_ALL (auto-engage czytanie komentarzy pod postami)
+      const scopes = (url.searchParams.get('scopes') || 'openid profile email w_member_social r_member_postAnalytics r_member_social').split(/\s+/).join(' ');
       const state = randomUUID();
       const authUrl = new URL('https://www.linkedin.com/oauth/v2/authorization');
       authUrl.searchParams.set('response_type', 'code');
@@ -454,6 +681,49 @@ async function handleRequest(req, res) {
       res.writeHead(302, { Location: authUrl.toString() });
       res.end();
       return;
+    }
+
+    // ── /api/guidelines — edytowalne wytyczne dla generatorów (humanizer + fact-checker) ──
+    // Czytane przez auto-comment-playwright.mjs (per wywołanie) i scripts/draft-article.mjs (przy starcie).
+    const GUIDELINES_ALLOWED = new Set(['humanizer', 'fact-checker']);
+    const GUIDELINES_DIR = join(DATA_DIR, 'guidelines');
+
+    if (method === 'GET' && path.match(/^\/api\/guidelines\/[a-z-]+$/)) {
+      const name = path.split('/').pop();
+      if (!GUIDELINES_ALLOWED.has(name)) return json(res, { error: 'unknown guideline' }, 404);
+      const filePath = join(GUIDELINES_DIR, `${name}.md`);
+      try {
+        const content = readFileSync(filePath, 'utf-8');
+        const stat = (() => { try { return statSync(filePath); } catch { return null; } })();
+        return json(res, { name, content, exists: true, last_modified: stat?.mtime?.toISOString() || null, size: content.length });
+      } catch {
+        return json(res, { name, content: '', exists: false, last_modified: null, size: 0 });
+      }
+    }
+
+    // GET /api/scraper-config — harmonogram + źródła danych analityki (panel w zakładce System)
+    if (method === 'GET' && path === '/api/scraper-config') {
+      let cfg = {};
+      try { cfg = JSON.parse(readFileSync(join(DATA_DIR, 'scraper-schedule.json'), 'utf-8')); } catch {}
+      let chartsLastDate = null, autoLastRun = null;
+      try {
+        const adb = new Database(join(DATA_DIR, 'analytics.db'), { readonly: true });
+        chartsLastDate = adb.prepare("SELECT MAX(date) d FROM creator_analytics").get()?.d || null;
+        autoLastRun = adb.prepare("SELECT MAX(date) d FROM daily_stats WHERE is_stale=0").get()?.d || null;
+        adb.close();
+      } catch {}
+      return json(res, { ...cfg, charts_last_date: chartsLastDate, auto_analytics_last_run: autoLastRun });
+    }
+
+    if (method === 'PUT' && path.match(/^\/api\/guidelines\/[a-z-]+$/)) {
+      const name = path.split('/').pop();
+      if (!GUIDELINES_ALLOWED.has(name)) return json(res, { error: 'unknown guideline' }, 404);
+      const body = await parseBody(req);
+      const content = (body.content ?? '').toString();
+      if (!existsSync(GUIDELINES_DIR)) mkdirSync(GUIDELINES_DIR, { recursive: true });
+      const filePath = join(GUIDELINES_DIR, `${name}.md`);
+      writeFileSync(filePath, content);
+      return json(res, { name, content, exists: true, size: content.length, saved_at: new Date().toISOString() });
     }
 
     // PUT /api/scraper-auth — update li_at cookie from UI textarea
@@ -617,6 +887,135 @@ async function handleRequest(req, res) {
       return;
     }
 
+    // Iter5: GET /api/service/health — agregat: daemons + DB + auth + dashboard self
+    // Używane przez Klyx banner i auto-healthwatch.mjs daemon
+    if (method === 'GET' && path === '/api/service/health') {
+      // 1. LaunchAgent statuses (launchctl list)
+      let agents = [];
+      try {
+        const out = execSync('launchctl list 2>/dev/null | grep com.gaca.linkedin-', { encoding: 'utf-8' });
+        agents = out.trim().split('\n').filter(Boolean).map((line) => {
+          const parts = line.split('\t');
+          const pid = parts[0];
+          const lastExit = parts[1];
+          const label = (parts[2] || '').trim();
+          return {
+            label,
+            running: pid !== '-',
+            pid: pid === '-' ? null : Number(pid),
+            last_exit: Number(lastExit) || 0,
+          };
+        });
+      } catch {}
+
+      // 2. DB stats (size, mtime, row counts)
+      const HOME_LM = join(homedir(), '.linkedin-mcp');
+      const DB_SPECS = [
+        { name: 'scheduler', path: DB_PATH, tables: ['scheduled_posts', 'media_plan_items'] },
+        { name: 'engage', path: ENGAGE_DB_PATH, tables: ['reply_proposals', 'thread_comments'] },
+        { name: 'prospects', path: PROSPECTS_DB_PATH, tables: ['prospects'] },
+        { name: 'analytics', path: join(HOME_LM, 'analytics.db'), tables: ['creator_analytics'] },
+        { name: 'content', path: join(HOME_LM, 'content.db'), tables: [] },
+      ];
+      const dbs = DB_SPECS.map((d) => {
+        try {
+          const stat = statSync(d.path);
+          const conn = new Database(d.path, { readonly: true });
+          const counts = {};
+          for (const t of d.tables) {
+            try { counts[t] = conn.prepare(`SELECT COUNT(*) AS c FROM ${t}`).get().c; } catch {}
+          }
+          conn.close();
+          return {
+            name: d.name,
+            size_bytes: stat.size,
+            last_write_iso: stat.mtime.toISOString(),
+            last_write_age_hours: Math.round((Date.now() - stat.mtime.getTime()) / 3.6e6),
+            row_counts: counts,
+            ok: true,
+          };
+        } catch (e) {
+          return { name: d.name, ok: false, error: e.message?.slice(0, 100) };
+        }
+      });
+
+      // 3. Auth tokens — LinkedIn (auth.json) + scraper (scraper-auth.json)
+      const auth = { linkedin: null, scraper: null };
+      try {
+        const a = JSON.parse(readFileSync(AUTH_PATH, 'utf-8'));
+        if (a.expires_at) {
+          const expMs = new Date(a.expires_at).getTime();
+          const daysLeft = Math.round((expMs - Date.now()) / 8.64e7);
+          auth.linkedin = {
+            expires_iso: new Date(expMs).toISOString(),
+            days_left: daysLeft,
+            ok: daysLeft > 7,
+          };
+        } else {
+          auth.linkedin = { ok: !!a.access_token };
+        }
+      } catch (e) { auth.linkedin = { ok: false, error: e.message?.slice(0, 80) }; }
+      try {
+        const sa = JSON.parse(readFileSync(join(HOME_LM, 'scraper-auth.json'), 'utf-8'));
+        auth.scraper = { ok: !!sa.li_at, last_refresh_iso: sa.last_refresh || null };
+      } catch { auth.scraper = { ok: false }; }
+
+      // 4. Daemon last activity — z .log mtime
+      const DAEMON_LOGS = {
+        'com.gaca.linkedin-autopublish': 'auto-publish.log',
+        'com.gaca.linkedin-autoengage': 'auto-engage.log',
+        'com.gaca.linkedin-playwright-comments': 'playwright-comments.log',
+        'com.gaca.linkedin-comment-sender': 'comment-sender.log',
+        'com.gaca.linkedin-autodm': 'auto-dm.log',
+        'com.gaca.linkedin-invite': 'auto-invite.log',
+        'com.gaca.linkedin-prospect': 'auto-prospect.log',
+        'com.gaca.linkedin-analytics': 'auto-analytics.log',
+        'com.gaca.linkedin-autonotify': 'auto-notify.log',
+        'com.gaca.linkedin-cookie-refresh': 'cookie-refresh.log',
+      };
+      const enriched = agents.map((a) => {
+        const logName = DAEMON_LOGS[a.label];
+        if (!logName) return a;
+        const logPath = join(IMG_DIR, logName);
+        try {
+          const stat = statSync(logPath);
+          return {
+            ...a,
+            log_last_write_age_min: Math.round((Date.now() - stat.mtime.getTime()) / 60000),
+            log_size_kb: Math.round(stat.size / 1024),
+          };
+        } catch { return a; }
+      });
+
+      // 5. Composite overall: fail jeśli ktokolwiek crashed/auth bad/DB unreachable
+      const failedDbs = dbs.filter((d) => !d.ok).length;
+      const staleDbs = dbs.filter((d) => d.ok && d.last_write_age_hours > 48).length;
+      const crashedAgents = enriched.filter((a) => !a.running && a.last_exit !== 0).length;
+      const authIssues =
+        (auth.linkedin && !auth.linkedin.ok ? 1 : 0) +
+        (auth.scraper && !auth.scraper.ok ? 1 : 0);
+      const overall =
+        failedDbs + crashedAgents + authIssues > 0 ? 'fail' : staleDbs > 0 ? 'warn' : 'ok';
+
+      return json(res, {
+        overall,
+        timestamp: new Date().toISOString(),
+        dashboard: { ok: true, port: PORT, uptime_s: Math.round(process.uptime()) },
+        agents: enriched,
+        dbs,
+        auth,
+        summary: {
+          agents_running: enriched.filter((a) => a.running).length,
+          agents_total: enriched.length,
+          agents_crashed: crashedAgents,
+          dbs_ok: dbs.filter((d) => d.ok).length,
+          dbs_total: dbs.length,
+          dbs_stale_48h: staleDbs,
+          auth_issues: authIssues,
+        },
+      });
+    }
+
     // GET /api/health — production smoke test endpoint (D1 verification)
     if (method === 'GET' && path === '/api/health') {
       const checks = { status: 'ok', db: 'unknown', auth: 'unknown', version: process.env.GIT_SHA || 'dev', uptime_s: Math.round(process.uptime()) };
@@ -664,12 +1063,15 @@ async function handleRequest(req, res) {
     // GET /api/posts
     if (method === 'GET' && path === '/api/posts') {
       const status = url.searchParams.get('status');
+      const includeArchived = url.searchParams.get('archived') === '1';
       const db = getDb();
       let posts;
       if (status) {
         posts = db.prepare("SELECT * FROM scheduled_posts WHERE status = ? ORDER BY publish_at ASC").all(status);
-      } else {
+      } else if (includeArchived) {
         posts = db.prepare("SELECT * FROM scheduled_posts ORDER BY publish_at ASC").all();
+      } else {
+        posts = db.prepare("SELECT * FROM scheduled_posts WHERE status NOT IN ('archived','cancelled') ORDER BY publish_at ASC").all();
       }
       db.close();
       posts.forEach(enrichPost);
@@ -691,6 +1093,224 @@ async function handleRequest(req, res) {
       return json(res, enrichPost(post), 201);
     }
 
+    // ── Iter2: media per post ─────────────────────────────────────────────
+
+    // Iter2: GET /mp-banner/:id — serve banera z media_plan_items.banner_path (absolutna ścieżka w bazie)
+    if (method === 'GET' && path.match(/^\/mp-banner\/[^/]+$/)) {
+      const id = decodeURIComponent(path.split('/')[2]);
+      const db = getDb();
+      const item = db.prepare("SELECT banner_path FROM media_plan_items WHERE id = ? OR slug = ?").get(id, id);
+      db.close();
+      if (!item || !item.banner_path || !existsSync(item.banner_path)) {
+        res.writeHead(404); res.end('Not found'); return;
+      }
+      const ext = extname(item.banner_path).toLowerCase();
+      const mime = MIME[ext] || 'image/png';
+      const data = readFileSync(item.banner_path);
+      res.writeHead(200, { 'Content-Type': mime, 'Cache-Control': 'public, max-age=300' });
+      res.end(data);
+      return;
+    }
+
+    // GET /post-media/:id/:filename — serve uploaded/generated media files
+    // Iter13: fallback do ~/.linkedin-mcp/images/posts/ (NVIDIA FLUX outputs)
+    // bo regenerate-posts.mjs zapisuje absolute path do scheduled_posts.media_preview_path.
+    if (method === 'GET' && path.startsWith('/post-media/')) {
+      const parts = path.slice('/post-media/'.length).split('/');
+      if (parts.length !== 2 || parts[0].includes('..') || parts[1].includes('..') || parts[1].includes('/')) {
+        res.writeHead(403); res.end('Forbidden'); return;
+      }
+      let filePath = join(POSTS_MEDIA_DIR, parts[0], parts[1]);
+      if (!existsSync(filePath)) {
+        // Fallback: spróbuj ~/.linkedin-mcp/images/posts/<filename>
+        const altPath = join(homedir(), '.linkedin-mcp', 'images', 'posts', parts[1]);
+        if (existsSync(altPath)) {
+          filePath = altPath;
+        } else {
+          res.writeHead(404); res.end('Not found'); return;
+        }
+      }
+      const ext = extname(parts[1]).toLowerCase();
+      let mime = MIME[ext] || 'application/octet-stream';
+      const data = readFileSync(filePath);
+      // Magic bytes auto-detect (NVIDIA FLUX zwraca JPEG w pliku .png)
+      if (ext === '.png' && data.length >= 3 && data[0] === 0xFF && data[1] === 0xD8 && data[2] === 0xFF) {
+        mime = 'image/jpeg';
+      }
+      res.writeHead(200, { 'Content-Type': mime, 'Cache-Control': 'public, max-age=300' });
+      res.end(data);
+      return;
+    }
+
+    // POST /api/posts/:id/media  — multipart upload (field: 'file')
+    if (method === 'POST' && path.match(/^\/api\/posts\/[^/]+\/media$/)) {
+      const id = path.split('/')[3];
+      const db = getDb(false);
+      const post = db.prepare("SELECT * FROM scheduled_posts WHERE id = ?").get(id);
+      if (!post) { db.close(); return json(res, { error: 'Not found' }, 404); }
+      let parsed;
+      try { parsed = await parseMultipart(req); }
+      catch (e) { db.close(); return json(res, { error: 'Multipart parse failed: ' + e.message }, 400); }
+      const file = parsed.files?.file;
+      if (!file || !file.data?.length) { db.close(); return json(res, { error: 'No file in field "file"' }, 400); }
+      const ext = (extname(file.filename || '').toLowerCase() || '.bin');
+      const kind = (file.contentType || '').startsWith('video/') ? 'video' : 'image';
+      const targetDir = join(POSTS_MEDIA_DIR, id);
+      try { mkdirSync(targetDir, { recursive: true }); } catch {}
+      const filename = 'preview' + ext;
+      const fullPath = join(targetDir, filename);
+      writeFileSync(fullPath, file.data);
+      const relative = join('output', 'linkedin-mcp', 'posts', id, filename);
+      db.prepare("UPDATE scheduled_posts SET media_preview_path = ?, media_kind = ?, updated_at = datetime('now') WHERE id = ?")
+        .run(relative, kind, id);
+      db.close();
+      return json(res, { ok: true, kind, preview_url: '/post-media/' + id + '/' + filename, size: file.data.length });
+    }
+
+    // DELETE /api/posts/:id/media — usuń uploaded media i wyczyść kolumny
+    if (method === 'DELETE' && path.match(/^\/api\/posts\/[^/]+\/media$/)) {
+      const id = path.split('/')[3];
+      const db = getDb(false);
+      const post = db.prepare("SELECT * FROM scheduled_posts WHERE id = ?").get(id);
+      if (!post) { db.close(); return json(res, { error: 'Not found' }, 404); }
+      if (post.media_preview_path) {
+        const filename = post.media_preview_path.split('/').pop();
+        const fullPath = join(POSTS_MEDIA_DIR, id, filename);
+        try { if (existsSync(fullPath)) unlinkSync(fullPath); } catch {}
+      }
+      db.prepare("UPDATE scheduled_posts SET media_preview_path = NULL, media_kind = NULL, updated_at = datetime('now') WHERE id = ?").run(id);
+      db.close();
+      return json(res, { ok: true });
+    }
+
+    // POST /api/posts/:id/banner — wygeneruj banner z preset, zapisz jako media_preview_path
+    if (method === 'POST' && path.match(/^\/api\/posts\/[^/]+\/banner$/)) {
+      const id = path.split('/')[3];
+      const body = await parseBody(req).catch(() => ({}));
+      const preset = body.preset || 'post5';
+      const db = getDb();
+      const post = db.prepare("SELECT id FROM scheduled_posts WHERE id = ?").get(id);
+      db.close();
+      if (!post) return json(res, { error: 'Not found' }, 404);
+
+      const targetDir = join(POSTS_MEDIA_DIR, id);
+      try { mkdirSync(targetDir, { recursive: true }); } catch {}
+      const filename = 'preview.png';
+      const fullPath = join(targetDir, filename);
+      // Iter6: usuń poprzedni preview żeby wymusić świeży render (banner-generator może cache'ować)
+      try { if (existsSync(fullPath)) unlinkSync(fullPath); } catch {}
+      console.log(`[banner] generating preset=${preset} for post ${id} → ${fullPath}`);
+      try {
+        // Iter6: parametr nazywa się save_path nie output_path (sprawdzono w src/banner/index.ts:244)
+        const result = await callMCP('linkedin_banner_generate', { preset, save_path: fullPath });
+        console.log(`[banner] MCP returned:`, JSON.stringify(result).slice(0, 200));
+      } catch (err) {
+        console.error(`[banner] failed for ${id}:`, err.message);
+        return json(res, { error: 'Banner generation failed: ' + err.message }, 500);
+      }
+      // Verify plik istnieje (MCP może wrócić OK ale nic nie zapisać)
+      if (!existsSync(fullPath)) {
+        console.error(`[banner] MCP succeeded but file not created: ${fullPath}`);
+        return json(res, { error: 'Banner MCP returned OK but file not created at ' + fullPath }, 500);
+      }
+      const relative = join('output', 'linkedin-mcp', 'posts', id, filename);
+      const dbw = getDb(false);
+      dbw.prepare("UPDATE scheduled_posts SET media_preview_path = ?, media_kind = ?, updated_at = datetime('now') WHERE id = ?")
+        .run(relative, 'banner', id);
+      dbw.close();
+      console.log(`[banner] success for ${id}, saved to DB`);
+      return json(res, { ok: true, preset, preview_url: '/post-media/' + id + '/' + filename });
+    }
+
+    // Iter8: POST /api/posts/:id/ai-image — wygeneruj AI obraz przez Google Imagen 4
+    if (method === 'POST' && path.match(/^\/api\/posts\/[^/]+\/ai-image$/)) {
+      const id = path.split('/')[3];
+      const body = await parseBody(req).catch(() => ({}));
+      const db = getDb();
+      const post = db.prepare("SELECT id, text FROM scheduled_posts WHERE id = ?").get(id);
+      db.close();
+      if (!post) return json(res, { error: 'Not found' }, 404);
+
+      const basePrompt = body.prompt || post.text.slice(0, 200);
+      const fullPrompt = body.prompt
+        ? basePrompt
+        : `Professional LinkedIn post image, photorealistic, clean tech-forward composition: ${basePrompt}. Style: navy and electric blue accents, minimalist, no text overlay, depth of field, 16:9 aspect ratio.`;
+
+      const targetDir = join(POSTS_MEDIA_DIR, id);
+      try { mkdirSync(targetDir, { recursive: true }); } catch {}
+      const filename = 'ai-image.png';
+      const fullPath = join(targetDir, filename);
+      try { if (existsSync(fullPath)) unlinkSync(fullPath); } catch {}
+
+      console.log(`[ai-image] generating for post ${id} → ${fullPath}`);
+      try {
+        const result = await callMCP('linkedin_gemini_image', {
+          prompt: fullPrompt,
+          aspect_ratio: body.aspect_ratio || '16:9',
+          save_path: fullPath,
+        });
+        console.log(`[ai-image] MCP returned:`, JSON.stringify(result).slice(0, 200));
+      } catch (err) {
+        console.error(`[ai-image] failed for ${id}:`, err.message);
+        return json(res, { error: 'AI image gen failed: ' + err.message }, 500);
+      }
+      if (!existsSync(fullPath)) {
+        return json(res, { error: 'Imagen returned OK but file not created at ' + fullPath }, 500);
+      }
+      const relative = join('output', 'linkedin-mcp', 'posts', id, filename);
+      const dbw = getDb(false);
+      dbw.prepare("UPDATE scheduled_posts SET media_preview_path = ?, media_kind = ?, updated_at = datetime('now') WHERE id = ?")
+        .run(relative, 'image', id);
+      dbw.close();
+      return json(res, { ok: true, prompt: fullPrompt, preview_url: '/post-media/' + id + '/' + filename });
+    }
+
+    // Iter7: POST /api/posts/:id/backfill-comments — pobierz komentarze z LinkedIn dla published posta
+    if (method === 'POST' && path.match(/^\/api\/posts\/[^/]+\/backfill-comments$/)) {
+      const id = path.split('/')[3];
+      const db = getDb();
+      const post = db.prepare("SELECT post_urn FROM scheduled_posts WHERE id = ?").get(id);
+      db.close();
+      if (!post?.post_urn) return json(res, { error: 'Post nie ma post_urn (nieopublikowany?)' }, 400);
+      try {
+        const result = await callMCP('linkedin_comments_list', { post_urn: post.post_urn, count: 100 });
+        const comments = result?.comments || result?.items || result?.elements || [];
+        const edb = getEngageDb(false);
+        const insert = edb.prepare(`
+          INSERT OR IGNORE INTO thread_comments
+            (post_urn, comment_urn, parent_comment_urn, author_name, author_headline, comment_text, comment_created_at, is_our_comment, scraped_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+        `);
+        const OUR_NAMES = ['bartosz gaca'];
+        let inserted = 0;
+        const tx = edb.transaction(() => {
+          for (const c of comments) {
+            const author = c.author_name || c.author || c.actor?.name || '';
+            const isOurs = OUR_NAMES.some((n) => author.toLowerCase().includes(n)) ? 1 : 0;
+            const urnId = c.comment_urn || c.urn || c.id || c.entityUrn;
+            if (!urnId) continue;
+            const info = insert.run(
+              post.post_urn,
+              urnId,
+              c.parent_comment_urn || c.parent_urn || c.parentUrn || null,
+              author,
+              c.author_headline || c.headline || c.actor?.title || '',
+              c.text || c.comment_text || c.message?.text || c.commentary || '',
+              c.created_at || c.comment_created_at || c.createdAt || null,
+              isOurs,
+            );
+            if (info.changes) inserted++;
+          }
+        });
+        tx();
+        edb.close();
+        return json(res, { ok: true, total: comments.length, inserted, post_urn: post.post_urn });
+      } catch (err) {
+        console.error('[backfill-comments] error:', err.message);
+        return json(res, { error: err.message || 'MCP call failed' }, 500);
+      }
+    }
+
     // POST /api/posts/:id/publish (must be before generic :id)
     if (method === 'POST' && path.match(/^\/api\/posts\/[^/]+\/publish$/)) {
       const id = path.split('/')[3];
@@ -699,47 +1319,40 @@ async function handleRequest(req, res) {
       if (!post) { db.close(); return json(res, { error: 'Not found' }, 404); }
       db.close();
 
+      // FIX 2026-06-29: ręczny "Publish" duplikował uproszczoną ścieżkę publikacji
+      // (callMCP linkedin_post_create/media_upload), która:
+      //   1) NIE escapowała tekstu → LinkedIn ucinał post na pierwszym "(" (reserved char),
+      //   2) sklejała join(MCP_DIR, media_preview_path) z ABSOLUTNĄ ścieżką → zła ścieżka,
+      //      błąd połykany (try/catch bez re-throw) → post szedł BEZ zdjęcia,
+      //   3) nie czekała na asset AVAILABLE i nie zapisywała media_ids.
+      // Zamiast utrzymywać drugą, gorszą ścieżkę — DELEGUJEMY do działającego daemona
+      // (auto-publish.mjs, resident): escapuje (escapeLinkedInText), uploaduje z pollingiem
+      // AVAILABLE i ma bramkę assertPublishable("nie publikuję bez zdjęcia"). Jedna ścieżka
+      // = determinizm: ZAWSZE wychodzi cały tekst + zdjęcie, albo nic (status=failed + alert).
       try {
-        const createArgs = { text: post.text };
-        if (post.media_ids) {
-          const ids = JSON.parse(post.media_ids);
-          if (ids.length > 0) createArgs.media_ids = ids;
-        }
-        const result = await callMCP('linkedin_post_create', createArgs);
-
         const dbw = getDb(false);
-        dbw.prepare("UPDATE scheduled_posts SET status = 'published', post_urn = ?, published_at = ?, updated_at = datetime('now') WHERE id = ?")
-          .run(result.post_urn, new Date().toISOString(), id);
-
-        // Auto-link to media_plan_items + auto-trigger GSC pipeline (if linked + auto-submit ON)
-        const linkedItem = dbw.prepare("SELECT * FROM media_plan_items WHERE scheduled_post_id = ?").get(id);
-        if (linkedItem) {
-          dbw.prepare("UPDATE media_plan_items SET linkedin_post_urn = ?, status = ?, updated_at = datetime('now') WHERE id = ?")
-            .run(result.post_urn, 'opublikowane', linkedItem.id);
-          const setting = dbw.prepare("SELECT value FROM media_plan_settings WHERE key = 'gsc_auto_submit'").get();
-          dbw.close();
-          if (setting?.value === '1' && linkedItem.wiki_slug) {
-            // Fire-and-forget GSC pipeline (response returns to caller immediately)
-            (async () => {
-              try {
-                const r = await fetch(`http://localhost:${PORT}/api/media-plan/${linkedItem.id}/gsc-submit`, { method: 'POST' });
-                console.log('Auto GSC submit:', linkedItem.slug, r.status);
-              } catch (e) {
-                console.error('Auto GSC error:', e.message);
-              }
-            })();
-          }
-        } else {
-          dbw.close();
-        }
-        return json(res, { ok: true, post_urn: result.post_urn });
+        // Reset wiersza → daemon złapie go w ≤60 s (status=scheduled, qa=approved,
+        // publish_at w przeszłości). media_ids=NULL wymusza świeży upload z media_preview_path.
+        dbw.prepare(`UPDATE scheduled_posts
+          SET status = 'scheduled', qa_status = 'approved',
+              post_urn = NULL, published_at = NULL, media_ids = NULL,
+              error = NULL, retry_count = 0,
+              publish_at = datetime('now','-1 minute'),
+              updated_at = datetime('now')
+          WHERE id = ?`).run(id);
+        dbw.close();
+        return json(res, {
+          ok: true,
+          queued: true,
+          message: 'Zakolejkowano do publikacji przez daemon (escaping + upload media + bramka). Wyjdzie w ≤60 s (+0–7 min jitter).'
+        });
       } catch (err) {
         return json(res, { error: err.message }, 500);
       }
     }
 
     // GET /api/posts/:id
-    if (method === 'GET' && path.match(/^\/api\/posts\/[^/]+$/) && !path.includes('/publish')) {
+    if (method === 'GET' && path.match(/^\/api\/posts\/[^/]+$/) && !path.includes('/publish') && path !== '/api/posts/queue-unified') {
       const id = path.split('/')[3];
       const db = getDb();
       const post = db.prepare("SELECT * FROM scheduled_posts WHERE id = ?").get(id);
@@ -760,10 +1373,14 @@ async function handleRequest(req, res) {
       const visibility = body.visibility ?? post.visibility;
       const language = body.language ?? post.language ?? detectLanguage(text);
       const text_alt = body.text_alt !== undefined ? body.text_alt : post.text_alt;
-      db.prepare("UPDATE scheduled_posts SET text = ?, publish_at = ?, visibility = ?, language = ?, text_alt = ?, updated_at = datetime('now') WHERE id = ?")
-        .run(text, publish_at, visibility, language, text_alt, id);
+      // Iter2: override pierwszego komentarza (string lub null żeby przywrócić auto z mapowania)
+      const auto_comment_override = body.auto_comment_override !== undefined
+        ? (body.auto_comment_override || null)
+        : post.auto_comment_override;
+      db.prepare("UPDATE scheduled_posts SET text = ?, publish_at = ?, visibility = ?, language = ?, text_alt = ?, auto_comment_override = ?, updated_at = datetime('now') WHERE id = ?")
+        .run(text, publish_at, visibility, language, text_alt, auto_comment_override, id);
       db.close();
-      return json(res, enrichPost({ ...post, text, publish_at, visibility, language, text_alt }));
+      return json(res, enrichPost({ ...post, text, publish_at, visibility, language, text_alt, auto_comment_override }));
     }
 
     // DELETE /api/posts/:id
@@ -902,7 +1519,19 @@ Po zakończeniu wypisz raport: które zaproszenia wysłane, które nie (np. już
           const exp = new Date(auth.expires_at);
           officialStatus = exp > new Date() ? `valid_until_${auth.expires_at.slice(0,10)}` : 'expired';
         } catch { officialStatus = 'no_file'; }
-        health.auth = { voyager: voyagerStatus, official: officialStatus };
+        // Generuj OAuth URL jeśli token expired i CLIENT_ID dostępny
+        let oauthUrl = null;
+        const clientId = process.env.LINKEDIN_CLIENT_ID;
+        if (clientId && (officialStatus === 'expired' || officialStatus === 'no_file')) {
+          const redirect = process.env.OAUTH_PUBLIC_REDIRECT_URI || `http://localhost:${PORT}/callback`;
+          const params = new URLSearchParams({
+            response_type: 'code', client_id: clientId, redirect_uri: redirect,
+            scope: 'openid profile email w_member_social',
+            state: 'dashboard-refresh-' + Date.now(),
+          });
+          oauthUrl = `https://www.linkedin.com/oauth/v2/authorization?${params.toString()}`;
+        }
+        health.auth = { voyager: voyagerStatus, official: officialStatus, oauth_url: oauthUrl };
         // MCP tools count
         health.mcp_tools = 71;
         adb.close();
@@ -1055,7 +1684,11 @@ Po zakończeniu wypisz raport: które zaproszenia wysłane, które nie (np. już
         weeks[key].posts.push(p);
       }
 
-      return json(res, { weeks: Object.values(weeks) });
+      // Iter6: sortuj tygodnie chronologicznie DESC (najnowsze pierwsze)
+      const sortedWeeks = Object.values(weeks).sort(
+        (a, b) => new Date(b.weekStart).getTime() - new Date(a.weekStart).getTime(),
+      );
+      return json(res, { weeks: sortedWeeks });
     }
 
     // GET /api/analytics — dashboard analytics summary
@@ -1067,68 +1700,149 @@ Po zakończeniu wypisz raport: które zaproszenia wysłane, które nie (np. już
       let dailyStats = [];
       try { dailyStats = adb.prepare("SELECT * FROM daily_stats ORDER BY date DESC LIMIT 30").all(); } catch {}
 
+      // Top posty: PRAWDZIWE z eksportu XLSX (xlsx_top_posts) — social_metadata (oficjalne API) jest
+      // niepełne i zaniża (top 40 vs realne 380). Fallback do social_metadata, gdy brak importu XLSX.
       let topPosts = [];
       try {
         topPosts = adb.prepare(`
-          SELECT sm.post_urn,
-            (sm.like_count + sm.praise_count + sm.empathy_count + sm.interest_count + sm.appreciation_count + sm.entertainment_count) as total_reactions,
-            sm.comment_count, sm.like_count, sm.praise_count, sm.empathy_count, sm.interest_count, sm.appreciation_count, sm.entertainment_count,
-            sm.fetched_at
-          FROM social_metadata sm ORDER BY total_reactions DESC LIMIT 10
+          SELECT activity_id, activity_id AS post_urn, value AS total_reactions, post_date AS published_at,
+            NULL AS comment_count, NULL AS like_count, NULL AS praise_count, NULL AS empathy_count,
+            NULL AS interest_count, NULL AS appreciation_count, NULL AS entertainment_count
+          FROM xlsx_top_posts WHERE kind='reactions' ORDER BY rank ASC LIMIT 10
         `).all();
       } catch {}
+      if (!topPosts.length) {
+        try {
+          topPosts = adb.prepare(`
+            SELECT sm.post_urn,
+              (sm.like_count + sm.praise_count + sm.empathy_count + sm.interest_count + sm.appreciation_count + sm.entertainment_count) as total_reactions,
+              sm.comment_count, sm.like_count, sm.praise_count, sm.empathy_count, sm.interest_count, sm.appreciation_count, sm.entertainment_count
+            FROM social_metadata sm ORDER BY total_reactions DESC LIMIT 10
+          `).all();
+        } catch {}
+      }
 
       let weeklyReports = [];
       try { weeklyReports = adb.prepare("SELECT * FROM weekly_report ORDER BY week_start DESC LIMIT 4").all(); } catch {}
 
       adb.close();
 
-      // Enrich top posts with text from scheduler.db
+      // Enrich top posts with text. Primary: scheduler.db. Fallback: creator_top_posts.raw_text.
+      // Last resort: a readable "Post (share …)" label instead of the raw urn:li:share URN.
       const sdb = getDb();
+      const adbT = new Database(ANALYTICS_DB, { readonly: true });
       for (const tp of topPosts) {
-        const post = sdb.prepare("SELECT text, publish_at FROM scheduled_posts WHERE post_urn = ?").get(tp.post_urn);
-        tp.text_preview = post ? post.text.substring(0, 80) : '';
-        tp.published_at = post?.publish_at || '';
+        const aid = tp.activity_id || (String(tp.post_urn || '').match(/(\d{6,})/) || [])[1] || '';
+        // tekst: scheduler.db po activity_id (post_urn zawiera id), potem creator_top_posts, potem label
+        let post = null;
+        if (aid) post = sdb.prepare("SELECT text, publish_at FROM scheduled_posts WHERE post_urn LIKE ? ORDER BY publish_at DESC LIMIT 1").get('%' + aid + '%');
+        let preview = post ? post.text.substring(0, 80) : '';
+        if (!preview && aid) {
+          const ctp = adbT.prepare("SELECT raw_text, text_preview FROM creator_top_posts WHERE post_urn LIKE ? ORDER BY scraped_at DESC LIMIT 1").get('%' + aid + '%');
+          preview = (ctp?.raw_text || ctp?.text_preview || '').substring(0, 80);
+        }
+        if (!preview) preview = aid ? 'Post (…' + aid.slice(-6) + ')' : '(brak treści)';
+        tp.text_preview = preview;
+        if (!tp.published_at) tp.published_at = post?.publish_at || '';
+        // komentarze + breakdown reakcji z social_metadata (oficjalne API), jeśli jest match po activity_id
+        // — eksport XLSX ma tylko sumę reakcji, więc to uzupełniamy z API gdzie się da, inaczej '—'.
+        if (aid && tp.comment_count == null) {
+          const sm = adbT.prepare("SELECT comment_count, like_count, praise_count, empathy_count, interest_count, appreciation_count, entertainment_count FROM social_metadata WHERE post_urn LIKE ? LIMIT 1").get('%' + aid + '%');
+          if (sm) {
+            tp.comment_count = sm.comment_count; tp.like_count = sm.like_count; tp.praise_count = sm.praise_count;
+            tp.empathy_count = sm.empathy_count; tp.interest_count = sm.interest_count;
+            tp.appreciation_count = sm.appreciation_count; tp.entertainment_count = sm.entertainment_count;
+          }
+        }
       }
+      adbT.close();
       sdb.close();
 
-      // Use REAL data from creator_analytics if available
-      let followerCount = 0, followerDelta = 0, totalImpressions = 0, totalEngagements = 0;
+      // ── KPI sources: prefer FRESH/REAL data, never the frozen creator_analytics series. ──
+      // Followers   → latest REAL fetch in daily_stats (is_stale=0). creator_analytics is
+      //               kept only for the historical chart (frozen at last working UI scrape).
+      // Impressions → summed from the most recent creator_top_posts scrape (only working
+      //               source — Official socialMetadata/profileView endpoints return 403/410).
+      // Reactions   → summed across social_metadata (real per-post reaction counts).
+      let followerCount = 0, followerDelta = 0, totalImpressions = 0, totalReactions = 0;
+      let dataStale = { followers: false, profileviews_dead: false, errors_today: 0, last_run_date: null, followers_last_real_date: null, impressions_scrape_date: null };
       try {
         const adb2 = new Database(join(homedir(), '.linkedin-mcp', 'analytics.db'), { readonly: true });
-        const latestF = adb2.prepare("SELECT value FROM creator_analytics WHERE metric='followers' AND chart_type='cumulative' ORDER BY date DESC LIMIT 1").get();
-        const prevF = adb2.prepare("SELECT value FROM creator_analytics WHERE metric='followers' AND chart_type='cumulative' AND date <= date('now', '-7 days') ORDER BY date DESC LIMIT 1").get();
-        const latestImp = adb2.prepare("SELECT value FROM creator_analytics WHERE metric='impressions' AND chart_type='cumulative' ORDER BY date DESC LIMIT 1").get();
-        const recentEng = adb2.prepare("SELECT SUM(value) as total FROM creator_analytics WHERE metric='engagements' AND chart_type='daily' AND date >= date('now', '-7 days')").get();
+
+        // Followers — real anchors only (exclude fabricated frozen-fallback rows)
+        const latestReal = adb2.prepare("SELECT date, follower_count FROM daily_stats WHERE is_stale=0 AND follower_count>0 ORDER BY date DESC LIMIT 1").get();
+        const weekAgoReal = adb2.prepare("SELECT follower_count FROM daily_stats WHERE is_stale=0 AND follower_count>0 AND date <= date('now','-7 days') ORDER BY date DESC LIMIT 1").get();
+        if (latestReal) {
+          followerCount = latestReal.follower_count;
+          followerDelta = weekAgoReal ? followerCount - weekAgoReal.follower_count : 0;
+          dataStale.followers_last_real_date = latestReal.date;
+        }
+
+        // Impressions — PRAWDZIWA suma z importu XLSX (creator_analytics impressions/cumulative = total LinkedIn).
+        // creator_top_posts (scrape) zaniża (tylko top posty → 134k vs realne 155k). Fallback do scrape, gdy brak importu.
+        const imprReal = adb2.prepare("SELECT date, value FROM creator_analytics WHERE metric='impressions' AND chart_type='cumulative' ORDER BY date DESC LIMIT 1").get();
+        if (imprReal?.value) {
+          totalImpressions = imprReal.value;
+          dataStale.impressions_scrape_date = imprReal.date;
+        } else {
+          const lastScrape = adb2.prepare("SELECT MAX(date(scraped_at)) AS d FROM creator_top_posts").get();
+          if (lastScrape?.d) {
+            totalImpressions = adb2.prepare("SELECT SUM(impressions) AS s FROM creator_top_posts WHERE date(scraped_at)=?").get(lastScrape.d)?.s || 0;
+            dataStale.impressions_scrape_date = lastScrape.d;
+          }
+        }
+
+        // Reactions — PRAWDZIWA suma z XLSX (engagements/daily = realne reakcje dziennie). Fallback: social_metadata (niepełne).
+        const reactReal = adb2.prepare("SELECT SUM(value) AS s FROM creator_analytics WHERE metric='engagements' AND chart_type='daily'").get();
+        totalReactions = reactReal?.s
+          || adb2.prepare("SELECT SUM(like_count+praise_count+empathy_count+interest_count+appreciation_count+entertainment_count) AS s FROM social_metadata").get()?.s || 0;
+
+        // Staleness flags for the dashboard banner
+        const hf = (m) => adb2.prepare("SELECT value FROM data_health WHERE metric=?").get(m)?.value;
+        dataStale.followers = hf('followers_stale') === '1';
+        dataStale.profileviews_dead = hf('profileviews_stale') === '1';
+        dataStale.errors_today = parseInt(hf('errors_today') || '0', 10);
+        dataStale.last_run_date = hf('last_run_date') || null;
+        // Chart-freeze guard: the 365-day Highcharts scrape silently froze for 75 days.
+        try {
+          const caDays = adb2.prepare("SELECT CAST(julianday('now') - julianday(MAX(scraped_at)) AS INTEGER) AS d FROM creator_analytics").get()?.d;
+          if (caDays != null) dataStale.charts_stale_days = caDays;
+        } catch {}
         adb2.close();
-        followerCount = latestF?.value || 0;
-        followerDelta = followerCount - (prevF?.value || followerCount);
-        totalImpressions = latestImp?.value || 0;
-        totalEngagements = recentEng?.total || 0;
       } catch {}
 
-      // Fallback to daily_stats if no creator_analytics
-      if (followerCount === 0) {
-        const latest = dailyStats[0] || {};
-        const prev = dailyStats[7] || {};
-        followerCount = latest.follower_count || 0;
-        followerDelta = followerCount - (prev.follower_count || 0);
-      }
-
-      const engRate = totalImpressions > 0 ? Math.round(totalEngagements / totalImpressions * 10000) / 100 : 0;
+      // Engagement rate: reactions / impressions when impressions known, else reactions / followers
+      const engRate = totalImpressions > 0
+        ? Math.round(totalReactions / totalImpressions * 10000) / 100
+        : (followerCount > 0 ? Math.round(totalReactions / followerCount * 10000) / 100 : 0);
 
       return json(res, {
         current: {
           follower_count: followerCount,
           follower_delta: followerDelta,
-          profile_views: totalImpressions,
-          total_reactions: totalEngagements,
+          impressions: totalImpressions,
+          // profile_views are NOT available (LinkedIn endpoint 410 Gone). Never fabricate by
+          // substituting impressions — see lib/analytics-snapshot.mjs for the honest export.
+          profile_views: null,
+          profile_views_available: false,
+          total_reactions: totalReactions,
           avg_engagement_rate: engRate,
         },
+        data_stale: dataStale,
         daily_stats: dailyStats,
         top_posts: topPosts,
         weekly_reports: weeklyReports,
       });
+    }
+
+    // GET /api/analytics/llm-export — deterministic, provenance-tagged snapshot for LLM use.
+    // Same payload as ~/.linkedin-mcp/exports/analytics-latest.json (shared builder).
+    if (method === 'GET' && path === '/api/analytics/llm-export') {
+      try {
+        return json(res, buildSnapshot());
+      } catch (e) {
+        return json(res, { error: 'snapshot failed', detail: String(e?.message || e) });
+      }
     }
 
     // GET /api/post-metrics/:post_urn — single post metrics from analytics.db cache
@@ -1177,7 +1891,7 @@ Po zakończeniu wypisz raport: które zaproszenia wysłane, które nie (np. już
             engagements_daily: engagementsDaily.map(r => r.value),
             // Legacy compat
             reactions: engagementsDaily.map(r => r.value),
-            profile_views: impressionsDaily.map(r => r.value),
+            // profile_views removed — it was impressions_daily mislabeled. Use impressions_daily.
             engagement_rate: followersCum.map((r, i) => {
               const imp = impressionsDaily[i]?.value || 0;
               const eng = engagementsDaily[i]?.value || 0;
@@ -1198,7 +1912,7 @@ Po zakończeniu wypisz raport: które zaproszenia wysłane, które nie (np. już
         datasets: {
           followers: rows.map(r => r.follower_count || 0),
           reactions: rows.map(r => r.total_reactions || 0),
-          profile_views: rows.map(r => r.profile_views || 0),
+          impressions_daily: rows.map(r => r.total_impressions || 0),
           engagement_rate: rows.map(r => r.avg_engagement_rate || 0),
         },
         source: 'daily_stats',
@@ -1360,7 +2074,6 @@ Po zakończeniu wypisz raport: które zaproszenia wysłane, które nie (np. już
         let cumRows = [], dailyRows = [];
         try { cumRows = adb.prepare(`SELECT date, value as follower_count FROM creator_analytics WHERE metric='followers' AND chart_type='cumulative' AND ${dateFilter} ORDER BY date`).all(); } catch {}
         try { dailyRows = adb.prepare(`SELECT date, value as delta FROM creator_analytics WHERE metric='followers' AND chart_type='daily' AND ${dateFilter} ORDER BY date`).all(); } catch {}
-        adb.close();
 
         // Merge cumulative + daily into timeline
         const dailyMap = {};
@@ -1370,6 +2083,21 @@ Po zakończeniu wypisz raport: które zaproszenia wysłane, które nie (np. już
           follower_count: r.follower_count,
           delta: dailyMap[r.date] || 0,
         }));
+
+        // Extend with REAL daily_stats anchors beyond the creator_analytics cutoff.
+        // creator_analytics is the frozen UI scrape; fresh Voyager fetches land in daily_stats
+        // (is_stale=0). Without this the chart would stop at the April snapshot while the
+        // Followers KPI shows the current count — a visible contradiction.
+        const cutoff = timeline.length ? timeline[timeline.length - 1].date : '0000-00-00';
+        try {
+          const realRows = adb.prepare("SELECT date, follower_count FROM daily_stats WHERE is_stale=0 AND follower_count>0 AND date > ? ORDER BY date").all(cutoff);
+          let prevFc = timeline.length ? timeline[timeline.length - 1].follower_count : 0;
+          for (const rr of realRows) {
+            timeline.push({ date: rr.date, follower_count: rr.follower_count, delta: rr.follower_count - prevFc });
+            prevFc = rr.follower_count;
+          }
+        } catch {}
+        adb.close();
 
         const totalGrowth = timeline.length > 1 ? timeline[timeline.length - 1].follower_count - timeline[0].follower_count : 0;
         const avgDaily = timeline.length > 1 ? Math.round(totalGrowth / timeline.length * 10) / 10 : 0;
@@ -1692,7 +2420,13 @@ Po zakończeniu wypisz raport: które zaproszenia wysłane, które nie (np. już
           // Auto-refresh cookie before scanning
           send({ type: 'start', message: 'Odswiezam sesje LinkedIn...' });
           try {
-            execSync('node scripts/refresh-voyager-cookie.mjs 2>&1', { cwd: MCP_DIR, timeout: 30000 });
+            // Próba 1: wyciągnij li_at z Chrome (szybkie, bez logowania)
+            try {
+              execSync('node auto-refresh-li-at.mjs 2>&1', { cwd: MCP_DIR, timeout: 15000 });
+            } catch {
+              // Fallback: Playwright persistent session
+              execSync('node scripts/refresh-voyager-cookie.mjs 2>&1', { cwd: MCP_DIR, timeout: 60000 });
+            }
             send({ type: 'start', message: 'Sesja odswiezona. Szukam prospektow...' });
           } catch (cookieErr) {
             send({ type: 'start', message: 'Nie udalo sie odswiezyc sesji — probuje szukac...' });
@@ -1868,6 +2602,506 @@ Po zakończeniu wypisz raport: które zaproszenia wysłane, które nie (np. już
       return json(res, { ok: true, classified, hashtags_updated: Object.keys(hashStats).length, total_posts: published.length });
     }
 
+    // ── /api/threads (pamięć wątków komentarzy) ──────────────────────────
+
+    if (method === 'GET' && path === '/api/threads') {
+      const db = getEngageDb(true);
+      try {
+        db.exec(`CREATE TABLE IF NOT EXISTS thread_memory (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, post_urn TEXT NOT NULL,
+          post_text TEXT, post_author TEXT, post_url TEXT,
+          thread_json TEXT, our_replies_json TEXT,
+          last_scraped_at TEXT DEFAULT (datetime('now')),
+          comment_count INTEGER DEFAULT 0, needs_review BOOLEAN DEFAULT 0,
+          post_published_at TEXT,
+          UNIQUE(post_urn)
+        )`);
+      } catch {}
+      const u = new URL(req.url, 'http://localhost');
+      const hasReply = u.searchParams.get('has_reply') || 'all';
+      const q = (u.searchParams.get('q') || '').trim();
+      const since = (u.searchParams.get('since') || '').trim();
+      const sortKey = u.searchParams.get('sort') || 'published_desc';
+      const SORT_MAP = {
+        published_desc: 'COALESCE(post_published_at, last_scraped_at) DESC',
+        published_asc:  'COALESCE(post_published_at, last_scraped_at) ASC',
+        comments_desc:  'comment_count DESC, COALESCE(post_published_at, last_scraped_at) DESC',
+        scraped_desc:   'last_scraped_at DESC',
+        no_reply_first: '(our_replies_json IS NOT NULL AND our_replies_json != \'[]\') ASC, COALESCE(post_published_at, last_scraped_at) DESC',
+      };
+      const orderBy = SORT_MAP[sortKey] || SORT_MAP.published_desc;
+      const where = [];
+      const params = [];
+      if (hasReply === '1') where.push("(our_replies_json IS NOT NULL AND our_replies_json != '[]')");
+      else if (hasReply === '0') where.push("(our_replies_json IS NULL OR our_replies_json = '[]')");
+      if (q) { where.push("post_text LIKE ?"); params.push('%' + q + '%'); }
+      if (since) { where.push("COALESCE(post_published_at, last_scraped_at) >= ?"); params.push(since); }
+      const sql = `SELECT * FROM thread_memory ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ORDER BY ${orderBy} LIMIT 100`;
+      const rows = db.prepare(sql).all(...params);
+      db.close();
+      return json(res, rows);
+    }
+
+    // POST /api/threads/backfill — uruchom backfill (long-running, background)
+    if (method === 'POST' && path === '/api/threads/backfill') {
+      const body = await parseBody(req).catch(() => ({}));
+      const limit = parseInt(body.limit, 10) || 5;
+      const dryRun = body.dry_run ? '--dry-run' : '';
+      try {
+        // Background spawn — nie blokujemy response
+        const child = spawn('node', [
+          'scripts/backfill-comments.mjs',
+          '--limit', String(limit),
+          ...(dryRun ? ['--dry-run'] : []),
+        ], { cwd: MCP_DIR, detached: true, stdio: 'ignore' });
+        child.unref();
+        return json(res, { ok: true, pid: child.pid, limit, dryRun: !!body.dry_run, message: 'Backfill uruchomiony w tle. Logi: tail -f playwright-comments.log' });
+      } catch (e) {
+        return json(res, { error: e.message }, 500);
+      }
+    }
+
+    if (method === 'GET' && path === '/api/playwright-cycles') {
+      const db = getEngageDb(true);
+      try {
+        db.exec(`CREATE TABLE IF NOT EXISTS playwright_cycles (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          started_at TEXT DEFAULT (datetime('now')), ended_at TEXT,
+          posts_checked INTEGER DEFAULT 0, proposals_created INTEGER DEFAULT 0,
+          errors INTEGER DEFAULT 0, notes TEXT
+        )`);
+      } catch {}
+      const rows = db.prepare("SELECT * FROM playwright_cycles ORDER BY started_at DESC LIMIT 30").all();
+      db.close();
+      return json(res, rows);
+    }
+
+    // ── /api/proposals ────────────────────────────────────────────────────
+
+    // GET /api/proposals — lista propozycji (pending/all)
+    // Filtr "already_replied_in_thread": jeśli w thread_context (scrapowany dialog) po komentarzu
+    // źródłowym pojawia się nasza wypowiedź ("Bartosz Gaca: ..."), oznaczamy propozycję jako follow-up.
+    // Domyślnie ukrywamy follow-upy; UI checkbox `include_replied=1` je przywraca.
+    if (method === 'GET' && path === '/api/proposals') {
+      const status = url.searchParams.get('status') || 'pending';
+      const includeReplied = url.searchParams.get('include_replied') === '1';
+      const minScore = parseFloat(url.searchParams.get('min_score') || '0');
+      const db = getEngageDb(true);
+      // Iter3: ORDER BY blocked-last + composite_score DESC + created_at fallback
+      const sortClause = "ORDER BY (status = 'blocked') ASC, COALESCE(composite_score, 0) DESC, created_at DESC";
+      const rows = status === 'all'
+        ? db.prepare("SELECT * FROM reply_proposals " + sortClause + " LIMIT 100").all()
+        : db.prepare("SELECT * FROM reply_proposals WHERE status = ? " + sortClause + " LIMIT 100").all(status);
+      // Cache nasze nazwy autora (z thread_memory.post_author per post_urn, fallback "Bartosz Gaca")
+      const authors = new Map();
+      const ourNames = ['Bartosz Gaca'];
+      for (const r of rows) {
+        if (!authors.has(r.post_urn)) {
+          const tm = db.prepare("SELECT post_author FROM thread_memory WHERE post_urn = ?").get(r.post_urn);
+          authors.set(r.post_urn, tm?.post_author || 'Bartosz Gaca');
+        }
+      }
+      // Wzbogać każdy wiersz o flagę already_replied_in_thread + composite_score.
+      // DETERMINISTYCZNIE: follow-up = mamy NASZĄ odpowiedź będącą BEZPOŚREDNIM dzieckiem TEGO komentarza
+      // (thread_comments.parent_comment_urn = source_id AND is_our_comment=1). Stary heurystyk po
+      // płaskim thread_context błędnie ukrywał CUDZE nieodpowiedziane komentarze na ruchliwych postach.
+      const childStmt = db.prepare("SELECT 1 FROM thread_comments WHERE parent_comment_urn = ? AND is_our_comment = 1 LIMIT 1");
+      const annotated = rows.map((r) => {
+        let alreadyReplied = 0;
+        try { if (r.source_id && childStmt.get(r.source_id)) alreadyReplied = 1; } catch {}
+        const composite = r.composite_score != null ? r.composite_score : computeComposite(r);
+        return { ...r, already_replied_in_thread: alreadyReplied, composite_score: composite };
+      });
+      db.close();
+      let filtered = (status === 'pending' && !includeReplied)
+        ? annotated.filter((r) => !r.already_replied_in_thread)
+        : annotated;
+      if (minScore > 0) filtered = filtered.filter((r) => (r.composite_score || 0) >= minScore);
+      const followUpCount = annotated.filter((r) => r.already_replied_in_thread).length;
+      const blockedCount = annotated.filter((r) => r.status === 'blocked').length;
+      return json(res, { rows: filtered, total: annotated.length, follow_ups: followUpCount, blocked: blockedCount });
+    }
+
+    // PUT /api/proposals/:id — edytuj treść propozycji
+    if (method === 'PUT' && path.match(/^\/api\/proposals\/\d+$/)) {
+      const id = parseInt(path.split('/').pop(), 10);
+      const body = await parseBody(req);
+      const db = getEngageDb(false);
+      // Capture original Claude reply on first edit (if not already set)
+      db.prepare(
+        "UPDATE reply_proposals SET original_reply = proposed_reply WHERE id = ? AND (original_reply IS NULL OR original_reply = '')"
+      ).run(id);
+      const result = db.prepare(
+        "UPDATE reply_proposals SET proposed_reply = ?, updated_at = datetime('now') WHERE id = ? AND status = 'pending'"
+      ).run(body.proposed_reply || '', id);
+      const row = db.prepare("SELECT * FROM reply_proposals WHERE id = ?").get(id);
+      db.close();
+      if (!result.changes) return json(res, { error: 'Not found or already sent' }, 404);
+      return json(res, row);
+    }
+
+    // POST /api/proposals/:id/regenerate — „Twoja wskazówka → AI pisze treść" (Opus 4.8 + fact-check)
+    if (method === 'POST' && path.match(/^\/api\/proposals\/\d+\/regenerate$/)) {
+      const id = parseInt(path.split('/')[3], 10);
+      const body = await parseBody(req).catch(() => ({}));
+      const hint = (body.hint || '').toString().slice(0, 800);
+
+      const rdb = getEngageDb(true);
+      const prop = rdb.prepare("SELECT * FROM reply_proposals WHERE id = ?").get(id);
+      if (!prop) { rdb.close(); return json(res, { error: 'Not found' }, 404); }
+      if (prop.status !== 'pending' && prop.status !== 'blocked') {
+        rdb.close();
+        return json(res, { error: 'Regenerować można tylko propozycję pending/blocked' }, 409);
+      }
+      const tcRows = rdb.prepare(
+        "SELECT comment_urn, parent_comment_urn, author_name, comment_text, is_our_comment FROM thread_comments WHERE post_urn = ? ORDER BY id ASC"
+      ).all(prop.post_urn);
+      const tm = rdb.prepare("SELECT post_text, post_author FROM thread_memory WHERE post_urn = ?").get(prop.post_urn);
+      rdb.close();
+
+      const thread = tcRows.map(c => ({
+        author: c.author_name, text: c.comment_text,
+        isOurs: c.is_our_comment === 1, isReply: !!c.parent_comment_urn, commentUrn: c.comment_urn,
+      }));
+      const ourReplies = thread.filter(c => c.isOurs).map(c => c.text);
+      const postText = tm?.post_text || prop.post_text || '';
+      const postAuthor = tm?.post_author || 'Bartosz Gaca';
+      const targetComment = { author: prop.source_author || '', text: prop.source_text || '', commentUrn: prop.source_id };
+      const threadContext = prop.thread_context || thread.map(c => `${c.author}: "${c.text}"`).join('\n');
+      const persona = loadPersona();
+      const kb = retrieveKnowledge((prop.source_text || '') + ' ' + postText + ' ' + hint);
+
+      try {
+        const prompt = buildPrompt({ persona, postText, postAuthor, thread, ourReplies, targetComment, hint, knowledge: kb.text });
+        const parsed = parseClaudeJson(await callClaude(prompt, {}));
+        if (!parsed || !parsed.reply) return json(res, { error: 'Opus 4.8 nie zwrócił poprawnej odpowiedzi' }, 502);
+
+        // Fact-check (C) — potwierdź że nie kłamie (z bazą wiedzy jako grounded)
+        let reply = parsed.reply;
+        const extraNotes = [];
+        try {
+          const fc = await factCheck({ postText, threadContext, proposedReply: reply, persona, knowledge: kb.text }, {});
+          if (fc.grounded === false) {
+            if (fc.fixed_reply) reply = fc.fixed_reply;
+            else extraNotes.push('HALLUCINATION_RISK', ...fc.unsupported_claims.slice(0, 3).map(c => 'CLAIM:' + String(c).slice(0, 60)));
+          }
+        } catch {}
+
+        const notes = [...validateProposal({ proposedReply: reply, sourceText: prop.source_text }, null), ...extraNotes];
+        const status = notes.length ? 'blocked' : 'pending';
+
+        const wdb = getEngageDb(false);
+        wdb.prepare("UPDATE reply_proposals SET original_reply = proposed_reply WHERE id = ? AND (original_reply IS NULL OR original_reply = '')").run(id);
+        wdb.prepare(
+          "UPDATE reply_proposals SET proposed_reply = ?, status = ?, validation_notes = ?, updated_at = datetime('now') WHERE id = ?"
+        ).run(reply, status, notes.length ? JSON.stringify(notes) : null, id);
+        const row = wdb.prepare("SELECT * FROM reply_proposals WHERE id = ?").get(id);
+        wdb.close();
+        return json(res, { ok: true, proposed_reply: reply, status, validation_notes: notes, hint_used: !!hint, row });
+      } catch (e) {
+        return json(res, { error: 'Regenerate failed: ' + e.message }, 500);
+      }
+    }
+
+    // GET /api/comment-engine/health — funkcjonalny health silnika komentarzy (H)
+    if (method === 'GET' && path === '/api/comment-engine/health') {
+      const db = getEngageDb(true);
+      let hb = null, lastScrape = null, pending = 0, blocked = 0, unanswered = 0;
+      try { hb = db.prepare("SELECT * FROM daemon_health WHERE id = 1").get(); } catch {}
+      try { lastScrape = db.prepare("SELECT MAX(last_scraped_at) AS t FROM thread_memory").get()?.t; } catch {}
+      try { pending = db.prepare("SELECT COUNT(*) c FROM reply_proposals WHERE status='pending'").get()?.c || 0; } catch {}
+      try { blocked = db.prepare("SELECT COUNT(*) c FROM reply_proposals WHERE status='blocked'").get()?.c || 0; } catch {}
+      try {
+        unanswered = db.prepare(
+          "SELECT COUNT(*) c FROM thread_comments tc WHERE tc.is_our_comment=0 AND NOT EXISTS (SELECT 1 FROM reply_proposals rp WHERE rp.source_id = tc.comment_urn) AND NOT EXISTS (SELECT 1 FROM thread_comments r WHERE r.parent_comment_urn = tc.comment_urn AND r.is_our_comment=1)"
+        ).get()?.c || 0;
+      } catch {}
+      db.close();
+
+      const now = Date.now();
+      const mins = (t) => (t ? (now - new Date(t.replace(' ', 'T') + 'Z').getTime()) / 60000 : Infinity);
+      const sinceRun = mins(hb?.last_run_at);
+      const sinceScrape = mins(lastScrape);
+      const zeros = hb?.consecutive_zero || 0;
+      let color = 'green', reasons = [];
+      if (sinceRun > 90) { color = 'red'; reasons.push(`brak cyklu ${Math.round(sinceRun)} min`); }
+      if (zeros >= 3) { color = 'red'; reasons.push(`${zeros}× cykl 0 postów`); }
+      if (sinceScrape > 180) { color = 'red'; reasons.push(`drzewko stare ${Math.round(sinceScrape)} min`); }
+      if (color === 'green' && (hb?.posts_checked === 0)) { color = 'yellow'; reasons.push('ostatni cykl 0 postów'); }
+      return json(res, {
+        color, reasons,
+        last_run_at: hb?.last_run_at || null, last_ok_at: hb?.last_ok_at || null,
+        last_scrape_at: lastScrape || null, consecutive_zero: zeros,
+        pending, blocked, unanswered,
+      });
+    }
+
+    // POST /api/comment-engine/fetch-all — „Pobierz wszystkie komentarze i odpowiedzi" (M)
+    // Wymusza natychmiastowy pełny cykl daemona (sweep wszystkich postów → scrape komentarzy
+    // + nested replies → odświeżenie drzewka + generacja). Respektuje lock profilu Chrome.
+    if (method === 'POST' && path === '/api/comment-engine/fetch-all') {
+      try {
+        const uid = process.getuid();
+        execSync(`launchctl kickstart -k gui/${uid}/com.gaca.linkedin-playwright-comments`, { timeout: 8000 });
+        return json(res, { ok: true, info: 'Uruchomiono pełny skan wszystkich postów. Drzewko i propozycje odświeżą się za 1-3 min (po cyklu).' });
+      } catch (e) {
+        return json(res, { error: 'Nie udało się uruchomić skanu: ' + e.message }, 500);
+      }
+    }
+
+    // POST /api/posts/:urn/fetch-comments — „Pobierz komentarze DO TEGO POSTU" z LinkedIn (priorytet)
+    if (method === 'POST' && path.match(/^\/api\/posts\/[^/]+\/fetch-comments$/)) {
+      const postUrn = decodeURIComponent(path.split('/')[3]);
+      try {
+        const db = getEngageDb(false);
+        db.exec(`CREATE TABLE IF NOT EXISTS priority_scrape (post_urn TEXT PRIMARY KEY, requested_at TEXT DEFAULT (datetime('now')))`);
+        db.prepare(`INSERT OR REPLACE INTO priority_scrape (post_urn, requested_at) VALUES (?, datetime('now'))`).run(postUrn);
+        db.close();
+        try { execSync(`launchctl kickstart -k gui/${process.getuid()}/com.gaca.linkedin-playwright-comments`, { timeout: 8000 }); } catch {}
+        return json(res, { ok: true, info: 'Zlecono pobranie pełnego wątku tego postu z LinkedIn (priorytet). Odśwież drzewko za 1-2 min.' });
+      } catch (e) { return json(res, { error: e.message }, 500); }
+    }
+
+    // POST /api/comments/reply-with-ai — „✍️ Odpisz z AI" dla KONKRETNEGO komentarza (z drzewka).
+    // Deterministyczne: propozycja twardo przypięta do source_id = comment_urn → Playwright wyśle DOKŁADNIE tam.
+    if (method === 'POST' && path === '/api/comments/reply-with-ai') {
+      const body = await parseBody(req).catch(() => ({}));
+      const commentUrn = (body.comment_urn || '').toString();
+      const postUrn = (body.post_urn || '').toString();
+      const hint = (body.hint || '').toString().slice(0, 800);
+      if (!commentUrn || commentUrn.indexOf('urn:') !== 0) {
+        return json(res, { error: 'Brak realnego URN komentarza — nie mogę deterministycznie odpisać (kliknij „🔄 Pobierz świeże").' }, 400);
+      }
+      const rdb = getEngageDb(true);
+      const tm = rdb.prepare("SELECT post_text, post_author FROM thread_memory WHERE post_urn = ?").get(postUrn);
+      const tcRows = rdb.prepare("SELECT comment_urn, parent_comment_urn, author_name, comment_text, is_our_comment FROM thread_comments WHERE post_urn = ? ORDER BY id ASC").all(postUrn);
+      const tgt = tcRows.find(c => c.comment_urn === commentUrn);
+      const existing = rdb.prepare("SELECT id, status FROM reply_proposals WHERE type='comment' AND source_id = ? ORDER BY id DESC LIMIT 1").get(commentUrn);
+      rdb.close();
+      const srcText = (body.comment_text || (tgt && tgt.comment_text) || '').toString();
+      const author = (body.author || (tgt && tgt.author_name) || '').toString();
+
+      const thread = tcRows.map(c => ({ author: c.author_name, text: c.comment_text, isOurs: c.is_our_comment === 1, isReply: !!c.parent_comment_urn, commentUrn: c.comment_urn }));
+      const ourReplies = thread.filter(c => c.isOurs).map(c => c.text);
+      const postText = (tm && tm.post_text) || '';
+      const postAuthor = (tm && tm.post_author) || 'Bartosz Gaca';
+      const threadContext = thread.map(c => `${c.author}: "${c.text}"`).join('\n');
+      const persona = loadPersona();
+      const kb = retrieveKnowledge(srcText + ' ' + postText + ' ' + hint);
+
+      try {
+        const prompt = buildPrompt({ persona, postText, postAuthor, thread, ourReplies, targetComment: { author, text: srcText, commentUrn }, hint, knowledge: kb.text });
+        const parsed = parseClaudeJson(await callClaude(prompt, {}));
+        if (!parsed || !parsed.reply) return json(res, { error: 'Opus 4.8 nie zwrócił odpowiedzi' }, 502);
+        let reply = parsed.reply;
+        const extraNotes = [];
+        try {
+          const fc = await factCheck({ postText, threadContext, proposedReply: reply, persona, knowledge: kb.text }, {});
+          if (fc.grounded === false) { if (fc.fixed_reply) reply = fc.fixed_reply; else extraNotes.push('HALLUCINATION_RISK', ...fc.unsupported_claims.slice(0, 3).map(c => 'CLAIM:' + String(c).slice(0, 60))); }
+        } catch {}
+        const notes = [...validateProposal({ proposedReply: reply, sourceText: srcText }, null), ...extraNotes];
+        const status = notes.length ? 'blocked' : 'pending';
+
+        const wdb = getEngageDb(false);
+        let id;
+        if (existing && (existing.status === 'pending' || existing.status === 'approved' || existing.status === 'blocked')) {
+          wdb.prepare("UPDATE reply_proposals SET proposed_reply=?, status=?, validation_notes=?, source_text=?, source_author=?, post_text=?, parent_in_tree=?, updated_at=datetime('now') WHERE id=?")
+            .run(reply, status, notes.length ? JSON.stringify(notes) : null, srcText, author, postText.slice(0, 500), commentUrn, existing.id);
+          id = existing.id;
+        } else {
+          const r = wdb.prepare(`INSERT INTO reply_proposals
+            (type, source_id, source_text, source_author, post_urn, post_text, proposed_reply, original_reply, parent_in_tree, status, validation_notes)
+            VALUES ('comment', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+            .run(commentUrn, srcText, author, postUrn, postText.slice(0, 500), reply, reply, commentUrn, status, notes.length ? JSON.stringify(notes) : null);
+          id = r.lastInsertRowid;
+        }
+        wdb.close();
+        return json(res, { ok: true, id, proposed_reply: reply, status, validation_notes: notes, target: author });
+      } catch (e) { return json(res, { error: 'reply-with-ai: ' + e.message }, 500); }
+    }
+
+    // GET /api/proposals/:id/context — full post text + thread tree (who wrote what)
+    if (method === 'GET' && path.match(/^\/api\/proposals\/\d+\/context$/)) {
+      const id = parseInt(path.split('/')[3], 10);
+      const db = getEngageDb(true);
+      const prop = db.prepare("SELECT id, post_urn, source_id, post_text, thread_context FROM reply_proposals WHERE id = ?").get(id);
+      if (!prop) { db.close(); return json(res, { error: 'Not found' }, 404); }
+      const tm = db.prepare("SELECT post_text, post_author, post_url, our_replies_json FROM thread_memory WHERE post_urn = ?").get(prop.post_urn);
+      db.close();
+      // Iter7: użyj shared buildCommentsTree (refactor)
+      const { tree } = buildCommentsTree(prop.post_urn, prop.source_id);
+      let ourReplies = [];
+      try { ourReplies = JSON.parse(tm?.our_replies_json || '[]'); } catch {}
+      return json(res, {
+        post_text: tm?.post_text || prop.post_text || '',
+        post_author: tm?.post_author || 'Bartosz Gaca',
+        post_url: tm?.post_url || (prop.post_urn ? 'https://www.linkedin.com/feed/update/' + encodeURIComponent(prop.post_urn) + '/' : null),
+        target_comment_urn: prop.source_id,
+        tree,
+        our_replies: ourReplies,
+      });
+    }
+
+    // Iter7: GET /api/posts/:urn/comments-tree — drzewko komentarzy dla dowolnego post_urn
+    if (method === 'GET' && path.match(/^\/api\/posts\/[^/]+\/comments-tree$/)) {
+      const postUrn = decodeURIComponent(path.split('/')[3]);
+      return json(res, buildCommentsTree(postUrn, null));
+    }
+
+    // POST /api/proposals/:id/revert — restore Claude's original reply
+    if (method === 'POST' && path.match(/^\/api\/proposals\/\d+\/revert$/)) {
+      const id = parseInt(path.split('/')[3], 10);
+      const db = getEngageDb(false);
+      const result = db.prepare(
+        "UPDATE reply_proposals SET proposed_reply = original_reply, updated_at = datetime('now') WHERE id = ? AND status = 'pending' AND original_reply IS NOT NULL"
+      ).run(id);
+      const row = db.prepare("SELECT * FROM reply_proposals WHERE id = ?").get(id);
+      db.close();
+      if (!result.changes) return json(res, { error: 'Cannot revert (no original, or already sent)' }, 404);
+      return json(res, row);
+    }
+
+    // POST /api/proposals/:id/send — APPROVE propozycję (Playwright sender wyśle ją asynchronicznie)
+    if (method === 'POST' && path.match(/^\/api\/proposals\/\d+\/send$/)) {
+      const id = parseInt(path.split('/')[3], 10);
+      const db = getEngageDb(false);
+      const prop = db.prepare("SELECT * FROM reply_proposals WHERE id = ? AND status = 'pending'").get(id);
+      if (!prop) { db.close(); return json(res, { error: 'Not found or already sent' }, 404); }
+
+      if (prop.type === 'dm') {
+        // DM: ręcznie przez LinkedIn UI (Voyager API ma bany)
+        db.prepare("UPDATE reply_proposals SET status='sent', sent_at=datetime('now'), sent_via='manual_dm', updated_at=datetime('now') WHERE id=?").run(id);
+        db.close();
+        return json(res, { ok: true, manual: true, copy_text: prop.proposed_reply, url: 'https://www.linkedin.com/messaging/', info: 'Skopiuj tekst i wyślij przez LinkedIn Messaging' });
+      }
+
+      // Comment: approval queue — Playwright sender (auto-comment-sender.mjs) wyśle gdy będzie cykl
+      db.prepare("UPDATE reply_proposals SET status='approved', approved_at=datetime('now'), updated_at=datetime('now') WHERE id=?").run(id);
+      db.close();
+      return json(res, {
+        ok: true,
+        queued: true,
+        info: 'Zatwierdzone — Playwright sender wyśle automatycznie w ciągu kilku/kilkudziesięciu minut (losowy delay 5-30 min, human-like)',
+      });
+    }
+
+    // POST /api/proposals/:id/reject — odrzuć propozycję
+    if (method === 'POST' && path.match(/^\/api\/proposals\/\d+\/reject$/)) {
+      const id = parseInt(path.split('/')[3], 10);
+      const db = getEngageDb(false);
+      const result = db.prepare("UPDATE reply_proposals SET status='rejected', updated_at=datetime('now') WHERE id=?").run(id);
+      db.close();
+      if (!result.changes) return json(res, { error: 'Not found' }, 404);
+      return json(res, { ok: true });
+    }
+
+    // ── /api/posts/queue-unified — scalony widok kolejki + pomysłów + media ──
+    if (method === 'GET' && path === '/api/posts/queue-unified') {
+      const db = getDb();
+      // 1) Scheduled (kolejka postów do publikacji)
+      const scheduled = db.prepare(`
+        SELECT sp.id, sp.text, sp.publish_at, sp.language, sp.status, sp.visibility,
+               sp.media_preview_path, sp.media_kind, sp.gemini_prompt, sp.media_ids, sp.text_alt, sp.banner_preset,
+               mpi.slug AS mp_slug, mpi.title AS mp_title, mpi.topic_number AS mp_topic_number,
+               mpi.visual_asset_path AS mp_visual_path, mpi.visual_asset_type AS mp_visual_type,
+               mpi.banner_path AS mp_banner_path, mpi.source_project AS mp_source_project
+        FROM scheduled_posts sp
+        LEFT JOIN media_plan_items mpi ON mpi.scheduled_post_id = sp.id
+        WHERE sp.status IN ('scheduled', 'approved')
+        ORDER BY sp.publish_at ASC
+      `).all();
+
+      // 2) Pomysły (status='plan' w media_plan_items, jeszcze nie napisane)
+      const proposed = db.prepare(`
+        SELECT id, slug, topic_number, title, hook, hook_variants, format, language, publish_at,
+               source_project, lead_trigger, cta, hashtags,
+               banner_path, visual_asset_path, visual_asset_type, banner_concept
+        FROM media_plan_items
+        WHERE status = 'plan'
+        ORDER BY topic_number ASC
+      `).all();
+
+      // 3) Ostatnio opublikowane (kontekst — co poszło live)
+      const recentPublished = db.prepare(`
+        SELECT sp.id, sp.text, sp.published_at, sp.post_urn, sp.language,
+               mpi.slug AS mp_slug, mpi.visual_asset_path AS mp_visual_path
+        FROM scheduled_posts sp
+        LEFT JOIN media_plan_items mpi ON mpi.scheduled_post_id = sp.id
+        WHERE sp.status = 'published' AND sp.published_at IS NOT NULL
+        ORDER BY sp.published_at DESC
+        LIMIT 10
+      `).all();
+
+      const counts = {
+        scheduled: scheduled.length,
+        proposed: proposed.length,
+        published_30d: db.prepare(`SELECT COUNT(*) AS n FROM scheduled_posts WHERE status='published' AND published_at >= datetime('now','-30 days')`).get().n,
+        plan_in_media: db.prepare(`SELECT COUNT(*) AS n FROM media_plan_items WHERE status='plan'`).get().n,
+        napisane_in_media: db.prepare(`SELECT COUNT(*) AS n FROM media_plan_items WHERE status='napisane'`).get().n,
+      };
+      db.close();
+
+      // Enrich każdy z tagiem `has_media` i ścieżką relatywną dla UI (jeśli istnieje)
+      const enrichMedia = (row) => {
+        const visualPath = row.mp_visual_path || row.visual_asset_path || row.banner_path || row.mp_banner_path || row.media_preview_path;
+        const visualType = row.mp_visual_type || row.visual_asset_type || (row.banner_preset ? 'banner' : null) || (row.media_kind === 'carousel' ? 'carousel' : null);
+        const hasMedia = !!visualPath;
+        // Ścieżka serwowalna przez dashboard: /mp-banner/:slug lub /media/:filename (TODO endpoint)
+        let mediaUrl = null;
+        if (visualPath) {
+          if (visualPath.includes('/images/posts/')) {
+            mediaUrl = `/media-image/${encodeURIComponent(row.slug || row.mp_slug || row.id)}`;
+          } else if (visualPath.includes('banner')) {
+            mediaUrl = `/mp-banner/${encodeURIComponent(row.slug || row.mp_slug || row.id)}`;
+          }
+        }
+        return { ...row, has_media: hasMedia, visual_type: visualType, visual_path: visualPath, media_url: mediaUrl };
+      };
+
+      return json(res, {
+        scheduled: scheduled.map(enrichMedia),
+        proposed: proposed.map(enrichMedia),
+        recent_published: recentPublished.map(enrichMedia),
+        counts,
+      });
+    }
+
+    // GET /media-image/:slug — serve obrazek z ~/.linkedin-mcp/images/posts/<slug>.png (NVIDIA FLUX outputs)
+    // Auto-detect Content-Type po magic bytes - NVIDIA czasem zwraca JPG mimo .png extension.
+    if (method === 'GET' && path.startsWith('/media-image/')) {
+      const slug = decodeURIComponent(path.split('/').pop());
+      const imgPath = join(homedir(), '.linkedin-mcp', 'images', 'posts', `${slug}.png`);
+      if (!existsSync(imgPath)) {
+        res.writeHead(404, { 'Content-Type': 'text/plain' });
+        return res.end('Not found');
+      }
+      const buf = readFileSync(imgPath);
+      // Magic bytes detection
+      let contentType = 'image/png';
+      if (buf.length >= 3 && buf[0] === 0xFF && buf[1] === 0xD8 && buf[2] === 0xFF) contentType = 'image/jpeg';
+      else if (buf.length >= 8 && buf[0] === 0x89 && buf[1] === 0x50) contentType = 'image/png';
+      else if (buf.length >= 12 && buf[8] === 0x57 && buf[9] === 0x45 && buf[10] === 0x42 && buf[11] === 0x50) contentType = 'image/webp';
+      res.writeHead(200, { 'Content-Type': contentType, 'Cache-Control': 'public, max-age=300' });
+      return res.end(buf);
+    }
+
+    // POST /api/media-plan/:id/regenerate — odpal regenerate-posts.mjs --slug=<> w tle (przycisk "Przerób na post")
+    if (method === 'POST' && path.match(/^\/api\/media-plan\/[^/]+\/regenerate$/)) {
+      const id = path.split('/')[3];
+      const db = getDb();
+      const item = db.prepare("SELECT slug FROM media_plan_items WHERE id = ? OR slug = ?").get(id, id);
+      db.close();
+      if (!item) return json(res, { error: 'Not found' }, 404);
+
+      const script = '/Users/gaca/projects/personal/linkedin-mcp-server/scripts/regenerate-posts.mjs';
+      const child = spawn('node', [script, `--slug=${item.slug}`, '--auto-schedule'], {
+        detached: true,
+        stdio: 'ignore',
+      });
+      child.unref();
+      return json(res, { ok: true, started: true, slug: item.slug, pid: child.pid, hint: 'Odśwież /api/posts/queue-unified za 60-180s' });
+    }
+
     // ── /api/media-plan ────────────────────────────────────────────────────
 
     // GET /api/media-plan — list all 12 items, optional ?status= filter
@@ -1904,7 +3138,7 @@ Po zakończeniu wypisz raport: które zaproszenia wysłane, które nie (np. już
       const id = path.split('/').pop();
       const body = await parseBody(req);
       const allowed = [
-        'post_text', 'hashtags', 'cta', 'lead_trigger',
+        'post_text', 'hook', 'title', 'hashtags', 'cta', 'lead_trigger',
         'banner_path', 'visual_asset_path', 'visual_asset_type',
         'wiki_slug', 'publish_at', 'language',
         'cannibalize_status'
@@ -2246,6 +3480,90 @@ Po zakończeniu wypisz raport: które zaproszenia wysłane, które nie (np. już
       return;
     }
 
+    // Iter9: POST /api/media-plan/bulk-regenerate-empty — regen wszystkich postów z post_text NULL/short
+    if (method === 'POST' && path === '/api/media-plan/bulk-regenerate-empty') {
+      const db = getDb();
+      const targets = db.prepare(`
+        SELECT id, slug FROM media_plan_items
+        WHERE status IN ('plan','napisane')
+          AND (post_text IS NULL OR length(post_text) < 300)
+          AND publish_at >= date('now')
+        ORDER BY publish_at ASC
+      `).all();
+      db.close();
+      if (targets.length === 0) return json(res, { ok: true, total: 0, results: [] });
+
+      console.log(`[bulk-regen] Starting ${targets.length} regens sequentially...`);
+      const results = [];
+      const { spawn } = await import('node:child_process');
+      for (const item of targets) {
+        const t0 = Date.now();
+        try {
+          const proc = spawn('node', [join(MCP_DIR, 'scripts', 'regenerate-posts.mjs'), '--slug=' + item.slug], {
+            cwd: MCP_DIR, env: process.env, stdio: ['ignore', 'pipe', 'pipe'],
+          });
+          let stdout = '', stderr = '';
+          proc.stdout.on('data', (d) => { stdout += d.toString(); });
+          proc.stderr.on('data', (d) => { stderr += d.toString(); });
+          const r = await new Promise((resolve) => {
+            proc.on('close', (code) => resolve({ code, stdout, stderr }));
+            setTimeout(() => { proc.kill(); resolve({ code: -1, stdout, stderr: stderr + '\nTIMEOUT' }); }, 180000);
+          });
+          const failed = /WALIDACJA FAIL/.test(r.stdout);
+          const dbCheck = getDb();
+          const updated = dbCheck.prepare("SELECT length(post_text) AS chars FROM media_plan_items WHERE id = ?").get(item.id);
+          dbCheck.close();
+          results.push({
+            slug: item.slug,
+            status: failed ? 'validation-fail' : (r.code === 0 ? 'ok' : 'fail'),
+            chars: updated?.chars || 0,
+            duration_s: Math.round((Date.now() - t0) / 1000),
+          });
+          console.log(`[bulk-regen]   ${item.slug}: ${failed ? 'validation-fail' : (r.code === 0 ? 'ok' : 'fail')} (${updated?.chars || 0} chars, ${Math.round((Date.now() - t0)/1000)}s)`);
+        } catch (e) {
+          results.push({ slug: item.slug, status: 'error', error: e.message?.slice(0, 200), duration_s: Math.round((Date.now() - t0) / 1000) });
+        }
+      }
+      const ok_count = results.filter((r) => r.status === 'ok').length;
+      console.log(`[bulk-regen] Done: ${ok_count}/${targets.length} succeeded`);
+      return json(res, { ok: true, total: targets.length, succeeded: ok_count, results });
+    }
+
+    // Iter8: POST /api/media-plan/:id/regenerate — regeneracja post_text przez Claude Opus + git log + README
+    if (method === 'POST' && path.match(/^\/api\/media-plan\/[^/]+\/regenerate$/)) {
+      const id = path.split('/')[3];
+      const db = getDb();
+      const item = db.prepare("SELECT * FROM media_plan_items WHERE id = ? OR slug = ?").get(id, id);
+      db.close();
+      if (!item) return json(res, { error: 'Not found' }, 404);
+      // Wywołaj skrypt jako subproces (re-use logiki) lub inline
+      const { spawn } = await import('node:child_process');
+      const proc = spawn('node', [join(MCP_DIR, 'scripts', 'regenerate-posts.mjs'), '--slug=' + item.slug], {
+        cwd: MCP_DIR,
+        env: process.env,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let stdout = '';
+      let stderr = '';
+      proc.stdout.on('data', (d) => { stdout += d.toString(); });
+      proc.stderr.on('data', (d) => { stderr += d.toString(); });
+      const result = await new Promise((resolve) => {
+        proc.on('close', (code) => resolve({ code, stdout, stderr }));
+        setTimeout(() => { proc.kill(); resolve({ code: -1, stdout, stderr: stderr + '\nTIMEOUT 180s' }); }, 180000);
+      });
+      if (result.code !== 0) return json(res, { error: 'regenerate failed', code: result.code, stderr: result.stderr.slice(-1000), stdout: result.stdout.slice(-500) }, 500);
+      // Iter9: parse stdout dla WALIDACJA FAIL (Claude zwrócił słaby wynik → skrypt nie zapisał do DB)
+      if (/WALIDACJA FAIL/.test(result.stdout)) {
+        const m = result.stdout.match(/WALIDACJA FAIL — ([^\n]+)/);
+        return json(res, { ok: false, error: 'Walidacja: ' + (m ? m[1] : 'Claude zwrócił słaby wynik'), log: result.stdout.slice(-500) }, 200);
+      }
+      // Re-fetch zaktualizowany item
+      const dbw = getDb();
+      const updated = dbw.prepare("SELECT id, slug, post_text, original_post_text, updated_at FROM media_plan_items WHERE id = ?").get(item.id);
+      dbw.close();
+      return json(res, { ok: true, slug: updated.slug, chars: (updated.post_text || '').length, log: result.stdout.slice(-500) });
+    }
+
     // POST /api/media-plan/:id/generate-banner — call linkedin_banner_generate via MCP
     if (method === 'POST' && path.match(/^\/api\/media-plan\/[^/]+\/generate-banner$/)) {
       const id = path.split('/')[3];
@@ -2275,7 +3593,7 @@ Po zakończeniu wypisz raport: które zaproszenia wysłane, które nie (np. już
         headline: body.headline || (item.title || item.hook || `#${item.topic_number}`).slice(0, 60),
         subheadline: body.subheadline || (item.hook || '').slice(0, 120),
         cta_text: body.cta_text || 'bartoszgaca.pl',
-        output_path: outputPath
+        save_path: outputPath, // Iter6: poprawna nazwa parametru (był output_path)
       };
 
       try {
@@ -2500,11 +3818,31 @@ function buildHtml() {
 'a{color:var(--blu)}',
 '.header{background:var(--card);border-bottom:1px solid var(--brd);padding:0 20px;display:flex;align-items:center;gap:12px;height:52px;position:sticky;top:0;z-index:50;overflow:hidden}',
 '.logo{font-size:16px;font-weight:700;white-space:nowrap;flex-shrink:0}.logo em{color:var(--blu);font-style:normal}',
-'.tabnav{display:flex;gap:2px;overflow-x:auto;flex:1;scrollbar-width:none;-webkit-overflow-scrolling:touch}',
-'.tabnav::-webkit-scrollbar{display:none}',
-'.tnb{background:none;border:none;color:var(--dim);font-family:inherit;font-size:13px;font-weight:600;padding:7px 13px;border-radius:6px;cursor:pointer;white-space:nowrap;transition:.15s}',
+/* Hamburger + sliding sidebar nav */
+'.hburger{background:none;border:1px solid var(--brd);color:var(--txt);width:36px;height:36px;border-radius:6px;cursor:pointer;display:flex;flex-direction:column;justify-content:center;align-items:center;gap:3px;flex-shrink:0;transition:.15s}',
+'.hburger:hover{background:rgba(255,255,255,.05);border-color:var(--blu)}',
+'.hburger span{display:block;width:18px;height:2px;background:var(--txt);border-radius:2px;transition:.2s}',
+'.hburger.open span:nth-child(1){transform:translateY(5px) rotate(45deg)}',
+'.hburger.open span:nth-child(2){opacity:0}',
+'.hburger.open span:nth-child(3){transform:translateY(-5px) rotate(-45deg)}',
+'.current-tab{font-size:14px;font-weight:600;color:var(--blu);padding:0 10px;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+'.nav-overlay{position:fixed;inset:0;background:rgba(0,0,0,.5);opacity:0;pointer-events:none;transition:.2s;z-index:99}',
+'.nav-overlay.open{opacity:1;pointer-events:auto}',
+'.tabnav{position:fixed;left:0;top:0;bottom:0;width:280px;background:var(--card);border-right:1px solid var(--brd);transform:translateX(-100%);transition:transform .25s ease;z-index:100;display:flex;flex-direction:column;gap:2px;padding:60px 12px 12px;overflow-y:auto}',
+'.tabnav.open{transform:translateX(0)}',
+'.tabnav::-webkit-scrollbar{width:6px}.tabnav::-webkit-scrollbar-thumb{background:var(--brd);border-radius:3px}',
+'.nav-header{position:absolute;top:12px;left:12px;right:12px;font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:1px;padding:8px 12px;border-bottom:1px solid var(--brd)}',
+'.tnb{background:none;border:none;color:var(--dim);font-family:inherit;font-size:14px;font-weight:600;padding:11px 14px;border-radius:6px;cursor:pointer;white-space:nowrap;transition:.15s;text-align:left;width:100%;display:flex;align-items:center;gap:8px}',
 '.tnb:hover{color:var(--txt);background:rgba(255,255,255,.05)}',
-'.tnb.active{color:var(--grn);background:rgba(63,185,80,.1)}',
+'.tnb.active{color:var(--grn);background:rgba(63,185,80,.12);border-left:3px solid var(--grn);padding-left:11px}',
+'.nav-group{margin:0}',
+'.nav-group>summary{list-style:none;cursor:pointer;font-size:11px;font-weight:700;color:var(--dim);text-transform:uppercase;letter-spacing:.06em;padding:10px 14px 6px;display:flex;align-items:center;gap:6px;user-select:none}',
+'.nav-group>summary::-webkit-details-marker{display:none}',
+'.nav-group>summary::before{content:"▸";font-size:9px;transition:transform .15s;color:var(--dim)}',
+'.nav-group[open]>summary::before{transform:rotate(90deg)}',
+'.nav-group>summary:hover{color:var(--txt)}',
+'.nav-group .tnb{padding-left:30px;font-size:13px;font-weight:500}',
+'.nav-group .tnb.active{padding-left:27px}',
 '.sbar{display:flex;gap:10px;align-items:center;font-size:11px;flex-wrap:nowrap;flex-shrink:0}',
 '.sdot{width:7px;height:7px;border-radius:50%;display:inline-block;margin-right:3px}',
 '.sdot.g{background:var(--grn)}.sdot.r{background:var(--red)}.sdot.y{background:var(--yel)}',
@@ -2574,6 +3912,14 @@ function buildHtml() {
 '.sec{margin-bottom:28px}',
 '.sec-h{font-size:13px;font-weight:700;color:var(--grn);margin:24px 0 10px;padding-bottom:7px;border-bottom:1px solid var(--brd);text-transform:uppercase;letter-spacing:.04em}',
 '.sec-h:first-child{margin-top:0}',
+/* Iter2: Media Plan thumbnail + filter toolbar */
+'.mp-thumb{width:96px;height:54px;object-fit:cover;border-radius:4px;border:1px solid var(--brd);flex-shrink:0;background:var(--bg)}',
+'.mp-thumb-empty{display:flex;align-items:center;justify-content:center;font-size:10px;color:var(--dim);font-style:italic}',
+'.mp-toolbar{display:flex;gap:10px;align-items:center;margin:12px 0;flex-wrap:wrap}',
+'.mp-toolbar select{background:var(--card);border:1px solid var(--brd);color:var(--txt);padding:5px 9px;border-radius:4px;font-size:12px;font-family:inherit;cursor:pointer}',
+'.view-toggle{display:inline-flex;gap:2px;background:var(--bg);border:1px solid var(--brd);border-radius:6px;padding:2px}',
+'.view-toggle .btn{border:none!important;background:transparent!important;color:var(--dim)}',
+'.view-toggle .btn.active{background:var(--card)!important;color:var(--grn)}',
 '.pg-title{font-size:1.15rem;font-weight:700;margin-bottom:18px}',
 /* Code block */
 '.cblk{position:relative;background:var(--card);border:1px solid var(--brd);border-radius:8px;overflow:hidden;margin-bottom:14px}',
@@ -2615,6 +3961,11 @@ function buildHtml() {
 '.cal-tbl td{padding:9px 13px;border-top:1px solid var(--brd)}',
 '.cal-tbl tr:hover td{background:rgba(255,255,255,.02)}',
 '.cal-week td{padding:7px 13px;font-family:var(--mono);font-size:10px;color:var(--yel);font-weight:600;background:rgba(210,153,34,.05);border-top:1px solid var(--brd)}',
+/* Iter7: drag-and-drop indicators */
+'.cal-tbl tr[draggable="true"]{cursor:move}',
+'.cal-tbl tr[draggable="true"]:hover td{background:rgba(255,255,255,.04)}',
+'.cal-tbl tr.dragging-source td{opacity:.4}',
+'.cal-tbl tr.drop-hover td{background:rgba(63,185,80,.18)!important;outline:2px dashed var(--grn);outline-offset:-2px}',
 /* Timeline */
 '.tl{position:relative;padding-left:26px}',
 '.tl::before{content:"";position:absolute;left:7px;top:0;bottom:0;width:2px;background:var(--brd)}',
@@ -2679,18 +4030,41 @@ function buildHtml() {
 '</head>',
 '<body>',
 '<div class="header">',
+'<button class="hburger" id="hburger" aria-label="Menu"><span></span><span></span><span></span></button>',
 '<div class="logo"><em>LI</em> Dashboard</div>',
-'<nav class="tabnav">',
-'<button class="tnb active" data-tab="posty">Posty</button>',
-'<button class="tnb" data-tab="mediaplan">Media Plan</button>',
-'<button class="tnb" data-tab="prospekci">Inbound Leads</button>',
-'<button class="tnb" data-tab="kalendarz">Kalendarz</button>',
-'<button class="tnb" data-tab="rutyna">Rutyna</button>',
-'<button class="tnb" data-tab="analytics">Analytics</button>',
-'<button class="tnb" data-tab="siec">Siec</button>',
-'<button class="tnb" data-tab="leady">Leady</button>',
-'<button class="tnb" data-tab="kontenty">Kontenty</button>',
+'<div class="current-tab" id="current-tab">Posty</div>',
+'<div class="nav-overlay" id="nav-overlay"></div>',
+'<nav class="tabnav" id="tabnav">',
+'<div class="nav-header">Menu</div>',
+'<details class="nav-group" data-group="operacje" open>',
+'<summary>📅 Operacje</summary>',
+'<button class="tnb active" data-tab="posty">Kolejka postów</button>',
+'<button class="tnb" data-tab="rutyna">Automatyzacje</button>',
+'</details>',
+'<details class="nav-group" data-group="tresc">',
+'<summary>✍️ Treść</summary>',
 '<button class="tnb" data-tab="artykuly">Artykuły</button>',
+'<button class="tnb" data-tab="kontenty">Insights</button>',
+'</details>',
+'<details class="nav-group" data-group="crm">',
+'<summary>👥 CRM</summary>',
+'<button class="tnb" data-tab="prospekci">Inbound</button>',
+'<button class="tnb" data-tab="leady">Pipeline</button>',
+'</details>',
+'<details class="nav-group" data-group="engagement">',
+'<summary>💬 Engagement</summary>',
+'<button class="tnb" data-tab="propozycje" id="tab-btn-propozycje">Propozycje</button>',
+'<button class="tnb" data-tab="watki" id="tab-btn-watki">Wątki</button>',
+'</details>',
+'<details class="nav-group" data-group="analytics">',
+'<summary>📊 Analytics</summary>',
+'<button class="tnb" data-tab="analytics">Performance</button>',
+'<button class="tnb" data-tab="siec">Sieć</button>',
+'</details>',
+'<details class="nav-group" data-group="system">',
+'<summary>⚙️ System</summary>',
+'<button class="tnb" data-tab="ustawienia">Wytyczne AI</button>',
+'</details>',
 '</nav>',
 '<div class="sbar" id="sbar">...</div>',
 '</div>',
@@ -2698,34 +4072,121 @@ function buildHtml() {
 '<div class="tab-panel active" id="tab-posty">',
 '<div class="wrap">',
 '<div class="post-stats" id="post-stats"></div>',
-'<div class="toolbar">',
-'<span style="font-size:14px;font-weight:700">Nadchodz\u0105ce</span>',
-'<button class="btn primary" id="btnNew">+ New Post</button>',
+// Iter2: toggle widok\u00f3w
+'<div class="toolbar" style="margin-bottom:12px">',
+'<div class="view-toggle" id="posts-view-toggle">',
+'<button class="btn sm active" data-view="list">\ud83d\udccb Lista</button>',
+'<button class="btn sm" data-view="week">\ud83d\udcc5 Tydzie\u0144</button>',
 '</div>',
+// Iter6: filtr okresu \u2014 domy\u015blnie 365d ukrywa archiwum sprzed roku
+'<select id="posts-period" class="sel-inline" style="margin-left:12px;font-size:12px;padding:5px 9px;background:var(--card);border:1px solid var(--brd);color:var(--txt);border-radius:6px">',
+'<option value="90d">Ostatnie 90 dni</option>',
+'<option value="365d" selected>Ostatni rok</option>',
+'<option value="future">Tylko przysz\u0142e</option>',
+'<option value="all">Wszystkie (te\u017c archiwum)</option>',
+'</select>',
+'<button class="btn primary" id="btnNew" style="margin-left:auto">+ New Post</button>',
+'</div>',
+// View: Lista (default)
+'<div id="posts-view-list">',
+'<div class="toolbar"><span style="font-size:14px;font-weight:700">Nadchodz\u0105ce</span></div>',
 '<div id="posts-upcoming"></div>',
 '<div style="margin-top:20px"><span style="font-size:14px;font-weight:700;color:var(--dim)">Proponowane (<span id="propCount">0</span>)</span></div>',
 '<div id="posts-proposed" style="margin-top:10px"></div>',
+'<div style="margin-top:28px;display:flex;align-items:center;gap:10px">',
+'<span style="font-size:14px;font-weight:700;color:var(--yel)">\ud83d\udca1 Pomys\u0142y z Media Plan (<span id="ideasCount">0</span>)</span>',
+'<span style="font-size:11px;color:var(--dim)">Status \u201eplan\u201d \u2014 jeszcze nie napisane. Klik \u201cPrzer\u00f3b\u201d odpala generator z humanizer + fact-checker.</span>',
+'<button class="btn sm" id="btn-ideas-refresh" style="margin-left:auto">\u21ba</button>',
+'</div>',
+'<div id="posts-media-ideas" style="margin-top:10px;display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:12px"></div>',
 '<div class="hist-toggle"><button class="btn" id="btnHistory">Poka\u017c histori\u0119 (<span id="histCount">0</span> post\u00f3w)</button></div>',
 '<div id="posts-history" style="display:none"></div>',
+'</div>',
+// View: Tydzie\u0144 (alias dla dawnego Kalendarza)
+'<div id="posts-view-week" style="display:none"></div>',
 '</div>',
 '</div>',
 // ── Tab: Prospekci & Zaproszenia ────────────────────────────────────────
 '<div class="tab-panel" id="tab-mediaplan"><div class="wrap" id="mp-root"></div></div>',
 '<div class="tab-panel" id="tab-prospekci"><div class="wrap" id="pro-root"></div></div>',
-// ── Tab: Kalendarz ──────────────────────────────────────────────────────
-'<div class="tab-panel" id="tab-kalendarz"><div class="wrap" id="kal-root"></div></div>',
+// ── Tab: Kalendarz (Iter2: usunięty — widok tygodniowy żyje w tab-posty toggle) ──
 // ── Tab: Rutyna ─────────────────────────────────────────────────────────
 '<div class="tab-panel" id="tab-rutyna"><div class="wrap" id="rut-root"></div></div>',
 // ── Tab: Analytics ──────────────────────────────────────────────────
 '<div class="tab-panel" id="tab-analytics"><div class="wrap" id="ana-root"></div></div>',
 // ── Tab: Siec (Network) ────────────────────────────────────────────
 '<div class="tab-panel" id="tab-siec"><div class="wrap" id="siec-root"></div></div>',
+// ── Tab: Ustawienia (Wytyczne AI) ──────────────────────────────────
+'<div class="tab-panel" id="tab-ustawienia"><div class="wrap" id="ust-root">',
+'<div id="scraper-panel" style="margin-bottom:28px"></div>',
+'<div style="display:flex;align-items:center;gap:12px;margin-bottom:20px">',
+'<h2 style="margin:0;font-size:16px">⚙️ Wytyczne AI</h2>',
+'<span style="font-size:11px;color:var(--dim)">Stosowane przy generowaniu postów (draft-article) i odpowiedzi na komentarze (auto-comment-playwright). Zmiana = natychmiast w kolejnym wywołaniu, bez restartu.</span>',
+'</div>',
+'<div id="ust-blocks"></div>',
+'</div></div>',
 // ── Tab: Leady (Pipeline) ──────────────────────────────────────────
 '<div class="tab-panel" id="tab-leady"><div class="wrap" id="leady-root"></div></div>',
 // ── Tab: Kontenty (Content Intelligence) ───────────────────────────
 '<div class="tab-panel" id="tab-kontenty"><div class="wrap" id="kontenty-root"></div></div>',
 // ── Tab: Artykuły (Article Drafter — Wariant G-A) ──────────────────
 '<div class="tab-panel" id="tab-artykuly"><div class="wrap" id="art-root"></div></div>',
+
+// ── Tab: Propozycje odpowiedzi ──────────────────────────────────────────────
+'<div class="tab-panel" id="tab-propozycje">',
+'<div class="wrap">',
+'<div style="display:flex;align-items:center;gap:12px;margin-bottom:16px">',
+'<h2 style="margin:0;font-size:16px">💬 Propozycje odpowiedzi</h2>',
+'<span id="prop-count" style="background:var(--blu);color:#fff;padding:2px 8px;border-radius:10px;font-size:11px">0</span>',
+'<span id="engine-health" title="Silnik komentarzy: Playwright scrape + Opus 4.8. Zielony = skanuje i odświeża drzewko." style="font-size:11px;padding:2px 8px;border-radius:10px;background:var(--dim);color:#fff;cursor:default">⚙️ …</span>',
+'<button class="btn sm" id="fetch-all-comments" title="Wymuś pełny skan: wszystkie posty → wszystkie komentarze + odpowiedzi pod nimi → odśwież drzewko i propozycje">📥 Pobierz wszystkie</button>',
+'<select id="prop-filter" style="margin-left:auto;background:var(--card);border:1px solid var(--brd);color:var(--txt);padding:4px 8px;border-radius:4px;font-size:12px">',
+'<option value="pending">Oczekujące</option>',
+'<option value="blocked">🚫 Zablokowane (walidacja)</option>',
+'<option value="all">Wszystkie</option>',
+'<option value="sent">Wysłane</option>',
+'<option value="rejected">Odrzucone</option>',
+'</select>',
+'<label style="font-size:11px;color:var(--dim);display:flex;align-items:center;gap:4px;cursor:pointer" title="Domyślnie ukrywamy wątki gdzie już odpowiedziałeś — bo bot scrape\\\'uje notyfikacje pod Twoimi replykami i sugeruje follow-up. Zaznacz żeby zobaczyć follow-upy.">',
+'<input type="checkbox" id="prop-show-replied" style="margin:0"> pokaż follow-upy',
+'</label>',
+'<button class="btn sm" id="prop-refresh">↺ Odśwież</button>',
+'</div>',
+'<div id="prop-list"></div>',
+'</div>',
+'</div>',
+
+// ── Tab: Wątki (thread_memory) ──────────────────────────────────────────────
+'<div class="tab-panel" id="tab-watki">',
+'<div class="wrap">',
+'<div style="display:flex;align-items:center;gap:12px;margin-bottom:16px">',
+'<h2 style="margin:0;font-size:16px">🧵 Pamięć wątków komentarzy</h2>',
+'<span id="watki-count" style="background:var(--blu);color:#fff;padding:2px 8px;border-radius:10px;font-size:11px">0</span>',
+'<span id="watki-last-cycle" style="font-size:11px;color:var(--dim);margin-left:auto"></span>',
+'<button class="btn sm" id="watki-refresh">↺ Odśwież</button>',
+'</div>',
+'<div id="watki-cycles" style="margin-bottom:16px"></div>',
+'<div id="watki-filters" style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap;align-items:center">',
+'<input id="w-q" placeholder="🔍 szukaj w treści posta" style="flex:1;min-width:200px;background:var(--card);border:1px solid var(--brd);color:var(--txt);padding:6px 10px;border-radius:4px;font-size:12px">',
+'<select id="w-reply" style="background:var(--card);border:1px solid var(--brd);color:var(--txt);padding:6px 8px;border-radius:4px;font-size:12px">',
+'<option value="all">Wszystkie</option>',
+'<option value="1">✅ Z naszymi odp</option>',
+'<option value="0">⏳ Bez naszych odp</option>',
+'</select>',
+'<input id="w-since" type="date" style="background:var(--card);border:1px solid var(--brd);color:var(--txt);padding:6px 8px;border-radius:4px;font-size:12px" title="Od daty publikacji">',
+'<select id="w-sort" style="background:var(--card);border:1px solid var(--brd);color:var(--txt);padding:6px 8px;border-radius:4px;font-size:12px">',
+'<option value="published_desc">📅 Najnowsze publikacje</option>',
+'<option value="published_asc">📅 Najstarsze publikacje</option>',
+'<option value="comments_desc">💬 Najwięcej komentarzy</option>',
+'<option value="no_reply_first">⏳ Bez odp najpierw</option>',
+'<option value="scraped_desc">⏰ Ostatnio scrapowane</option>',
+'</select>',
+'<button class="btn sm" id="w-clear" title="Wyczyść filtry">✗</button>',
+'</div>',
+'<div id="watki-list"></div>',
+'</div>',
+'</div>',
+
 // ── Modal ───────────────────────────────────────────────────────────────
 '<div class="overlay" id="ov">',
 '<div class="modal">',
@@ -2745,24 +4206,67 @@ function buildHtml() {
 '<button type="button" data-l="pl">PL</button><button type="button" data-l="en">EN</button>',
 '</div></div>',
 '</div>',
-'<div class="cprev"><b>Auto-comment (15 min after publish):</b><br><span id="cptext">-</span></div>',
+// Iter2: edytowalny pierwszy komentarz (override hardcoded mapowania)
+'<div class="frow" style="grid-template-columns:1fr">',
+'<div class="fg"><label>Pierwszy komentarz (15 min po publikacji) <span id="acom-source" style="font-size:10px;font-weight:400;color:var(--dim);margin-left:6px"></span></label>',
+'<textarea id="auto-comment" rows="3" placeholder="Zostaw puste — użyje domyślnego z mapowania" style="width:100%;background:var(--bg);border:1px solid var(--brd);color:var(--txt);padding:8px;border-radius:4px;font-family:inherit;font-size:12px;resize:vertical"></textarea>',
+'<div class="cc" style="display:flex;justify-content:space-between;align-items:center;margin-top:4px"><span><span id="acom-cc">0</span> znaków</span><button type="button" class="btn sm" id="acom-reset" style="font-size:11px">↺ Domyślny (auto)</button></div>',
+'</div></div>',
+// Iter2: sekcja Media (banner / zdjęcie / wideo per post)
+'<div class="frow" style="grid-template-columns:1fr">',
+'<div class="fg"><label>Media załączone do posta</label>',
+'<div id="media-preview" style="margin-bottom:8px;min-height:40px;display:flex;align-items:center;gap:10px;flex-wrap:wrap"></div>',
+'<div class="media-actions" style="display:flex;gap:8px;flex-wrap:wrap">',
+'<input type="file" id="media-file" accept="image/*,video/*" style="display:none">',
+'<button type="button" class="btn sm" id="media-upload-btn">📎 Wybierz plik</button>',
+'<select id="banner-preset" class="sel-inline" style="font-size:11px"><option value="">— preset banera —</option><option value="post5">post5</option><option value="post6">post6</option><option value="post7">post7</option><option value="post8">post8</option><option value="post9">post9</option><option value="post10">post10</option><option value="post11">post11</option><option value="post12">post12</option><option value="post13">post13</option><option value="post14">post14</option><option value="post15">post15</option><option value="post16">post16</option><option value="post17">post17</option></select>',
+'<button type="button" class="btn sm" id="media-banner-btn">🎨 Generuj banner</button>',
+'<button type="button" class="btn sm" id="media-ai-image-btn" style="background:rgba(56,139,253,.15);color:var(--blu);border-color:var(--blu)">🤖 AI Image (Imagen 4)</button>',
+'<button type="button" class="btn sm" id="media-remove-btn" style="background:var(--red);border-color:var(--red);color:#fff">🗑️ Usuń media</button>',
+'</div></div></div>',
 '<div class="mact"><button class="btn" id="mcancel">Cancel</button><button class="btn primary" id="msave">Save</button></div>',
 '</div>',
 '</div>',
 '<div class="toast" id="toast"></div>',
 
+// Iter6: Proposed post detail modal — readonly view + quick schedule
+'<div class="overlay" id="pp-ov">',
+'<div class="modal" style="width:720px">',
+'<div style="display:flex;align-items:flex-start;gap:12px;margin-bottom:12px">',
+'<h2 id="pp-mtitle" style="margin:0;flex:1">Proponowany post</h2>',
+'<button class="btn sm" id="pp-close" style="font-size:14px;padding:4px 10px">✕</button>',
+'</div>',
+'<div id="pp-meta" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px"></div>',
+'<div id="pp-screenshot" style="font-size:11px;color:var(--yel);margin-bottom:10px;display:none"></div>',
+'<label style="display:block;font-size:11px;color:var(--dim);margin-bottom:4px">Pełna treść posta:</label>',
+'<textarea id="pp-text" readonly style="width:100%;min-height:280px;background:var(--bg);border:1px solid var(--brd);color:var(--txt);padding:10px;border-radius:6px;font-family:inherit;font-size:13px;line-height:1.5;resize:vertical"></textarea>',
+'<div id="pp-hashtags" style="margin:8px 0;display:flex;gap:4px;flex-wrap:wrap"></div>',
+'<div class="mact" style="margin-top:14px;display:flex;gap:8px;justify-content:flex-end">',
+'<button class="btn" id="pp-copy">📋 Kopiuj tekst</button>',
+'<button class="btn primary" id="pp-schedule">📅 Zaplanuj teraz</button>',
+'</div>',
+'</div>',
+'</div>',
+
 // ── Media Plan modal ──
 '<div class="overlay" id="mp-ov">',
 '<div class="modal" style="width:980px">',
-'<h2 id="mp-mtitle">Media Plan — Edit</h2>',
+'<div style="display:flex;align-items:center;gap:10px;margin-bottom:14px">',
+'<h2 id="mp-mtitle" style="margin:0;flex:1">Media Plan — Edit</h2>',
+'<button type="button" class="btn sm" id="mp-regenerate-btn" style="background:rgba(63,185,80,.15);color:var(--grn);border-color:var(--grn)" title="Regeneruj treść przez Claude Opus + git log projektu (anti-halucynacje)">🤖 Regeneruj treść</button>',
+'</div>',
 '<div id="mp-meta" style="margin-bottom:14px;font-size:12px;color:var(--dim)"></div>',
+'<div class="frow" style="margin-bottom:10px">',
+'<div class="fg"><label>Hook (pierwsze 62 znaki — widoczne przed "see more")</label><input type="text" id="mp-hook" placeholder="Konkretne zdanie. Problem lub fakt." maxlength="120" style="font-weight:600"></div>',
+'<div class="fg" style="max-width:220px"><label>Title (wewnętrzny)</label><input type="text" id="mp-title" placeholder="Tytuł tematu"></div>',
+'</div>',
 '<div class="lcol act" style="margin-bottom:14px">',
 '<label>Treść posta (PL/EN — wg item.language)</label>',
 '<textarea id="mp-text" placeholder="Napisz treść 1300-1700 znaków..." style="min-height:280px"></textarea>',
 '<div class="cc"><span id="mp-cc">0</span> chars (target 1300-1700) · <span id="mp-cc-warn" style="color:var(--red)"></span></div>',
 '</div>',
 '<div class="frow">',
-'<div class="fg"><label>Banner path</label><input type="text" id="mp-banner" placeholder=".../banner.png"><div style="display:flex;gap:6px;margin-top:6px"><button class="btn sm" id="mp-gen-banner">🎨 Generate via MCP</button><label class="btn sm" style="cursor:pointer">📁 Upload<input type="file" id="mp-upload-banner" accept=".png,.jpg,.jpeg" style="display:none"></label></div></div>',
+'<div class="fg"><label>Banner path</label><input type="text" id="mp-banner" placeholder=".../banner.png"><div id="mp-banner-preview" style="margin-top:6px;min-height:54px"></div><div style="display:flex;gap:6px;margin-top:6px"><button class="btn sm" id="mp-gen-banner">🎨 Generate via MCP</button><label class="btn sm" style="cursor:pointer">📁 Upload<input type="file" id="mp-upload-banner" accept=".png,.jpg,.jpeg" style="display:none"></label></div></div>',
 '<div class="fg"><label>Visual asset path</label><input type="text" id="mp-visual" placeholder=".../screenshot.png lub .../demo.mp4"><div style="display:flex;gap:6px;margin-top:6px"><label class="btn sm" style="cursor:pointer">📁 Upload screen/video<input type="file" id="mp-upload-visual" accept="image/*,video/*" style="display:none"></label></div></div>',
 '</div>',
 '<div class="frow">',
@@ -2877,6 +4381,7 @@ function loadPosts() {
   api('/api/posts').then(function(data) {
     posts = data;
     render();
+    loadUnifiedQueue();  // Iter10: pomysły z media_plan_items.status='plan'
   });
 }
 
@@ -2890,7 +4395,36 @@ function renderCard(p) {
   var bi = p.text_alt ? '<span class="badge b-bi">PL+EN</span>' : '';
   var com = p.auto_comment || gcom(p.text);
   var comShort = com.length > 120 ? com.substring(0, 120) + '...' : com;
-  var img = p.image_file ? '<div class="card-img"><img src="/img/' + esc(p.image_file) + '" alt="Post image"></div>' : '';
+  // Iter11/12: PRIORYTET dla unifiedMatch.media_url (NVIDIA FLUX z media_plan_items
+  // przez endpoint /media-image/<slug> z auto-detect JPEG/PNG). Stary /post-media/{id}/...
+  // nie serwuje z ~/.linkedin-mcp/images/posts/.
+  var unifiedMatch = null;
+  if (UNIFIED_CACHE && UNIFIED_CACHE.scheduled) {
+    unifiedMatch = UNIFIED_CACHE.scheduled.find(function(s) { return s.id === p.id; });
+  }
+  // Iter2: media hierarchia
+  var img = '';
+  if (unifiedMatch && unifiedMatch.media_url) {
+    // PRIORYTET 1: NVIDIA FLUX z media_plan_items.visual_asset_path (przez /media-image/<slug>)
+    img = '<div class="card-img"><img src="' + esc(unifiedMatch.media_url) + '" alt="' + esc(unifiedMatch.mp_title || unifiedMatch.mp_slug || '') + '" loading="lazy"></div>';
+  } else if (p.media_preview_path) {
+    var mediaSrc = '/post-media/' + p.id + '/' + p.media_preview_path.split('/').pop();
+    var isVideo = p.media_kind === 'video' || /\.(mp4|webm|mov)$/i.test(p.media_preview_path);
+    img = isVideo
+      ? '<div class="card-img"><video src="' + esc(mediaSrc) + '" muted preload="metadata" style="width:100%;max-height:280px;object-fit:cover"></video></div>'
+      : '<div class="card-img"><img src="' + esc(mediaSrc) + '" alt="Post media"></div>';
+  } else if (p.image_file) {
+    img = '<div class="card-img"><img src="/img/' + esc(p.image_file) + '" alt="Post image"></div>';
+  } else if (p.media_ids) {
+    var urnCount = 0; try { urnCount = JSON.parse(p.media_ids || '[]').length; } catch(e) {}
+    if (urnCount) img = '<div class="card-img card-img-urn" style="background:var(--bg);padding:14px;text-align:center;color:var(--dim);font-size:12px;border:1px dashed var(--brd);border-radius:6px">🔗 ' + urnCount + ' media załączone (LinkedIn URN)</div>';
+  } else if (unifiedMatch && unifiedMatch.media_url) {
+    // Iter11: obraz z media_plan_items.visual_asset_path (NVIDIA FLUX wygenerowany przez gen-image-nvidia)
+    img = '<div class="card-img"><img src="' + esc(unifiedMatch.media_url) + '" alt="' + esc(unifiedMatch.mp_title || unifiedMatch.mp_slug || '') + '" loading="lazy"></div>';
+  }
+  var acomBadge = p.auto_comment_source === 'custom'
+    ? '<span style="font-size:10px;background:var(--yel);color:#000;padding:1px 6px;border-radius:3px;margin-right:6px">✏️ custom</span>'
+    : '';
   var cls = 'card card-' + p.status;
 
   var h = '<div class="' + cls + '" data-id="' + p.id + '">';
@@ -2900,6 +4434,18 @@ function renderCard(p) {
   h += bi;
   h += '<span>' + dt + '</span>';
   if (pd) h += '<span>Published: ' + pd + '</span>';
+  // QA bramka (nowy algorytm): status + score experience/emotion/specificity
+  if (p.qa_status) {
+    var qaBg = p.qa_status === 'approved' ? '#1f6f3f' : (p.qa_status === 'hold' ? '#8a5a00' : '#5a1f1f');
+    h += '<span class="badge" style="background:' + qaBg + ';color:#fff">QA ' + esc(p.qa_status) + '</span>';
+    var qsc = null; try { qsc = JSON.parse(p.qa_scores || 'null'); } catch (e) {}
+    if (qsc && qsc.scores) {
+      var d = qsc.scores;
+      var lo = function(v, min) { return (v == null ? '?' : v) + (v != null && v < min ? '⚠' : ''); };
+      h += '<span class="badge" title="experience/emotion/specificity — próg 3/2/3, suma ≥10. ⚠ = poniżej progu" style="background:#22272e;color:#adbac7">🧬' + lo(d.experience, 3) + ' ❤️' + lo(d.emotion, 2) + ' 🎯' + lo(d.specificity, 3) + '</span>';
+      if (qsc.isGenBanner) h += '<span class="badge" title="grafika generowana zbija zasięg (test #11)" style="background:#3a2a00;color:#e3b341">⚠ banner</span>';
+    }
+  }
   if (p.post_urn) {
     var url = urnToUrl(p.post_urn);
     h += '<a href="' + esc(url) + '" target="_blank" style="font-size:11px;color:var(--blu)">Otworz na LinkedIn &rarr;</a>';
@@ -2909,7 +4455,15 @@ function renderCard(p) {
   h += img;
   h += '<div class="ptxt" data-act="expand">' + esc(p.text) + '</div>';
   h += '<span class="toggle" data-act="expand">Show more</span>';
-  h += '<div class="acom"><b>Auto-comment (15m):</b> ' + esc(comShort) + '</div>';
+  h += '<div class="acom">' + acomBadge + '<b>Auto-comment (15m):</b> ' + esc(comShort) + '</div>';
+  // Iter7: drzewko komentarzy LinkedIn dla published — lazy load on toggle
+  if (p.status === 'published' && p.post_urn) {
+    var safeId = p.post_urn.replace(/[^a-z0-9]/gi, '_');
+    h += '<details class="comments-tree-wrap" data-load-comments="' + esc(p.post_urn) + '" data-post-id="' + esc(p.id) + '" style="margin-top:8px;border-top:1px solid var(--brd);padding-top:8px">';
+    h += '<summary style="cursor:pointer;font-size:12px;color:var(--blu);user-select:none;list-style:none">💬 Komentarze (kliknij aby załadować)</summary>';
+    h += '<div class="comments-tree" id="ct-' + safeId + '" style="margin-top:8px"></div>';
+    h += '</details>';
+  }
   h += '<div class="actions">';
   if (isSch || isFail) h += '<button class="btn sm" data-act="edit" data-id="' + p.id + '">Edit</button>';
   if (isSch) h += '<button class="btn sm primary" data-act="publish" data-id="' + p.id + '">Publish Now</button>';
@@ -2939,21 +4493,151 @@ function renderProposedCard(p, idx) {
   h += '<div class="ptxt" data-act="expand">' + esc(p.text || '') + '</div>';
   h += '<span class="toggle" data-act="expand">Show more</span>';
   h += '<div class="actions">';
+  // Iter6: drill-down do pełnych szczegółów + planowania
+  h += '<button class="btn sm" data-act="show-proposed" data-idx="' + idx + '">👁️ Szczegóły</button>';
   h += '<button class="btn sm primary" data-act="schedule-proposed" data-idx="' + idx + '">+ Zaplanuj ten post</button>';
   h += '</div></div>';
   return h;
 }
 
+// Iter6: filtr okresu — używany w Liście i Tygodniu
+function getPostsPeriod() {
+  var sel = document.getElementById('posts-period');
+  return (sel && sel.value) || localStorage.getItem('li_posts_period') || '365d';
+}
+function filterByPeriod(items, period, dateField) {
+  if (period === 'all') return items;
+  var now = Date.now();
+  var df = dateField || 'publish_at';
+  if (period === 'future') {
+    return items.filter(function(p) {
+      var d = new Date(p[df] || p.date || 0).getTime();
+      return !isNaN(d) && d >= now;
+    });
+  }
+  var ms = period === '90d' ? 90 * 86400000 : 365 * 86400000;
+  return items.filter(function(p) {
+    var d = new Date(p[df] || p.date || 0).getTime();
+    return !isNaN(d) && d >= now - ms;
+  });
+}
+
+// Iter10: zaciąga pomysły z media_plan_items.status='plan' (+ media URL dla scheduled).
+// Scala "Kolejka postów" z "Media Plan" w jeden widok zgodnie z wytyczną użytkownika.
+var UNIFIED_CACHE = null;
+function loadUnifiedQueue() {
+  return fetch('/api/posts/queue-unified', { cache: 'no-store' })
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      UNIFIED_CACHE = data;
+      renderMediaIdeas(data);
+      // Iter11: re-render scheduled cards żeby pokazać miniaturki obrazów z media_plan_items
+      if (typeof posts !== 'undefined' && Array.isArray(posts) && posts.length > 0 && typeof render === 'function') {
+        render();
+      }
+      return data;
+    })
+    .catch(function(e) { console.error('queue-unified failed:', e); return null; });
+}
+
+function renderMediaIdeas(data) {
+  var box = $$('posts-media-ideas');
+  var cnt = $$('ideasCount');
+  if (!box || !data) return;
+  var ideas = data.proposed || [];
+  if (cnt) cnt.textContent = ideas.length;
+  if (ideas.length === 0) {
+    box.innerHTML = '<div class="empty" style="grid-column:1/-1"><p>Wszystkie pomysły z media plan przerobione na posty.</p></div>';
+    return;
+  }
+  var html = '';
+  ideas.forEach(function(it) {
+    var titleEsc = esc(it.title || it.slug || '(brak tytułu)');
+    var hookEsc = esc((it.hook || '').slice(0, 240));
+    var fmtEsc = esc(it.format || 'thought-leadership');
+    var variants = [];
+    try { variants = JSON.parse(it.hook_variants || '[]'); } catch (e) { variants = []; }
+    var variantsHtml = '';
+    if (Array.isArray(variants) && variants.length > 1) {
+      variantsHtml = '<details style="margin-bottom:10px"><summary style="cursor:pointer;font-size:11px;color:var(--yel)">🧪 Hook Lab (' + variants.length + ' warianty)</summary>' +
+        '<ol style="margin:6px 0 0 16px;padding:0;font-size:11px;color:var(--txt);opacity:.8;line-height:1.5">' +
+        variants.map(function(v){ return '<li style="margin-bottom:4px">' + esc(String(v).slice(0, 200)) + '</li>'; }).join('') +
+        '</ol></details>';
+    }
+    var dateLabel = it.publish_at ? new Date(it.publish_at).toLocaleDateString('pl-PL', {day:'numeric', month:'short'}) : '';
+    var langBadge = it.language === 'en' ? 'EN' : 'PL';
+    var mediaHtml = '';
+    if (it.media_url) {
+      mediaHtml = '<div style="margin:8px 0"><img src="' + esc(it.media_url) + '" alt="' + titleEsc + '" style="width:100%;max-height:160px;object-fit:cover;border-radius:6px;border:1px solid var(--brd)"></div>';
+    } else if (it.visual_path) {
+      mediaHtml = '<div style="font-size:10px;color:var(--dim);margin:4px 0">📎 ' + esc(it.visual_type || 'asset') + ' planowane</div>';
+    }
+    html += '<div class="card card-idea" data-slug="' + esc(it.slug) + '" style="background:rgba(210,153,34,.06);border:1px solid rgba(210,153,34,.2);border-radius:8px;padding:14px">' +
+      '<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;font-size:11px">' +
+        '<span class="badge" style="background:var(--yel);color:#000;padding:2px 6px;border-radius:3px">#' + (it.topic_number || '?') + '</span>' +
+        '<span class="badge" style="background:rgba(255,255,255,.05);color:var(--dim);padding:2px 6px;border-radius:3px">' + langBadge + '</span>' +
+        '<span style="color:var(--dim)">' + esc(fmtEsc) + '</span>' +
+        (dateLabel ? '<span style="color:var(--dim);margin-left:auto">' + dateLabel + '</span>' : '') +
+      '</div>' +
+      mediaHtml +
+      '<div style="font-weight:600;margin-bottom:6px;font-size:13px;line-height:1.3">' + titleEsc + '</div>' +
+      '<div style="font-size:12px;color:var(--txt);opacity:.85;line-height:1.5;margin-bottom:12px">' + hookEsc + (it.hook && it.hook.length > 240 ? '...' : '') + '</div>' +
+      variantsHtml +
+      '<div style="display:flex;gap:6px;flex-wrap:wrap">' +
+        '<button class="btn primary sm" data-act="idea-regenerate" data-slug="' + esc(it.slug) + '" data-id="' + esc(it.id) + '">⚡ Przerób na post</button>' +
+        '<button class="btn sm" data-act="idea-details" data-slug="' + esc(it.slug) + '">👁️ Szczegóły</button>' +
+      '</div>' +
+    '</div>';
+  });
+  box.innerHTML = html;
+}
+
+// Event delegation dla "Przerób na post" i odśwież ikoniki
+document.addEventListener('click', function(e) {
+  var btn = e.target.closest && e.target.closest('[data-act="idea-regenerate"]');
+  if (btn) {
+    e.preventDefault();
+    var slug = btn.dataset.slug;
+    var id = btn.dataset.id;
+    btn.disabled = true;
+    btn.textContent = '⏳ Generuje...';
+    fetch('/api/media-plan/' + encodeURIComponent(id) + '/regenerate', { method: 'POST' })
+      .then(function(r) { return r.json(); })
+      .then(function(data) {
+        if (data.ok) {
+          if (typeof toast === 'function') toast('Generuje "' + slug + '" w tle. Odśwież za 60-180s.', true);
+          else alert('Generuje w tle: ' + slug);
+          btn.textContent = '⏳ W tle...';
+          setTimeout(function() { loadUnifiedQueue(); if (typeof load === 'function') load(); }, 90000);
+        } else {
+          if (typeof toast === 'function') toast('Błąd: ' + (data.error || 'nieznany'), false);
+          btn.disabled = false;
+          btn.textContent = '⚡ Przerób na post';
+        }
+      })
+      .catch(function(err) {
+        if (typeof toast === 'function') toast('Błąd sieci: ' + err.message, false);
+        btn.disabled = false;
+        btn.textContent = '⚡ Przerób na post';
+      });
+    return;
+  }
+  if (e.target.id === 'btn-ideas-refresh') { loadUnifiedQueue(); return; }
+});
+
 function render() {
-  var upcoming = posts.filter(function(p) { return p.status === 'scheduled'; })
+  var period = getPostsPeriod();
+  var filtered = filterByPeriod(posts, period, 'publish_at');
+  var upcoming = filtered.filter(function(p) { return p.status === 'scheduled'; })
     .sort(function(a, b) { return new Date(a.publish_at) - new Date(b.publish_at); });
-  var history = posts.filter(function(p) { return p.status === 'published' || p.status === 'cancelled' || p.status === 'failed'; })
+  var history = filtered.filter(function(p) { return p.status === 'published' || p.status === 'cancelled' || p.status === 'failed'; })
     .sort(function(a, b) { return new Date(b.publish_at) - new Date(a.publish_at); });
 
   // Filter proposed posts — exclude dates that already have a scheduled post
   var scheduledDates = {};
   posts.forEach(function(p) { if (p.publish_at) scheduledDates[(p.publish_at||'').slice(0,10)] = true; });
   var proposed = PROPOSED_POSTS.filter(function(p) { return !scheduledDates[p.date.slice(0,10)]; });
+  proposed = filterByPeriod(proposed, period, 'date');
 
   var now = new Date();
   var monthKey = now.getFullYear() + '-' + pad(now.getMonth() + 1);
@@ -3022,6 +4706,22 @@ document.addEventListener('click', function(e) {
     if (pp) openCreateFromProposed(pp);
     return;
   }
+  // Iter6: klik child w klikalnym <tr data-act="schedule-proposed">
+  var schedParent = t.closest && t.closest('[data-act="schedule-proposed"]');
+  if (schedParent && schedParent.dataset.idx) {
+    var idxP = parseInt(schedParent.dataset.idx);
+    var ppP = PROPOSED_POSTS[idxP];
+    if (ppP) openCreateFromProposed(ppP);
+    return;
+  }
+
+  // Iter6: drill-down do szczegółów proposed
+  if (t.dataset.act === 'show-proposed') {
+    var ppIdx = parseInt(t.dataset.idx);
+    var ppD = PROPOSED_POSTS[ppIdx];
+    if (ppD) openProposedDetail(ppD, ppIdx);
+    return;
+  }
 
   // New post
   if (t.id === 'btnNew') { openCreate(); return; }
@@ -3039,14 +4739,20 @@ document.addEventListener('click', function(e) {
     return;
   }
 
-  // Edit
+  // Edit (direct button)
   if (t.dataset.act === 'edit') { openEdit(t.dataset.id); return; }
 
-  // Publish now
+  // Publish now — MUSI być przed editParent (wiersz kalendarza ma data-act="edit",
+  // więc przycisk Publish/Cancel wewnątrz wiersza inaczej wpadałby w openEdit)
   if (t.dataset.act === 'publish') { publishNow(t.dataset.id); return; }
 
   // Cancel
   if (t.dataset.act === 'cancel') { cancelPost(t.dataset.id); return; }
+
+  // Edit — Iter6: klik w child element klikalnego <tr data-act="edit"> (drill-down wiersza).
+  // Fallback PO przyciskach, żeby nie przechwytywał klików w Publish/Cancel.
+  var editParent = t.closest && t.closest('[data-act="edit"]');
+  if (editParent && editParent.dataset.id) { openEdit(editParent.dataset.id); return; }
 
   // Mark prospect as invited
   if (t.dataset.act === 'mark-invited') {
@@ -3095,8 +4801,13 @@ document.addEventListener('change', function(e) {
 });
 
 function updComment() {
-  var txt = plang === 'pl' ? $$('tpl').value : $$('ten').value;
-  $$('cptext').textContent = txt ? gcom(txt) : '-';
+  // Iter6: cptext zostało usunięte w Iter2 — null check przed użyciem (preview auto-comment teraz w textarea #auto-comment)
+  var cptext = document.getElementById('cptext');
+  if (!cptext) return;
+  var tplEl = document.getElementById('tpl');
+  var tenEl = document.getElementById('ten');
+  var txt = plang === 'pl' ? (tplEl?.value || '') : (tenEl?.value || '');
+  cptext.textContent = txt ? gcom(txt) : '-';
 }
 
 function setLang(l) {
@@ -3127,8 +4838,40 @@ function openEdit(id) {
   $$('ccen').textContent = $$('ten').value.length;
 
   if (p.publish_at) $$('edate').value = toLocal(new Date(p.publish_at));
+  // Iter2: auto-comment override
+  var ac = $$('auto-comment'); if (ac) {
+    ac.value = p.auto_comment_override || '';
+    $$('acom-cc').textContent = ac.value.length;
+    $$('acom-source').textContent = p.auto_comment_source === 'custom'
+      ? '✏️ custom (zostanie wysłany Twój tekst)'
+      : '🤖 auto (z domyślnego mapowania)';
+    $$('acom-source').style.color = p.auto_comment_source === 'custom' ? 'var(--yel)' : 'var(--dim)';
+  }
+  // Iter2: media preview
+  renderMediaPreview(p);
   setLang(lang);
   $$('ov').classList.add('open');
+}
+
+function renderMediaPreview(p) {
+  var box = document.getElementById('media-preview');
+  if (!box) return;
+  if (p.media_preview_path) {
+    var src = '/post-media/' + p.id + '/' + p.media_preview_path.split('/').pop();
+    var isVideo = p.media_kind === 'video' || /\.(mp4|webm|mov)$/i.test(p.media_preview_path);
+    if (isVideo) {
+      box.innerHTML = '<video src="' + src + '" controls style="max-width:280px;max-height:160px;border-radius:6px;border:1px solid var(--brd)"></video>'
+        + '<span style="font-size:11px;color:var(--dim)">🎬 ' + (p.media_kind || 'video') + '</span>';
+    } else {
+      box.innerHTML = '<img src="' + src + '" alt="preview" style="max-width:280px;max-height:160px;border-radius:6px;border:1px solid var(--brd)">'
+        + '<span style="font-size:11px;color:var(--dim)">🖼️ ' + (p.media_kind || 'image') + '</span>';
+    }
+  } else if (p.image_file) {
+    box.innerHTML = '<img src="/img/' + p.image_file + '" alt="legacy" style="max-width:280px;max-height:160px;border-radius:6px;border:1px solid var(--brd);opacity:.7">'
+      + '<span style="font-size:11px;color:var(--dim)">📁 legacy (hardcoded mapping)</span>';
+  } else {
+    box.innerHTML = '<span style="font-size:12px;color:var(--dim);font-style:italic">Brak media. Wybierz plik lub wygeneruj banner.</span>';
+  }
 }
 
 function openCreate() {
@@ -3140,6 +4883,13 @@ function openCreate() {
   $$('ccen').textContent = '0';
   var d = new Date(); d.setDate(d.getDate() + 1); d.setHours(9, 30, 0, 0);
   $$('edate').value = toLocal(d);
+  // Iter2 reset
+  var ac = $$('auto-comment'); if (ac) {
+    ac.value = '';
+    $$('acom-cc').textContent = '0';
+    $$('acom-source').textContent = '';
+  }
+  renderMediaPreview({});
   setLang('en');
   $$('ov').classList.add('open');
 }
@@ -3157,18 +4907,179 @@ function savePost() {
   if (!main) { toast(plang.toUpperCase() + ' text is required', false); return; }
   if (!dt) { toast('Publish time is required', false); return; }
 
-  var body = JSON.stringify({ text: main, text_alt: alt || null, language: plang, publish_at: new Date(dt).toISOString() });
+  // Iter2: auto_comment_override (puste = null = auto z mapowania)
+  var acomEl = $$('auto-comment');
+  var acom = acomEl ? acomEl.value.trim() : '';
+  var body = JSON.stringify({
+    text: main,
+    text_alt: alt || null,
+    language: plang,
+    publish_at: new Date(dt).toISOString(),
+    auto_comment_override: acom || null,
+  });
 
   if (id) {
     api('/api/posts/' + id, { method: 'PUT', body: body }).then(function() {
-      toast('Post updated', true); closeModal(); loadPosts(); renderKalendarz();
+      toast('Post updated', true); closeModal(); loadPosts();
     });
   } else {
     api('/api/posts', { method: 'POST', body: body }).then(function() {
-      toast('Post created', true); closeModal(); loadPosts(); renderKalendarz();
+      toast('Post created', true); closeModal(); loadPosts();
     });
   }
 }
+
+// Iter2: media handlers (upload/banner/remove)
+function getCurrentEditPostId() {
+  var idEl = document.getElementById('eid');
+  return idEl ? idEl.value : '';
+}
+
+function refreshMediaPreviewById(id) {
+  // Re-fetch post from /api/posts ad hoc — proste: pobierz wszystkie i znajdź
+  fetch('/api/posts').then(function(r){return r.json();}).then(function(data){
+    var arr = Array.isArray(data) ? data : (data.rows || []);
+    var p = arr.find(function(x){ return x.id === id; });
+    if (p) {
+      // synchronize in-memory posts cache too
+      var idx = posts.findIndex(function(x){ return x.id === id; });
+      if (idx >= 0) posts[idx] = p;
+      renderMediaPreview(p);
+    }
+  });
+}
+
+function uploadMediaFile(id, file) {
+  var fd = new FormData();
+  fd.append('file', file);
+  fetch('/api/posts/' + id + '/media', { method: 'POST', body: fd })
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      if (d.error) { toast('Błąd: ' + d.error, false); return; }
+      toast('Media załączone (' + d.kind + ')', true);
+      refreshMediaPreviewById(id);
+      loadPosts();
+    })
+    .catch(function(e){ toast('Błąd uploadu: ' + e.message, false); });
+}
+
+function generatePostBanner(id, preset) {
+  if (!preset) { toast('Wybierz preset banera', false); return; }
+  toast('Generuję banner (' + preset + ')... ~30-60s', true);
+  fetch('/api/posts/' + id + '/banner', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ preset: preset })
+  })
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      if (d.error) {
+        // Iter6: pełny error do console, pierwsza linia do toast
+        console.error('[banner] error:', d.error);
+        var first = (d.error || '').split('\\n')[0].slice(0, 120);
+        toast('Błąd banera: ' + first + ' (pełen log w konsoli)', false);
+        return;
+      }
+      toast('Banner gotowy ✓', true);
+      refreshMediaPreviewById(id);
+      loadPosts();
+    })
+    .catch(function(e){
+      console.error('[banner] fetch error:', e);
+      toast('Błąd sieci: ' + e.message, false);
+    });
+}
+
+// Iter8: AI image generation (Google Imagen 4)
+function generatePostAiImage(id) {
+  var btn = document.getElementById('media-ai-image-btn');
+  var origText = btn ? btn.textContent : '';
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ Generuję AI (~15-30s)...'; }
+  toast('Generuję AI image przez Imagen 4 (~15-30s)...', true);
+  fetch('/api/posts/' + id + '/ai-image', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({}),
+  })
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      if (btn) { btn.disabled = false; btn.textContent = origText; }
+      if (d.error) {
+        console.error('[ai-image] error:', d.error);
+        var first = (d.error || '').split('\\n')[0].slice(0, 150);
+        toast('Błąd AI image: ' + first, false);
+        return;
+      }
+      toast('AI image gotowe ✓', true);
+      refreshMediaPreviewById(id);
+      loadPosts();
+    })
+    .catch(function(e){
+      if (btn) { btn.disabled = false; btn.textContent = origText; }
+      console.error('[ai-image] fetch error:', e);
+      toast('Błąd sieci AI image: ' + e.message, false);
+    });
+}
+
+function removePostMedia(id) {
+  if (!confirm('Usunąć media z tego posta?')) return;
+  fetch('/api/posts/' + id + '/media', { method: 'DELETE' })
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      if (d.error) { toast('Błąd: ' + d.error, false); return; }
+      toast('Media usunięte', true);
+      refreshMediaPreviewById(id);
+      loadPosts();
+    })
+    .catch(function(e){ toast('Błąd: ' + e.message, false); });
+}
+
+// Init modal media + auto-comment handlers (after DOM ready since elements are static HTML)
+(function initIter2ModalHandlers() {
+  var fileInput = document.getElementById('media-file');
+  var uploadBtn = document.getElementById('media-upload-btn');
+  var bannerBtn = document.getElementById('media-banner-btn');
+  var removeBtn = document.getElementById('media-remove-btn');
+  var presetSel = document.getElementById('banner-preset');
+  var acom = document.getElementById('auto-comment');
+  var acomReset = document.getElementById('acom-reset');
+  if (uploadBtn) uploadBtn.addEventListener('click', function() { if (fileInput) fileInput.click(); });
+  if (fileInput) fileInput.addEventListener('change', function(e) {
+    var id = getCurrentEditPostId();
+    if (!id) { toast('Najpierw zapisz post żeby załączyć media', false); fileInput.value=''; return; }
+    var file = e.target.files[0];
+    if (file) uploadMediaFile(id, file);
+    fileInput.value = '';
+  });
+  if (bannerBtn) bannerBtn.addEventListener('click', function() {
+    var id = getCurrentEditPostId();
+    if (!id) { toast('Najpierw zapisz post żeby wygenerować banner', false); return; }
+    generatePostBanner(id, presetSel ? presetSel.value : '');
+  });
+  // Iter8: AI Image (Imagen 4)
+  var aiImageBtn = document.getElementById('media-ai-image-btn');
+  if (aiImageBtn) aiImageBtn.addEventListener('click', function() {
+    var id = getCurrentEditPostId();
+    if (!id) { toast('Najpierw zapisz post żeby wygenerować AI image', false); return; }
+    generatePostAiImage(id);
+  });
+  if (removeBtn) removeBtn.addEventListener('click', function() {
+    var id = getCurrentEditPostId();
+    if (!id) return;
+    removePostMedia(id);
+  });
+  if (acom) acom.addEventListener('input', function() {
+    document.getElementById('acom-cc').textContent = acom.value.length;
+    document.getElementById('acom-source').textContent = acom.value.trim()
+      ? '✏️ custom (zostanie wysłany Twój tekst)'
+      : '🤖 auto (z domyślnego mapowania)';
+    document.getElementById('acom-source').style.color = acom.value.trim() ? 'var(--yel)' : 'var(--dim)';
+  });
+  if (acomReset) acomReset.addEventListener('click', function() {
+    acom.value = '';
+    acom.dispatchEvent(new Event('input'));
+  });
+})();
 
 function publishNow(id) {
   if (!confirm('Publish this post to LinkedIn now?')) return;
@@ -3195,7 +5106,47 @@ function switchTab(id) {
   localStorage.setItem('li_tab', id);
   document.querySelectorAll('.tnb').forEach(function(b) { b.classList.toggle('active', b.dataset.tab === id); });
   document.querySelectorAll('.tab-panel').forEach(function(p) { p.classList.toggle('active', p.id === 'tab-' + id); });
+  // Update header label — include group label so user knows where they are
+  var lbl = document.getElementById('current-tab');
+  var btn = document.querySelector('.tnb[data-tab="' + id + '"]');
+  if (lbl && btn) {
+    var group = btn.closest('.nav-group');
+    var groupName = group ? (group.querySelector('summary') || {}).textContent || '' : '';
+    lbl.textContent = (groupName ? groupName.trim() + ' · ' : '') + btn.textContent.trim();
+  }
+  // Auto-expand the group that contains the active tab; collapse others
+  document.querySelectorAll('.nav-group').forEach(function(g) {
+    var hasActive = g.querySelector('.tnb[data-tab="' + id + '"]');
+    g.open = !!hasActive;
+  });
+  if (btn) {
+    var grp = btn.closest('.nav-group');
+    if (grp) localStorage.setItem('li_group', grp.dataset.group || '');
+  }
+  // Close hamburger menu
+  closeNav();
 }
+
+function openNav() {
+  document.getElementById('tabnav').classList.add('open');
+  document.getElementById('nav-overlay').classList.add('open');
+  document.getElementById('hburger').classList.add('open');
+}
+function closeNav() {
+  document.getElementById('tabnav').classList.remove('open');
+  document.getElementById('nav-overlay').classList.remove('open');
+  document.getElementById('hburger').classList.remove('open');
+}
+function toggleNav() {
+  if (document.getElementById('tabnav').classList.contains('open')) closeNav(); else openNav();
+}
+
+document.getElementById('hburger').addEventListener('click', toggleNav);
+document.getElementById('nav-overlay').addEventListener('click', closeNav);
+// ESC zamyka menu
+document.addEventListener('keydown', function(e) {
+  if (e.key === 'Escape') closeNav();
+});
 
 document.querySelectorAll('.tnb').forEach(function(b) {
   b.addEventListener('click', function() {
@@ -3207,12 +5158,138 @@ document.querySelectorAll('.tnb').forEach(function(b) {
     if (b.dataset.tab === 'kontenty') renderKontenty();
     if (b.dataset.tab === 'mediaplan') renderMediaPlan();
     if (b.dataset.tab === 'artykuly') renderArtykuly();
+    if (b.dataset.tab === 'propozycje') loadProposals();
+    if (b.dataset.tab === 'watki') loadWatki();
+    if (b.dataset.tab === 'ustawienia') { loadGuidelines(); loadScraperConfig(); }
   });
 });
+
+// ── WYTYCZNE AI (humanizer + fact-checker) ─────────────────────────────────
+function escAttr(s) { return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
+function loadGuidelines() {
+  var root = document.getElementById('ust-blocks');
+  if (!root) return;
+  var defs = [
+    { name: 'humanizer', title: '🗣️ Humanizer — ton Bartosza', subtitle: 'Wytyczne tonu, zakazane otwieracze, persona czytelnika MŚP. Stosowane przy KAŻDYM wywołaniu Claude do generowania tekstów.' },
+    { name: 'fact-checker', title: '🔍 Fact-checker — anti-halucynacja', subtitle: 'Reguły co wymaga weryfikacji, polskie tiki content marketingowe, zasada „niepewny → pomiń, nie wymyślaj".' }
+  ];
+  root.innerHTML = defs.map(function(d) {
+    return '<div class="ust-block" data-name="' + d.name + '" style="margin-bottom:24px;background:var(--card);border:1px solid var(--brd);border-radius:8px;padding:16px">' +
+      '<div style="display:flex;align-items:center;gap:10px;margin-bottom:6px">' +
+        '<h3 style="margin:0;font-size:14px">' + d.title + '</h3>' +
+        '<span class="ust-meta" style="font-size:11px;color:var(--dim)" id="ust-meta-' + d.name + '">(ładowanie...)</span>' +
+        '<button class="btn sm" style="margin-left:auto" data-action="ust-reload" data-name="' + d.name + '">↺ Odśwież z dysku</button>' +
+        '<button class="btn primary sm" data-action="ust-save" data-name="' + d.name + '">💾 Zapisz</button>' +
+      '</div>' +
+      '<p style="font-size:11px;color:var(--dim);margin:0 0 10px">' + escAttr(d.subtitle) + '</p>' +
+      '<textarea id="ust-ta-' + d.name + '" style="width:100%;min-height:320px;background:#0d1117;border:1px solid var(--brd);color:var(--txt);font-family:var(--mono);font-size:12px;padding:10px;border-radius:6px;line-height:1.5;resize:vertical" placeholder="(pusty — bootstrap przez scripts/init-guidelines.mjs)"></textarea>' +
+      '<p style="font-size:10px;color:var(--dim);margin:6px 0 0">Plik: <code>~/.linkedin-mcp/guidelines/' + d.name + '.md</code> · zmiana = natychmiast w następnym wywołaniu</p>' +
+    '</div>';
+  }).join('');
+  defs.forEach(function(d) {
+    fetch('/api/guidelines/' + d.name)
+      .then(function(r) { return r.json(); })
+      .then(function(data) {
+        var ta = document.getElementById('ust-ta-' + d.name);
+        var meta = document.getElementById('ust-meta-' + d.name);
+        if (ta) ta.value = data.content || '';
+        if (meta) {
+          meta.textContent = data.exists
+            ? (data.size + ' znaków · zmieniono ' + (data.last_modified ? new Date(data.last_modified).toLocaleString('pl-PL') : 'nieznane'))
+            : '(plik nie istnieje — odpal scripts/init-guidelines.mjs)';
+        }
+      })
+      .catch(function(e) {
+        var meta = document.getElementById('ust-meta-' + d.name);
+        if (meta) meta.textContent = '⚠️ Błąd ładowania: ' + e.message;
+      });
+  });
+}
+// ── Panel: Scraper analityki — kiedy i skąd dane (tylko podgląd) ───────────
+function loadScraperConfig() {
+  var root = document.getElementById('scraper-panel');
+  if (!root) return;
+  fetch('/api/scraper-config').then(function(r){ return r.json(); }).then(function(d){
+    var c = d.charts_365d || {}, a = d.auto_analytics || {};
+    var steps = (c.refresh_steps||[]).map(function(s){ return '<li>'+escAttr(s)+'</li>'; }).join('');
+    var targets = (a.targets||[]).map(function(s){ return '<li>'+escAttr(s)+'</li>'; }).join('');
+    var sched = (a.hour!=null ? (String(a.hour).padStart(2,'0')+':'+String(a.minute||0).padStart(2,'0')) : '22:00');
+    root.innerHTML =
+      '<div style="display:flex;align-items:center;gap:12px;margin-bottom:14px">'+
+        '<h2 style="margin:0;font-size:16px">📊 Analityka — kiedy i skąd dane</h2>'+
+        '<span style="font-size:11px;color:var(--dim)">Co i kiedy zasila Command Center. Podgląd (edycja: pliki konfiguracyjne).</span>'+
+      '</div>'+
+      '<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">'+
+        '<div style="background:var(--card);border:1px solid var(--brd);border-radius:8px;padding:16px">'+
+          '<h3 style="margin:0 0 4px;font-size:14px">📈 '+escAttr(c.label||'Wykresy 365-dni')+'</h3>'+
+          '<p style="font-size:11px;color:var(--dim);margin:0 0 10px">'+escAttr(c.source||'')+'</p>'+
+          '<div style="font-size:12px;line-height:1.8">'+
+            '<div>Ostatni import: <b>'+escAttr(c.last_import||'—')+'</b></div>'+
+            '<div>Plik: <code style="font-size:10px">'+escAttr(c.last_import_file||'—')+'</code></div>'+
+            '<div>Dane wykresu do: <b>'+escAttr(d.charts_last_date||'—')+'</b></div>'+
+            '<div>Followers: <b>'+(c.followers_daily_auto?'codziennie auto':'tylko z eksportu')+'</b></div>'+
+          '</div>'+
+          '<div style="margin-top:10px;font-size:11px;color:var(--dim)">Odśwież (zalecane: '+escAttr(c.recommended_export_day||'co tydzień')+'):</div>'+
+          '<ol style="margin:4px 0 0;padding-left:18px;font-size:11px;color:var(--dim);line-height:1.6">'+steps+'</ol>'+
+        '</div>'+
+        '<div style="background:var(--card);border:1px solid var(--brd);border-radius:8px;padding:16px">'+
+          '<h3 style="margin:0 0 4px;font-size:14px">⏱️ '+escAttr(a.label||'Metryki dzienne')+'</h3>'+
+          '<p style="font-size:11px;color:var(--dim);margin:0 0 10px">Harmonogram: <b>codziennie '+sched+'</b> · restart-safe · prospecting: <b>'+escAttr(a.prospecting||'?')+'</b></p>'+
+          '<div style="font-size:12px">Ostatni realny bieg: <b>'+escAttr(d.auto_analytics_last_run||'—')+'</b></div>'+
+          '<div style="margin-top:8px;font-size:11px;color:var(--dim)">Zbiera:</div>'+
+          '<ul style="margin:4px 0 0;padding-left:18px;font-size:11px;color:var(--dim);line-height:1.6">'+targets+'</ul>'+
+        '</div>'+
+      '</div>';
+  }).catch(function(e){ root.innerHTML = '<div style="color:var(--dim);font-size:12px">⚠️ Nie udało się wczytać konfiguracji scrapera: '+e.message+'</div>'; });
+}
+document.addEventListener('click', function(e) {
+  var btn = e.target.closest && e.target.closest('[data-action]');
+  if (!btn) return;
+  var action = btn.dataset.action;
+  var name = btn.dataset.name;
+  if (action === 'ust-reload') { loadGuidelines(); return; }
+  if (action === 'ust-save') {
+    var ta = document.getElementById('ust-ta-' + name);
+    if (!ta) return;
+    btn.disabled = true; btn.textContent = '⏳ Zapisuję...';
+    fetch('/api/guidelines/' + name, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: ta.value })
+    })
+      .then(function(r) { return r.json(); })
+      .then(function(data) {
+        toast('Zapisano (' + data.size + ' znaków)', true);
+        var meta = document.getElementById('ust-meta-' + name);
+        if (meta) meta.textContent = data.size + ' znaków · zmieniono ' + new Date(data.saved_at).toLocaleString('pl-PL');
+      })
+      .catch(function(err) { toast('Błąd: ' + err.message, false); })
+      .finally(function() { btn.disabled = false; btn.textContent = '💾 Zapisz'; });
+  }
+});
+
+// Init header label
+(function initLabel() {
+  var lbl = document.getElementById('current-tab');
+  var active = document.querySelector('.tnb.active');
+  if (lbl && active) lbl.textContent = active.textContent.trim();
+})();
 
 // ── MEDIA PLAN ───────────────────────────────────────────────────────────────
 
 var mpItems = [];
+var mpFilter = localStorage.getItem('li_mp_filter') || 'all';
+var mpSort = localStorage.getItem('li_mp_sort') || 'date';
+
+function filterAndSortMp(items) {
+  var arr = mpFilter === 'all'
+    ? items.slice()
+    : items.filter(function(it) { return it.status === mpFilter; });
+  if (mpSort === 'score') arr.sort(function(a,b){return (b.score_total||0) - (a.score_total||0);});
+  else if (mpSort === 'status') arr.sort(function(a,b){return (a.status||'').localeCompare(b.status||'');});
+  else arr.sort(function(a,b){return (a.publish_at||'').localeCompare(b.publish_at||'');});
+  return arr;
+}
 
 function renderMediaPlan() {
   var root = $$('mp-root');
@@ -3234,19 +5311,53 @@ function renderMediaPlan() {
     html.push('<div class="stat" style="margin-left:auto"><label style="display:flex;gap:6px;align-items:center;font-size:12px;color:var(--dim);cursor:pointer"><input type="checkbox" id="mp-gsc-toggle" ' + (settings.gsc_auto_submit === '1' ? 'checked' : '') + '> GSC auto-submit</label></div>');
     html.push('</div>');
 
-    if (top3.length) {
+    // Iter2: filter + sort toolbar
+    html.push('<div class="mp-toolbar">');
+    html.push('<label style="font-size:11px;color:var(--dim)">Status:</label>');
+    html.push('<select id="mp-filter">');
+    ['all|Wszystkie','plan|📋 Plan','napisane|✍️ Napisane','opublikowane|🚀 Opublikowane','gsc_verified|🔍 GSC OK','cancelled|❌ Cancelled'].forEach(function(o) {
+      var p = o.split('|');
+      html.push('<option value="' + p[0] + '"' + (mpFilter === p[0] ? ' selected' : '') + '>' + p[1] + '</option>');
+    });
+    html.push('</select>');
+    html.push('<label style="font-size:11px;color:var(--dim)">Sortuj:</label>');
+    html.push('<select id="mp-sort">');
+    ['date|Data (rosnąco)','score|Score (malejąco)','status|Status'].forEach(function(o) {
+      var p = o.split('|');
+      html.push('<option value="' + p[0] + '"' + (mpSort === p[0] ? ' selected' : '') + '>' + p[1] + '</option>');
+    });
+    html.push('</select>');
+    // Iter9: counter postów z pustym post_text + bulk regen button
+    var emptyCount = mpItems.filter(function(i) {
+      return i.status !== 'cancelled' && i.status !== 'archived' && (!i.post_text || i.post_text.length < 300) && (!i.publish_at || i.publish_at >= new Date().toISOString().slice(0,10));
+    }).length;
+    if (emptyCount > 0) {
+      html.push('<button id="mp-bulk-regen" class="btn sm" style="background:rgba(63,185,80,.15);color:var(--grn);border-color:var(--grn);margin-left:auto;font-size:11px" title="Regeneruj wszystkie posty z pustym lub bardzo krótkim post_text. Sequential, ~3 min/post. Long-running.">🤖 Regeneruj wszystkie puste (' + emptyCount + ')</button>');
+    }
+    html.push('</div>');
+
+    if (top3.length && mpFilter === 'all') {
       html.push('<div class="sec-h">⭐ TOP-3 do produkcji w pierwszej kolejności</div>');
       html.push('<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:10px;margin-bottom:18px">');
       for (var i = 0; i < top3.length; i++) html.push(renderMpCard(top3[i], true));
       html.push('</div>');
     }
 
-    html.push('<div class="sec-h">Wszystkie 12 tematów</div>');
+    var filtered = filterAndSortMp(mpItems);
+    html.push('<div class="sec-h">' + (mpFilter === 'all' ? 'Wszystkie' : 'Filtr: ' + mpFilter) + ' (' + filtered.length + ')</div>');
     html.push('<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(380px,1fr));gap:10px">');
-    for (var j = 0; j < mpItems.length; j++) html.push(renderMpCard(mpItems[j], false));
+    for (var j = 0; j < filtered.length; j++) html.push(renderMpCard(filtered[j], false));
     html.push('</div>');
 
     root.innerHTML = html.join('');
+
+    // Iter2: filter/sort handlers
+    var fSel = $$('mp-filter'); if (fSel) fSel.addEventListener('change', function() {
+      mpFilter = fSel.value; localStorage.setItem('li_mp_filter', mpFilter); renderMediaPlan();
+    });
+    var sSel = $$('mp-sort'); if (sSel) sSel.addEventListener('change', function() {
+      mpSort = sSel.value; localStorage.setItem('li_mp_sort', mpSort); renderMediaPlan();
+    });
 
     // GSC auto-submit toggle handler
     var gscToggle = $$('mp-gsc-toggle');
@@ -3273,16 +5384,19 @@ function renderMpCard(it, isTop) {
     cancelled: '<span class="badge b-cancelled">❌</span>'
   }[it.status] || '<span class="badge">' + it.status + '</span>';
 
-  var canniBadge = {
-    clear: '<span class="badge" style="background:rgba(63,185,80,.15);color:var(--grn)">✅ clear</span>',
-    weak: '<span class="badge" style="background:rgba(210,153,34,.15);color:var(--yel)">⚠️ weak</span>',
-    strong: '<span class="badge" style="background:rgba(218,54,51,.15);color:var(--red)">🚨 strong</span>',
-    pending: '<span class="badge b-cancelled">⏳ pending</span>'
-  }[it.cannibalize_status || 'pending'];
+  // Iter2: konsolidacja cannibalization + GSC w jeden badge "SEO ready/pending/blocked"
+  var cann = it.cannibalize_status || 'pending';
+  var gscS = it.gsc_status || 'not_checked';
+  var isSeoReady = (cann === 'clear') && (gscS === 'already_indexed' || gscS === 'submitted' || gscS === 'inspected');
+  var isSeoBlocked = (cann === 'strong') || /blocked|error/.test(gscS);
+  var seoBadge = isSeoReady
+    ? '<span class="badge" style="background:rgba(63,185,80,.2);color:var(--grn)" title="cannib: ' + cann + ' · GSC: ' + gscS + '">🔍 SEO ready</span>'
+    : isSeoBlocked
+      ? '<span class="badge" style="background:rgba(218,54,51,.15);color:var(--red)" title="cannib: ' + cann + ' · GSC: ' + gscS + '">🚫 SEO blocked</span>'
+      : '<span class="badge b-cancelled" title="cannib: ' + cann + ' · GSC: ' + gscS + '">⏳ SEO pending</span>';
 
-  var langBadge = it.language === 'en'
-    ? '<span class="badge b-en">EN</span>'
-    : '<span class="badge b-pl">PL</span>';
+  // Iter2: język jako mała litera w prawym górnym rogu (nie badge)
+  var langTag = '<span style="font-size:10px;color:var(--dim);font-family:var(--mono);letter-spacing:.05em">' + (it.language === 'en' ? 'EN' : 'PL') + '</span>';
 
   var stars = it.score_total >= 4.9 ? '⭐⭐⭐' : it.score_total >= 4.0 ? '⭐⭐' : it.score_total >= 3.0 ? '⭐' : '';
   var scoreColor = it.score_total >= 4.9 ? 'var(--grn)' : it.score_total >= 4.0 ? 'var(--blu)' : it.score_total >= 3.0 ? 'var(--yel)' : 'var(--red)';
@@ -3309,49 +5423,53 @@ function renderMpCard(it, isTop) {
 
   var titleText = (it.title || '').replace(/</g, '&lt;');
 
-  // GSC badge
-  var gscBadge = '';
-  if (it.gsc_status && it.gsc_status !== 'not_checked') {
-    var gscMap = {
-      inspected: '<span class="badge" style="background:rgba(56,139,253,.15);color:var(--blu)">🔎 GSC inspected</span>',
-      already_indexed: '<span class="badge" style="background:rgba(63,185,80,.2);color:var(--grn)">✅ GSC indexed</span>',
-      submitted: '<span class="badge" style="background:rgba(63,185,80,.15);color:var(--grn)">📤 GSC submitted</span>',
-      blocked_no_page: '<span class="badge" style="background:rgba(218,54,51,.15);color:var(--red)">🚫 GSC blocked: no page</span>',
-      blocked_no_sitemap: '<span class="badge" style="background:rgba(218,54,51,.15);color:var(--red)">🚫 GSC blocked: no sitemap</span>',
-      submit_error: '<span class="badge" style="background:rgba(218,54,51,.15);color:var(--red)">❌ GSC error</span>',
-      error: '<span class="badge" style="background:rgba(218,54,51,.15);color:var(--red)">❌ GSC error</span>'
-    };
-    gscBadge = gscMap[it.gsc_status] || ('<span class="badge">' + it.gsc_status + '</span>');
-  }
-
   // LinkedIn link (if published)
   var liLink = '';
   if (it.linkedin_post_urn) {
-    var urnId = it.linkedin_post_urn.split(':').pop();
     liLink = '<a href="https://www.linkedin.com/feed/update/' + it.linkedin_post_urn + '" target="_blank" style="font-size:11px">🔗 LinkedIn</a>';
   } else if (it.scheduled_post_id) {
     liLink = '<span style="font-size:11px;color:var(--blu)">📅 zaplanowany</span>';
   }
 
+  // Iter2: thumbnail banera (gdy banner_path istnieje w DB)
+  // Iter6: cache-bust przez ?t=updated_at żeby po regeneracji obraz się odświeżył
+  var bustToken = (it.updated_at || '').replace(/[^0-9]/g, '').slice(0, 14) || Date.now();
+  var thumb = hasBanner
+    ? '<img src="/mp-banner/' + encodeURIComponent(it.slug || it.id) + '?t=' + bustToken + '" class="mp-thumb" alt="banner" onerror="this.style.display=\\'none\\'">'
+    : '<div class="mp-thumb mp-thumb-empty">no banner</div>';
+
+  // Iter2: quick "Schedule" action gdy plan + treść gotowa
+  var scheduleBtn = (it.status === 'plan' && hasContent)
+    ? '<button class="btn sm primary" data-mp-schedule="' + esc(it.slug || it.id) + '">📅 Schedule</button>'
+    : '';
+
   return [
     '<div class="card mp-card" style="border-left:3px solid ' + scoreColor + ';cursor:pointer" data-mp-open="' + it.id + '">',
-    '<div class="card-top">',
+    '<div class="card-top" style="display:flex;gap:10px;align-items:flex-start">',
+    thumb,
+    '<div style="flex:1;min-width:0">',
     '<div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">',
     '<b style="font-size:13px">#' + it.topic_number + '</b>',
-    statusBadge, langBadge, canniBadge, gscBadge,
-    '<span style="color:' + scoreColor + ';font-family:var(--mono);font-weight:700">' + (it.score_total || 0).toFixed(1) + '/5.0 ' + stars + '</span>',
+    statusBadge, seoBadge,
+    '<span style="margin-left:auto">' + langTag + '</span>',
     '</div>',
-    '<div class="meta">' + publishDate + ' CET' + (liLink ? ' · ' + liLink : '') + '</div>',
-    '</div>',
+    '<div class="meta" style="margin-top:4px">' + publishDate + ' CET' + (liLink ? ' · ' + liLink : '') + '</div>',
     titleText ? '<div style="font-size:13px;font-weight:600;color:var(--txt);margin:6px 0 2px">' + titleText + '</div>' : '',
     '<div class="ptxt" style="max-height:none;font-size:12px;color:#c9d1d9;margin:4px 0">' + hookText + '</div>',
-    '<div class="meta" style="margin:4px 0">📦 ' + sourceProj + ' · ' + liveSig + '</div>',
+    '</div>',
+    '</div>',
+    '<div class="meta" style="margin:6px 0;display:flex;gap:10px;flex-wrap:wrap">',
+    '<span style="color:' + scoreColor + ';font-family:var(--mono);font-weight:700">' + (it.score_total || 0).toFixed(1) + '/5.0 ' + stars + '</span>',
+    '<span>📦 ' + sourceProj + '</span>',
+    liveSig ? '<span>· ' + liveSig + '</span>' : '',
+    '</div>',
     hashtagsHtml ? '<div style="margin:4px 0">' + hashtagsHtml + '</div>' : '',
     '<div class="meta" style="margin:8px 0;font-size:11px">',
     'Treść: ' + artChecks[0] + ' &nbsp; Banner: ' + artChecks[1] + ' &nbsp; Visual: ' + artChecks[2],
     '</div>',
     '<div class="actions" data-mp-noopen="1">',
     '<button class="btn sm" data-mp-recheck="' + it.id + '">🔍 Recheck</button>',
+    scheduleBtn,
     '<button class="btn sm primary" data-mp-open="' + it.id + '">📝 Edytuj</button>',
     '</div>',
     '</div>'
@@ -3378,7 +5496,14 @@ function mpOpenDetail(id) {
   if (!it) return;
   mpEditing = it;
 
-  $$('mp-mtitle').textContent = '#' + it.topic_number + ' · ' + (it.slug || '');
+  // Iter9: status badge w nagłówku — sygnalizuje user'owi że post z status='plan' nie ma treści
+  var statusBadge = '';
+  if (it.status === 'plan' && (!it.post_text || it.post_text.length < 100)) {
+    statusBadge = ' <span style="background:rgba(56,139,253,.15);color:var(--blu);padding:3px 9px;border-radius:8px;font-size:11px;font-weight:400;margin-left:8px">📋 Plan (treść pusta — kliknij 🤖 Regeneruj)</span>';
+  } else if (it.status === 'cancelled') {
+    statusBadge = ' <span style="background:rgba(248,81,73,.15);color:var(--red);padding:3px 9px;border-radius:8px;font-size:11px;font-weight:400;margin-left:8px">❌ Cancelled</span>';
+  }
+  $$('mp-mtitle').innerHTML = '#' + it.topic_number + ' · ' + esc(it.slug || '') + statusBadge;
   var meta = '<b style="color:var(--txt)">Status: ' + it.status + '</b> · Score ' + (it.score_total||0).toFixed(1) + '/5.0 · ' + it.language.toUpperCase() + ' · Banner concept: ' + (it.banner_concept || '—') + ' · Lead trigger: ' + (it.lead_trigger || '—');
   if (it.hook) meta += '<br><br><b>Hook:</b> ' + it.hook.replace(/</g, '&lt;');
   if (it.live_signal) meta += '<br><b>Live signal:</b> ' + it.live_signal.replace(/</g, '&lt;');
@@ -3393,11 +5518,36 @@ function mpOpenDetail(id) {
   }
   $$('mp-meta').innerHTML = meta;
 
+  $$('mp-hook').value = it.hook || '';
+  $$('mp-title').value = it.title || '';
   $$('mp-text').value = it.post_text || '';
   $$('mp-cc').textContent = (it.post_text || '').length;
+  // Iter9: wizualne podpowiedzi gdy treść pusta
+  var mpTa = $$('mp-text');
+  if (!it.post_text || it.post_text.length < 100) {
+    mpTa.placeholder = it.status === 'plan'
+      ? '📋 Status: PLAN — treść jeszcze nie wygenerowana.\\n\\nKliknij "🤖 Regeneruj treść" w nagłówku, aby Claude Opus napisał post na podstawie git log + README projektu (~60s).'
+      : '⚠️ Treść pusta lub bardzo krótka. Kliknij "🤖 Regeneruj treść" w nagłówku.';
+    mpTa.style.borderColor = 'var(--yel)';
+    mpTa.style.borderWidth = '2px';
+  } else {
+    mpTa.placeholder = 'Napisz treść 1300-1700 znaków...';
+    mpTa.style.borderColor = '';
+    mpTa.style.borderWidth = '';
+  }
   mpUpdateCharWarn();
 
   $$('mp-banner').value = it.banner_path || '';
+  // Iter6: preview banera w modalu (jeśli istnieje) z cache-bust
+  var mpPrev = document.getElementById('mp-banner-preview');
+  if (mpPrev) {
+    if (it.banner_path) {
+      var slugBust = (it.updated_at || '').replace(/[^0-9]/g, '').slice(0, 14) || Date.now();
+      mpPrev.innerHTML = '<img src="/mp-banner/' + encodeURIComponent(it.slug || it.id) + '?t=' + slugBust + '" style="max-width:280px;max-height:160px;border-radius:6px;border:1px solid var(--brd)" alt="banner preview" onerror="this.parentElement.innerHTML=\\'<span style=\\\\"font-size:11px;color:var(--dim);font-style:italic\\\\">Plik nie istnieje na dysku</span>\\'">';
+    } else {
+      mpPrev.innerHTML = '<span style="font-size:11px;color:var(--dim);font-style:italic">Brak banera — kliknij Generate via MCP</span>';
+    }
+  }
   $$('mp-visual').value = it.visual_asset_path || '';
   var hashtagsArr = [];
   try { hashtagsArr = JSON.parse(it.hashtags || '[]'); } catch {}
@@ -3445,6 +5595,8 @@ function mpSave() {
   var publishAtRaw = $$('mp-publish-at').value;
   var publishAt = publishAtRaw ? publishAtRaw.replace('T', ' ') + ':00' : mpEditing.publish_at;
   var body = {
+    hook: $$('mp-hook').value || null,
+    title: $$('mp-title').value || null,
     post_text: $$('mp-text').value,
     banner_path: $$('mp-banner').value || null,
     visual_asset_path: $$('mp-visual').value || null,
@@ -3542,14 +5694,96 @@ function mpRecheckInModal() {
     });
 }
 
+// Iter8: regeneracja treści posta przez Claude Opus + git log (anti-halucynacje)
+function mpRegenerate() {
+  if (!mpEditing) return;
+  if (!confirm('Regenerować treść posta przez Claude Opus 4.6 (~30-60s)?\\nŻródło: git log + README + LINKEDIN-STRATEGY.md\\nOryginał backup do original_post_text.')) return;
+  var btn = document.getElementById('mp-regenerate-btn');
+  var origText = btn ? btn.textContent : '';
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ Regeneruję...'; }
+  toast('Regeneruję treść przez Claude Opus (~30-60s)...', true);
+  fetch('/api/media-plan/' + mpEditing.id + '/regenerate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      if (btn) { btn.disabled = false; btn.textContent = origText; }
+      // Iter9: ok:false = walidacja failed (Claude zwrócił słaby wynik, DB bez zmian)
+      if (d.ok === false || d.error) {
+        console.error('[mp-regenerate]', d);
+        toast('Regen fail: ' + (d.error || 'unknown').slice(0, 150), false);
+        return;
+      }
+      toast('Treść zregenerowana (' + d.chars + ' znaków) ✓', true);
+      // Re-fetch + re-open
+      fetch('/api/media-plan/' + mpEditing.id).then(function(r) { return r.json(); }).then(function(it) {
+        mpEditing = it;
+        mpOpenDetail(it.id);
+      });
+    })
+    .catch(function(e) {
+      if (btn) { btn.disabled = false; btn.textContent = origText; }
+      console.error('[mp-regenerate] fetch', e);
+      toast('Błąd sieci: ' + e.message, false);
+    });
+}
+
+// Iter9: bulk regen wszystkich pustych post_text
+function mpBulkRegen() {
+  var emptyItems = mpItems.filter(function(i) {
+    return i.status !== 'cancelled' && i.status !== 'archived' && (!i.post_text || i.post_text.length < 300);
+  });
+  if (emptyItems.length === 0) { toast('Brak pustych postów do regen', false); return; }
+  if (!confirm('Regenerować ' + emptyItems.length + ' postów sekwencyjnie?\\n\\n• ~3 min/post = ~' + Math.round(emptyItems.length * 3) + ' min całość\\n• Long-running fetch (no timeout w przeglądarce)\\n• Można zamknąć portal, regen leci w tle backendzie\\n• Wynik widoczny po zakończeniu w Media Plan')) return;
+  var btn = document.getElementById('mp-bulk-regen');
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ Bulk regen (' + emptyItems.length + ' postów, ~' + Math.round(emptyItems.length * 3) + ' min)...'; }
+  toast('Bulk regen uruchomiony (' + emptyItems.length + ' postów). Może potrwać ~' + Math.round(emptyItems.length * 3) + ' min...', true);
+  fetch('/api/media-plan/bulk-regenerate-empty', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      if (btn) { btn.disabled = false; }
+      if (d.error) { toast('Błąd bulk: ' + d.error.slice(0, 150), false); return; }
+      var okCount = (d.results || []).filter(function(r) { return r.status === 'ok'; }).length;
+      var failCount = (d.results || []).filter(function(r) { return r.status !== 'ok'; }).length;
+      toast('Bulk regen done: ' + okCount + '/' + d.total + ' ok' + (failCount > 0 ? ', ' + failCount + ' fail (sprawdź konsolę backend)' : ''), true);
+      console.log('[bulk-regen] results:', d.results);
+      renderMediaPlan();
+    })
+    .catch(function(e) {
+      if (btn) { btn.disabled = false; }
+      console.error('[bulk-regen] fetch error:', e);
+      toast('Błąd sieci bulk: ' + e.message, false);
+    });
+}
+
 function mpGenerateBanner() {
   if (!mpEditing) return;
+  var btn = document.getElementById('mp-gen-banner');
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ Generuję...'; }
   toast('Generuję banner przez linkedin_banner_generate (~5-15s)...', true);
   fetch('/api/media-plan/' + mpEditing.id + '/generate-banner', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
     .then(function(r) { return r.json(); }).then(function(data) {
-      if (data.error) { toast('Banner gen error: ' + data.error); return; }
-      $$('mp-banner').value = data.banner_path;
-      toast('Banner: ' + data.banner_path.split('/').pop(), true);
+      if (btn) { btn.disabled = false; btn.textContent = '🎨 Generate via MCP'; }
+      if (data.error) {
+        console.error('[mp-banner] error:', data.error);
+        toast('Banner gen error: ' + String(data.error).split('\\n')[0].slice(0, 150), false);
+        return;
+      }
+      // Iter6: pokaż ścieżkę + odśwież preview w modal + odśwież karty Media Plan
+      var bIn = document.getElementById('mp-banner');
+      if (bIn) bIn.value = data.banner_path;
+      toast('Banner zapisany: ' + data.banner_path.split('/').pop() + ' ✓', true);
+      // Cache-bust + inline preview w modalu
+      var prev = document.getElementById('mp-banner-preview');
+      if (prev && mpEditing) {
+        var slug = encodeURIComponent(mpEditing.slug || mpEditing.id);
+        prev.innerHTML = '<img src="/mp-banner/' + slug + '?t=' + Date.now() + '" style="max-width:280px;max-height:160px;border-radius:6px;border:1px solid var(--brd)" alt="banner preview">';
+      }
+      // Re-render kart żeby thumbnail pojawił się natychmiast na karcie (po zamknięciu modala)
+      renderMediaPlan();
+    })
+    .catch(function(e) {
+      if (btn) { btn.disabled = false; btn.textContent = '🎨 Generate via MCP'; }
+      console.error('[mp-banner] fetch error:', e);
+      toast('Banner sieć: ' + e.message, false);
     });
 }
 
@@ -3579,6 +5813,8 @@ document.addEventListener('click', function(e) {
   if (t.id === 'mp-gsc-submit') mpGscSubmit();
   if (t.id === 'mp-cancel-item') mpCancelItem();
   if (t.id === 'mp-gen-banner') mpGenerateBanner();
+  if (t.id === 'mp-regenerate-btn') mpRegenerate();
+  if (t.id === 'mp-bulk-regen') mpBulkRegen();
 
   // Card delegated handlers (replace inline onclick — escaped quotes break in template literal)
   var openTarget = t.closest && t.closest('[data-mp-open]');
@@ -3590,6 +5826,21 @@ document.addEventListener('click', function(e) {
   if (t.dataset && t.dataset.mpRecheck) {
     e.stopPropagation();
     mpRecheck(t.dataset.mpRecheck);
+    return;
+  }
+  // Iter2: Schedule quick-action — kalibruje POST /api/media-plan/:slug/schedule
+  if (t.dataset && t.dataset.mpSchedule) {
+    e.stopPropagation();
+    var slug = t.dataset.mpSchedule;
+    if (!confirm('Zaplanować ten media plan item jako post LinkedIn?')) return;
+    fetch('/api/media-plan/' + encodeURIComponent(slug) + '/schedule', { method: 'POST' })
+      .then(function(r){ return r.json(); })
+      .then(function(d){
+        if (d.error) { toast('Błąd: ' + d.error, false); return; }
+        toast('Zaplanowano (scheduled_post_id=' + (d.scheduled_post_id || '') + ')', true);
+        renderMediaPlan(); loadPosts();
+      })
+      .catch(function(e){ toast('Błąd: ' + e.message, false); });
     return;
   }
   // Edytuj button inside actions
@@ -3637,47 +5888,293 @@ var ROUTINE = ${JSON.stringify(ROUTINE)};
 
 // ── RENDER: KALENDARZ (dynamic from /api/calendar) ───────────────────────────
 
+// Iter2: renderuje widok tygodniowy do containera #posts-view-week wewnątrz tab-posty
 function renderKalendarz() {
-  var root = document.getElementById('kal-root');
-  root.innerHTML = '<div class="pg-title">Kalendarz publikacji</div><div class="empty">Ladowanie...</div>';
+  var root = document.getElementById('posts-view-week');
+  if (!root) return; // panel kalendarz usunięty
+  root.innerHTML = '<div class="empty">Ladowanie...</div>';
 
   api('/api/calendar').then(function(data) {
-    var h = '<div class="pg-title">Kalendarz publikacji</div>';
-    h += '<table class="cal-tbl"><thead><tr><th>#</th><th>Data</th><th>Godz.</th><th>Temat</th><th>Status</th><th></th></tr></thead><tbody>';
+    var h = '<table class="cal-tbl"><thead><tr><th>#</th><th>Data</th><th>Godz.</th><th>Temat</th><th>Status</th><th>Akcje</th></tr></thead><tbody>';
     var n = 1;
-    (data.weeks || []).forEach(function(w) {
+    var thisYear = new Date().getFullYear();
+    // Iter6: filtr okresu — najpierw filtruj posty w każdym tygodniu, pomiń puste tygodnie
+    var period = getPostsPeriod();
+    var weeksFiltered = (data.weeks || []).map(function(w) {
+      return { weekStart: w.weekStart, posts: filterByPeriod(w.posts || [], period, 'date') };
+    }).filter(function(w) { return w.posts.length > 0; });
+    weeksFiltered.forEach(function(w) {
       var ws = new Date(w.weekStart);
       var wsEnd = new Date(ws); wsEnd.setDate(ws.getDate() + 6);
-      var label = 'Tydzien ' + ws.toLocaleDateString('pl-PL', {day:'numeric',month:'short'}) + ' - ' + wsEnd.toLocaleDateString('pl-PL', {day:'numeric',month:'short'});
-      h += '<tr class="cal-week"><td colspan="6">' + esc(label) + '</td></tr>';
+      // Iter6: pokaż rok gdy tydzień ≠ bieżący rok ("Tydzień 3 maj - 9 maj · 2020")
+      var showYear = ws.getFullYear() !== thisYear;
+      var label = 'Tydzień ' + ws.toLocaleDateString('pl-PL', {day:'numeric',month:'short'}) + ' - ' + wsEnd.toLocaleDateString('pl-PL', {day:'numeric',month:'short'}) + (showYear ? ' · ' + ws.getFullYear() : '');
+      // Iter7: header tygodnia jako drop target (drop = pierwszy dzień tygodnia)
+      h += '<tr class="cal-week" data-drop-week="' + esc(w.weekStart) + '"><td colspan="6">' + esc(label) + ' <span style="float:right;font-weight:400;color:var(--dim);font-size:9px">↓ upuść tutaj</span></td></tr>';
       (w.posts || []).forEach(function(p) {
         var dt = new Date(p.date || p.publish_at);
         var dateStr = dt.toLocaleDateString('pl-PL', {day:'numeric', month:'short', weekday:'short'});
         var timeStr = pad(dt.getHours()) + ':' + pad(dt.getMinutes());
         var isProposed = p.source === 'proposed';
+        var status = p.status || (isProposed ? 'proposed' : 'scheduled');
         var statusBadge = isProposed
           ? '<span class="badge b-cancelled">proponowany</span>'
-          : '<span class="badge b-' + (p.status||'scheduled') + '">' + (p.status||'scheduled') + '</span>';
-        var actionBtn = isProposed
-          ? '<button class="btn sm primary" data-act="schedule-proposed" data-idx="' + (typeof p.idx === 'number' ? p.idx : '') + '">+ Zaplanuj</button>'
-          : '';
+          : '<span class="badge b-' + status + '">' + status + '</span>';
+        var actions = '';
+        if (isProposed) {
+          actions = '<button class="btn sm primary" data-act="schedule-proposed" data-idx="' + (typeof p.idx === 'number' ? p.idx : '') + '">+ Zaplanuj</button>';
+        } else if (status === 'scheduled') {
+          actions = '<button class="btn sm" data-act="edit" data-id="' + esc(p.id) + '">Edit</button> '
+            + '<button class="btn sm primary" data-act="publish" data-id="' + esc(p.id) + '">Publish</button> '
+            + '<button class="btn sm danger" data-act="cancel" data-id="' + esc(p.id) + '">Cancel</button>';
+        } else if (status === 'published' && p.post_urn) {
+          actions = '<a href="' + esc(urnToUrl(p.post_urn)) + '" target="_blank" style="font-size:11px;color:var(--blu)">Otwórz →</a>';
+        } else if (status === 'failed') {
+          actions = '<button class="btn sm" data-act="edit" data-id="' + esc(p.id) + '">Edit</button>';
+        }
         var title = p.title || (p.text||'').substring(0, 60) + (p.text && p.text.length > 60 ? '...' : '');
 
-        h += '<tr style="' + (isProposed ? 'opacity:.7' : '') + '">';
+        // Iter6+7: drill-down (klik) + drag-and-drop (przeciąganie scheduled/failed/proposed na inny tydzień)
+        var rowAttrs;
+        var publishAtAttr = (p.publish_at || p.date) ? ' data-publish-at="' + esc(p.publish_at || p.date) + '"' : '';
+        if (isProposed) {
+          rowAttrs = 'data-act="show-proposed" data-idx="' + (typeof p.idx === 'number' ? p.idx : '') + '" draggable="true"' + publishAtAttr + ' style="cursor:move;opacity:.7"';
+        } else if (p.id && (status === 'scheduled' || status === 'failed')) {
+          rowAttrs = 'data-act="edit" data-id="' + esc(p.id) + '" draggable="true"' + publishAtAttr + ' style="cursor:move"';
+        } else if (p.id && status === 'published') {
+          rowAttrs = 'data-act="edit" data-id="' + esc(p.id) + '"' + publishAtAttr + ' style="cursor:pointer"';
+        } else {
+          rowAttrs = publishAtAttr + ' style="opacity:.7"';
+        }
+        h += '<tr ' + rowAttrs + '>';
         h += '<td style="font-family:var(--mono);font-size:11px">' + n++ + '</td>';
         h += '<td>' + esc(dateStr) + '</td>';
         h += '<td style="font-family:var(--mono);color:var(--grn)">' + esc(timeStr) + '</td>';
         h += '<td>' + esc(title) + '</td>';
         h += '<td>' + statusBadge + '</td>';
-        h += '<td>' + actionBtn + '</td></tr>';
+        h += '<td>' + actions + '</td></tr>';
       });
     });
     h += '</tbody></table>';
     root.innerHTML = h;
   }).catch(function() {
-    root.innerHTML = '<div class="pg-title">Kalendarz publikacji</div><div class="empty">Blad ladowania kalendarza</div>';
+    root.innerHTML = '<div class="empty">Blad ladowania widoku tygodniowego</div>';
   });
 }
+
+// Iter2: toggle Lista/Tydzień w Kolejce
+function setPostsView(view) {
+  var listEl = document.getElementById('posts-view-list');
+  var weekEl = document.getElementById('posts-view-week');
+  if (!listEl || !weekEl) return;
+  var isWeek = view === 'week';
+  listEl.style.display = isWeek ? 'none' : '';
+  weekEl.style.display = isWeek ? '' : 'none';
+  document.querySelectorAll('#posts-view-toggle button[data-view]').forEach(function(b) {
+    b.classList.toggle('active', b.dataset.view === view);
+  });
+  localStorage.setItem('li_posts_view', view);
+  if (isWeek) renderKalendarz();
+}
+
+document.addEventListener('click', function(e) {
+  var t = e.target;
+  if (t && t.dataset && t.dataset.view && t.closest && t.closest('#posts-view-toggle')) {
+    setPostsView(t.dataset.view);
+  }
+});
+
+// Iter7: drag-and-drop w widoku Tydzień — przeciąganie postów na inny tydzień/dzień
+var calDragging = null;
+
+document.addEventListener('dragstart', function(e) {
+  var tr = e.target && e.target.closest && e.target.closest('tr[draggable="true"]');
+  if (!tr) return;
+  var weekView = document.getElementById('posts-view-week');
+  if (!weekView || !weekView.contains(tr)) return;
+  calDragging = {
+    id: tr.dataset.id || null,
+    idx: tr.dataset.idx || null,
+    publishAt: tr.dataset.publishAt || '',
+    isProposed: tr.dataset.act === 'show-proposed',
+    sourceRow: tr,
+  };
+  tr.classList.add('dragging-source');
+  if (e.dataTransfer) {
+    e.dataTransfer.effectAllowed = 'move';
+    try { e.dataTransfer.setData('text/plain', calDragging.id || calDragging.idx || ''); } catch (err) {}
+  }
+});
+
+document.addEventListener('dragend', function(e) {
+  if (calDragging && calDragging.sourceRow) calDragging.sourceRow.classList.remove('dragging-source');
+  document.querySelectorAll('.drop-hover').forEach(function(el) { el.classList.remove('drop-hover'); });
+  calDragging = null;
+});
+
+document.addEventListener('dragover', function(e) {
+  if (!calDragging) return;
+  var target = e.target && e.target.closest && e.target.closest('[data-drop-week], tr[data-publish-at]');
+  if (!target) return;
+  if (target === calDragging.sourceRow) return;
+  e.preventDefault();
+  if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
+  document.querySelectorAll('.drop-hover').forEach(function(el) { el.classList.remove('drop-hover'); });
+  target.classList.add('drop-hover');
+});
+
+document.addEventListener('drop', function(e) {
+  if (!calDragging) return;
+  var weekHeader = e.target && e.target.closest && e.target.closest('[data-drop-week]');
+  var dayRow = e.target && e.target.closest && e.target.closest('tr[data-publish-at]');
+  var targetDate;
+  if (dayRow && dayRow !== calDragging.sourceRow && dayRow.dataset.publishAt) {
+    targetDate = dayRow.dataset.publishAt.slice(0, 10);
+  } else if (weekHeader && weekHeader.dataset.dropWeek) {
+    targetDate = weekHeader.dataset.dropWeek;
+  } else {
+    return;
+  }
+  e.preventDefault();
+  movePostToDate(calDragging, targetDate);
+});
+
+function movePostToDate(d, targetDateStr) {
+  // Iter7: zachowaj godzinę z oryginału, podmień tylko date part
+  var origDate = new Date(d.publishAt || '');
+  var hh = '08';
+  var mm = '00';
+  var ss = '00';
+  if (!isNaN(origDate.getTime())) {
+    hh = String(origDate.getHours()).padStart(2, '0');
+    mm = String(origDate.getMinutes()).padStart(2, '0');
+    ss = String(origDate.getSeconds()).padStart(2, '0');
+  }
+  // Konstruuj nową datę w lokalnym czasie żeby zachować dokładnie tę samą godzinę co user widzi
+  var newLocalDate = new Date(targetDateStr + 'T' + hh + ':' + mm + ':' + ss);
+  var newIso = newLocalDate.toISOString();
+  var timeLabel = hh + ':' + mm;
+
+  if (d.isProposed) {
+    var pp = PROPOSED_POSTS[parseInt(d.idx)];
+    if (!pp) return;
+    api('/api/posts', { method: 'POST', body: JSON.stringify({
+      text: pp.text || '', text_alt: null, language: 'pl', publish_at: newIso,
+    }) }).then(function() {
+      toast('Zaplanowano na ' + targetDateStr + ' ' + timeLabel, true);
+      loadPosts();
+      renderKalendarz();
+    }).catch(function(e) { toast('Błąd: ' + e.message, false); });
+    return;
+  }
+  if (!d.id) return;
+  api('/api/posts/' + d.id, { method: 'PUT', body: JSON.stringify({ publish_at: newIso }) })
+    .then(function() {
+      toast('Przeniesiono na ' + targetDateStr + ' (godz ' + timeLabel + ' zachowana)', true);
+      loadPosts();
+      renderKalendarz();
+    })
+    .catch(function(e) { toast('Błąd przenoszenia: ' + e.message, false); });
+}
+
+// Iter7: lazy-load drzewka komentarzy gdy user otwiera <details> w karcie published
+document.addEventListener('toggle', function(e) {
+  var det = e.target;
+  if (!det || !det.matches || !det.matches('details[data-load-comments]')) return;
+  if (!det.open) return;
+  if (det.dataset.loaded === '1') return;
+  var urn = det.dataset.loadComments;
+  var postId = det.dataset.postId;
+  var box = det.querySelector('.comments-tree');
+  var summary = det.querySelector('summary');
+  if (!box) return;
+  box.innerHTML = '<span style="color:var(--dim);font-size:11px">Ładowanie…</span>';
+  fetch('/api/posts/' + encodeURIComponent(urn) + '/comments-tree')
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      det.dataset.loaded = '1';
+      if (summary) summary.innerHTML = '💬 Komentarze (' + d.count + ')';
+      if (!d.tree || d.tree.length === 0) {
+        box.innerHTML = '<div style="font-size:11px;color:var(--dim);font-style:italic;padding:8px 0">'
+          + 'Brak komentarzy w bazie. <button class="btn sm" data-act="backfill-comments" data-id="' + esc(postId) + '" data-urn="' + esc(urn) + '" style="font-size:11px;margin-left:8px">↺ Pobierz z LinkedIn</button>'
+          + '</div>';
+        return;
+      }
+      box.innerHTML = d.tree.map(function(c) {
+        var ml = (c.depth || 0) * 20;
+        var icon = c.is_our_comment ? '👤' : '💬';
+        var bg = c.is_our_comment ? 'rgba(63,185,80,.08)' : 'rgba(255,255,255,.02)';
+        var bd = c.is_our_comment ? 'var(--grn)' : 'var(--brd)';
+        var when = c.comment_created_at ? new Date(c.comment_created_at).toLocaleString('pl-PL', {day:'numeric', month:'short', hour:'2-digit', minute:'2-digit'}) : '';
+        return '<div style="margin-left:' + ml + 'px;padding:6px 9px;background:' + bg + ';border-radius:4px;margin-bottom:4px;border-left:2px solid ' + bd + '">'
+          + '<div style="display:flex;gap:6px;font-size:10px;color:var(--dim);margin-bottom:3px;align-items:baseline">'
+          + '<b style="color:var(--txt);font-size:11px">' + icon + ' ' + esc(c.author_name || '?') + '</b>'
+          + (when ? '<span>· ' + esc(when) + '</span>' : '')
+          + (c.is_our_comment ? '<span style="color:var(--grn);font-weight:600">[Ty]</span>' : '')
+          + '</div>'
+          + '<div style="color:var(--txt);font-size:12px;line-height:1.4;white-space:pre-wrap">' + esc(c.comment_text || '') + '</div>'
+          + '</div>';
+      }).join('');
+    })
+    .catch(function(err) {
+      box.innerHTML = '<span style="color:var(--red);font-size:11px">Błąd ładowania: ' + esc(err.message) + '</span>';
+    });
+}, true);
+
+// Iter7: handler backfill komentarzy per post
+document.addEventListener('click', function(e) {
+  var t = e.target;
+  if (!t || !t.dataset || t.dataset.act !== 'backfill-comments') return;
+  var id = t.dataset.id;
+  var urn = t.dataset.urn;
+  if (!id || !urn) return;
+  e.preventDefault();
+  e.stopPropagation();
+  var origText = t.textContent;
+  t.disabled = true;
+  t.textContent = '⏳ Pobieram…';
+  fetch('/api/posts/' + encodeURIComponent(id) + '/backfill-comments', { method: 'POST' })
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      t.disabled = false;
+      t.textContent = origText;
+      if (d.error) { toast('Backfill: ' + d.error, false); return; }
+      toast('Pobrano ' + (d.inserted || 0) + ' nowych komentarzy (' + (d.total || 0) + ' total)', true);
+      // Re-trigger toggle handler żeby załadować od nowa drzewko
+      var det = t.closest('details[data-load-comments]');
+      if (det) {
+        det.dataset.loaded = '0';
+        det.open = false;
+        setTimeout(function() { det.open = true; }, 100);
+      }
+    })
+    .catch(function(err) {
+      t.disabled = false;
+      t.textContent = origText;
+      toast('Błąd backfill: ' + err.message, false);
+    });
+});
+
+// Iter6: handler filtra okresu — persist + re-render obu widoków
+document.addEventListener('change', function(e) {
+  if (e.target && e.target.id === 'posts-period') {
+    localStorage.setItem('li_posts_period', e.target.value);
+    // Lista: render() używa getPostsPeriod()
+    if (typeof posts !== 'undefined' && Array.isArray(posts)) render();
+    // Tydzień: re-fetch + filter
+    if (document.getElementById('posts-view-week') && document.getElementById('posts-view-week').style.display !== 'none') {
+      renderKalendarz();
+    }
+  }
+});
+
+// Iter6: przywróć ostatnio wybrany filtr okresu przy starcie
+(function restorePostsPeriod() {
+  var saved = localStorage.getItem('li_posts_period');
+  if (!saved) return;
+  var sel = document.getElementById('posts-period');
+  if (sel) sel.value = saved;
+})();
 
 function openCreateFromProposed(pp) {
   $$('eid').value = '';
@@ -3689,9 +6186,77 @@ function openCreateFromProposed(pp) {
   var dt = new Date(pp.date);
   $$('edate').value = toLocal(dt);
   setLang('pl');
-  $$('cptext').textContent = gcom(pp.text || '');
+  // Iter6: cptext usunięte w Iter2 — preview auto-comment teraz w textarea #auto-comment
+  var cpt = document.getElementById('cptext');
+  if (cpt) cpt.textContent = gcom(pp.text || '');
+  // Reset media + auto-comment fields dla świeżego proposed→scheduled
+  var ac = document.getElementById('auto-comment'); if (ac) ac.value = '';
+  renderMediaPreview({});
   $$('ov').classList.add('open');
 }
+
+// Iter6: modal drill-down dla proposed postów (readonly view + kopiowanie + schedule)
+var currentProposedIdx = -1;
+function openProposedDetail(pp, idx) {
+  currentProposedIdx = idx;
+  var ov = document.getElementById('pp-ov');
+  if (!ov) return;
+  document.getElementById('pp-mtitle').textContent = pp.title || 'Proponowany post';
+  document.getElementById('pp-text').value = pp.text || '';
+  // Meta: data, format, kategoria
+  var dt = new Date(pp.date);
+  var dateStr = isNaN(dt.getTime()) ? '' : dt.toLocaleString('pl-PL', {day:'numeric', month:'short', weekday:'short', hour:'2-digit', minute:'2-digit'});
+  var pieces = [];
+  if (dateStr) pieces.push('<span class="badge b-scheduled">📅 ' + esc(dateStr) + '</span>');
+  if (pp.format) pieces.push('<span class="badge" style="background:rgba(56,139,253,.15);color:var(--blu)">' + esc(pp.format) + '</span>');
+  if (pp.icp) pieces.push('<span class="badge" style="background:rgba(210,153,34,.15);color:var(--yel)">ICP: ' + esc(pp.icp) + '</span>');
+  if (pp.lead_trigger) pieces.push('<span class="badge" style="background:rgba(63,185,80,.15);color:var(--grn)">🎯 ' + esc(pp.lead_trigger) + '</span>');
+  document.getElementById('pp-meta').innerHTML = pieces.join(' ');
+  // Screenshot hint
+  var ss = document.getElementById('pp-screenshot');
+  if (pp.screenshot) {
+    ss.style.display = 'block';
+    ss.innerHTML = '📸 ' + esc(pp.screenshot);
+  } else { ss.style.display = 'none'; }
+  // Hashtags
+  var ht = document.getElementById('pp-hashtags');
+  if (pp.hashtags && Array.isArray(pp.hashtags) && pp.hashtags.length) {
+    ht.innerHTML = pp.hashtags.map(function(h) {
+      return '<span style="color:var(--blu);font-family:var(--mono);font-size:11px">' + esc(h) + '</span>';
+    }).join(' ');
+  } else { ht.innerHTML = ''; }
+  ov.classList.add('open');
+}
+
+function closeProposedDetail() {
+  var ov = document.getElementById('pp-ov');
+  if (ov) ov.classList.remove('open');
+  currentProposedIdx = -1;
+}
+
+// Iter6: handlery przyciskow modala proposed-detail
+document.addEventListener('click', function(e) {
+  var t = e.target;
+  if (!t) return;
+  if (t.id === 'pp-close' || t.id === 'pp-ov') { closeProposedDetail(); return; }
+  if (t.id === 'pp-copy') {
+    var txt = document.getElementById('pp-text');
+    if (txt) {
+      navigator.clipboard.writeText(txt.value).then(function() {
+        toast('Tekst skopiowany', true);
+      }).catch(function() { toast('Błąd kopiowania', false); });
+    }
+    return;
+  }
+  if (t.id === 'pp-schedule') {
+    var pp = PROPOSED_POSTS[currentProposedIdx];
+    if (pp) {
+      closeProposedDetail();
+      openCreateFromProposed(pp);
+    }
+    return;
+  }
+});
 
 // ── RENDER: RUTYNA ────────────────────────────────────────────────────────────
 
@@ -3707,8 +6272,11 @@ function renderRutyna() {
     h += '<div class="sec-h" style="margin-bottom:8px">Automatyzacje — status</div>';
     h += '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:10px;margin-bottom:24px">';
     autos.forEach(function(a) {
-      var statusColor = a.running ? 'var(--grn)' : 'var(--red)';
-      var statusText = a.running ? ('AKTYWNY' + (a.pid ? ' (PID '+a.pid+')' : '')) : 'ZATRZYMANY';
+      var isCron = /Cron:/i.test(a.schedule || '');
+      var statusColor = a.running ? 'var(--grn)' : (isCron ? 'var(--yel)' : 'var(--red)');
+      var statusText = a.running
+        ? ('AKTYWNY' + (a.pid ? ' (PID '+a.pid+')' : ''))
+        : (isCron ? ('IDLE — następny ' + (a.nextRun || a.schedule || '?')) : 'ZATRZYMANY');
       var dot = '<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:' + statusColor + ';margin-right:6px"></span>';
       h += '<div style="background:var(--card);border:1px solid var(--brd);border-radius:8px;padding:12px">';
       h += '<div style="font-weight:600;font-size:13px;margin-bottom:4px">' + esc(a.label) + '</div>';
@@ -3730,9 +6298,18 @@ function renderRutyna() {
       // Auth status
       var authColor = dh.auth && dh.auth.official && dh.auth.official.startsWith('valid') ? 'var(--grn)' : 'var(--red)';
       var voyColor = dh.auth && dh.auth.voyager === 'has_cookie' ? 'var(--yel)' : 'var(--red)';
+      var oauthUrl = dh.auth?.oauth_url || '';
       hh += '<div style="background:var(--card);border:1px solid var(--brd);border-radius:6px;padding:8px">';
       hh += '<div style="font-size:11px;color:var(--dim)">Official API</div>';
-      hh += '<div style="color:' + authColor + ';font-weight:600;font-size:12px">' + esc(dh.auth?.official || '?') + '</div></div>';
+      hh += '<div style="color:' + authColor + ';font-weight:600;font-size:12px">' + esc(dh.auth?.official || '?') + '</div>';
+      if (dh.auth?.official === 'expired' || dh.auth?.official === 'no_file') {
+        if (oauthUrl) {
+          hh += '<a href="' + oauthUrl + '" style="font-size:10px;color:var(--blu);text-decoration:none;display:block;margin-top:4px">🔑 Odśwież token →</a>';
+        } else {
+          hh += '<div style="font-size:10px;color:var(--yel);margin-top:4px">Brak CLIENT_ID w env</div>';
+        }
+      }
+      hh += '</div>';
       hh += '<div style="background:var(--card);border:1px solid var(--brd);border-radius:6px;padding:8px">';
       hh += '<div style="font-size:11px;color:var(--dim)">Voyager (Scraper)</div>';
       hh += '<div style="color:' + voyColor + ';font-weight:600;font-size:12px">' + esc(dh.auth?.voyager || '?') + '</div></div>';
@@ -4156,13 +6733,24 @@ function renderAnalytics() {
     });
     h += '</div>';
 
+    // ── Staleness banner ─────────────────────────────────────────────────────
+    var ds = data.data_stale || {};
+    var staleMsgs = [];
+    if (ds.followers) staleMsgs.push('liczba obserwujących nieaktualna (Voyager niedostępne — ostatni realny pomiar ' + (ds.followers_last_real_date || '?') + ')');
+    if (ds.profileviews_dead) staleMsgs.push('wyświetlenia profilu niedostępne (endpoint LinkedIn 410 Gone)');
+    if (ds.charts_stale_days != null && ds.charts_stale_days > 2) staleMsgs.push('wykresy 365-dni zamrożone od ' + ds.charts_stale_days + ' dni (scrape Highcharts nie aktualizuje — patrz /api/analytics/llm-export → health_alarms)');
+    if (ds.errors_today > 30) staleMsgs.push(ds.errors_today + ' błędów API dzisiaj (część endpointów wycofana przez LinkedIn)');
+    if (staleMsgs.length) {
+      h += '<div style="background:rgba(210,153,34,.12);border:1px solid rgba(210,153,34,.4);color:#d29922;padding:8px 12px;border-radius:6px;margin-bottom:12px;font-size:12px">⚠️ ' + esc(staleMsgs.join(' · ')) + '</div>';
+    }
+
     // ── KPI Cards ──────────────────────────────────────────────────────────
     var fd = c.follower_delta || 0;
     h += '<div class="kpi-row">';
-    h += '<div class="kpi-box"><div class="kl">Followers</div><div class="kv">' + (c.follower_count || '-') + '</div><div class="kd ' + (fd >= 0 ? 'pos' : 'neg') + '">' + (fd >= 0 ? '+' : '') + fd + ' / tydzien</div></div>';
-    h += '<div class="kpi-box"><div class="kl">Profile Views</div><div class="kv">' + (c.profile_views || '-') + '</div><div class="kd neu">ostatni snapshot</div></div>';
+    h += '<div class="kpi-box"><div class="kl">Followers</div><div class="kv">' + (c.follower_count || '-') + '</div><div class="kd ' + (fd >= 0 ? 'pos' : 'neg') + '">' + (fd >= 0 ? '+' : '') + fd + ' / 7d' + (ds.followers ? ' (stale)' : '') + '</div></div>';
+    h += '<div class="kpi-box"><div class="kl">Impressions</div><div class="kv">' + (c.impressions || '-') + '</div><div class="kd neu">' + (ds.impressions_scrape_date ? 'scrape ' + ds.impressions_scrape_date : 'top posty') + '</div></div>';
     h += '<div class="kpi-box"><div class="kl">Reactions</div><div class="kv">' + (c.total_reactions || 0) + '</div><div class="kd neu">all posts</div></div>';
-    h += '<div class="kpi-box"><div class="kl">Engagement</div><div class="kv">' + (c.avg_engagement_rate || 0) + '%</div><div class="kd neu">avg rate</div></div>';
+    h += '<div class="kpi-box"><div class="kl">Engagement</div><div class="kv">' + (c.avg_engagement_rate || 0) + '%</div><div class="kd neu">' + (c.impressions > 0 ? 'reactions/impr' : 'reactions/followers') + '</div></div>';
     h += '</div>';
 
     // ── Follower Growth (Chart.js line) ───────────────────────────────────
@@ -4237,7 +6825,7 @@ function renderAnalytics() {
         h += '<td style="max-width:280px">' + esc(p.text_preview || p.post_urn) + '</td>';
         h += '<td><span class="badge" style="background:rgba(56,139,253,.15);color:var(--blu)">' + esc(p.content_type || 'text') + '</span></td>';
         h += '<td style="font-family:var(--mono);color:var(--grn)">' + (p.total_reactions || 0) + '</td>';
-        h += '<td style="font-family:var(--mono)">' + (p.comment_count || 0) + '</td>';
+        h += '<td style="font-family:var(--mono)">' + (p.comment_count != null ? p.comment_count : '—') + '</td>';
         h += '<td style="font-size:11px;color:var(--dim)">' + breakdown.join(', ') + '</td>';
         h += '</tr>';
       });
@@ -4279,7 +6867,7 @@ function renderAnalytics() {
     if (tLabels.length > 1 && document.getElementById('chart-engagement')) {
       createChart('chart-engagement', 'line', tLabels.map(function(d) { return d.slice(5); }), [
         { label: 'Reactions', data: trends.datasets.reactions, borderColor: '#3fb950', backgroundColor: 'rgba(63,185,80,.08)', fill: true, tension: 0.3, pointRadius: 1, borderWidth: 2, yAxisID: 'y' },
-        { label: 'Profile Views', data: trends.datasets.profile_views, borderColor: '#58a6ff', backgroundColor: 'rgba(88,166,255,.08)', fill: true, tension: 0.3, pointRadius: 1, borderWidth: 2, yAxisID: 'y' },
+        { label: 'Impressions (daily)', data: trends.datasets.impressions_daily, borderColor: '#58a6ff', backgroundColor: 'rgba(88,166,255,.08)', fill: true, tension: 0.3, pointRadius: 1, borderWidth: 2, yAxisID: 'y' },
         { label: 'Engagement %', data: trends.datasets.engagement_rate, borderColor: '#d29922', tension: 0.3, pointRadius: 1, borderWidth: 2, yAxisID: 'y1' },
       ], {
         scales: {
@@ -4850,7 +7438,8 @@ function renderKontenty() {
 
 // ── INIT ──────────────────────────────────────────────────────────────────────
 
-renderKalendarz();
+// Iter2: przywróć ostatnio wybrany widok Kolejki (Lista/Tydzień)
+setPostsView(localStorage.getItem('li_posts_view') || 'list');
 renderRutyna();
 renderAnalytics();
 loadProspekci();
@@ -4864,6 +7453,37 @@ if (activeTab === 'leady') renderLeady();
 if (activeTab === 'kontenty') renderKontenty();
 if (activeTab === 'mediaplan') renderMediaPlan();
 if (activeTab === 'artykuly') renderArtykuly();
+if (activeTab === 'propozycje') loadProposals();
+
+// Refresh button + filter
+document.addEventListener('click', function(e) {
+  if (e.target.closest && e.target.closest('#prop-refresh')) loadProposals();
+  // 🔄 Pobierz cały wątek tego postu z LinkedIn (priorytet)
+  var rfb = e.target.closest && e.target.closest('.prop-refetch-btn');
+  if (rfb) {
+    var purn = rfb.getAttribute('data-post');
+    rfb.disabled = true; rfb.textContent = '⏳ Pobieram wątek…';
+    fetch('/api/posts/' + encodeURIComponent(purn) + '/fetch-comments', { method: 'POST' })
+      .then(function(r){ return r.json(); })
+      .then(function(d){ toast(d.error ? ('Błąd: ' + d.error) : (d.info || 'Zlecono'), !d.error); })
+      .catch(function(err){ toast('Błąd: ' + err.message); })
+      .finally(function(){ rfb.disabled = false; rfb.textContent = '🔄 Pobierz cały wątek z LinkedIn'; });
+    return;
+  }
+  if (e.target.closest && e.target.closest('#fetch-all-comments')) {
+    var btn = document.getElementById('fetch-all-comments');
+    if (btn) { btn.disabled = true; btn.textContent = '⏳ Skanuję wszystkie…'; }
+    fetch('/api/comment-engine/fetch-all', { method: 'POST' })
+      .then(function(r){ return r.json(); })
+      .then(function(d){ toast(d.error ? ('Błąd: ' + d.error) : (d.info || 'Uruchomiono'), !d.error); })
+      .catch(function(e){ toast('Błąd: ' + e.message); })
+      .finally(function(){ if (btn) { btn.disabled = false; btn.textContent = '📥 Pobierz wszystkie'; } setTimeout(loadEngineHealth, 3000); });
+  }
+});
+document.addEventListener('change', function(e) {
+  if (e.target.id === 'prop-filter') loadProposals();
+  if (e.target.id === 'prop-show-replied') loadProposals();
+});
 
 // ── ARTYKULY (Wariant G-A: article drafter UI) ──────────────────────────
 var artTopics = null;
@@ -4988,6 +7608,491 @@ setInterval(function() { if (activeTab === 'analytics') renderAnalytics(); }, 12
 setInterval(function() { if (activeTab === 'siec') renderSiec(); }, 120000);
 setInterval(function() { if (activeTab === 'leady') renderLeady(); }, 120000);
 setInterval(function() { if (activeTab === 'kontenty') renderKontenty(); }, 120000);
+setInterval(function() { if (activeTab === 'propozycje') loadProposals(); }, 30000);
+setInterval(function() { if (activeTab === 'watki') loadWatki(); }, 30000);
+
+// ── WATKI (thread memory) ──────────────────────────────────────────────────
+function watkiQuery() {
+  var q = (document.getElementById('w-q')||{}).value || '';
+  var reply = (document.getElementById('w-reply')||{}).value || 'all';
+  var since = (document.getElementById('w-since')||{}).value || '';
+  var sort = (document.getElementById('w-sort')||{}).value || 'published_desc';
+  var p = new URLSearchParams();
+  if (q) p.set('q', q);
+  if (reply !== 'all') p.set('has_reply', reply);
+  if (since) p.set('since', since);
+  if (sort) p.set('sort', sort);
+  return p.toString();
+}
+
+function loadWatki() {
+  var qs = watkiQuery();
+  Promise.all([
+    fetch('/api/threads' + (qs ? '?' + qs : '')).then(function(r) { return r.json(); }),
+    fetch('/api/playwright-cycles').then(function(r) { return r.json(); })
+  ]).then(function(arr) {
+    var threads = arr[0] || [];
+    var cycles = arr[1] || [];
+    renderWatki(threads, cycles);
+  }).catch(function(e) {
+    var el = document.getElementById('watki-list');
+    if (el) el.innerHTML = '<p style="color:var(--red)">Błąd: ' + e.message + '</p>';
+  });
+}
+
+var watkiDebounce;
+function wireWatkiFilters() {
+  ['w-q','w-reply','w-since','w-sort'].forEach(function(id) {
+    var el = document.getElementById(id);
+    if (!el || el._wired) return;
+    el._wired = true;
+    var evt = (id === 'w-q' || id === 'w-since') ? 'input' : 'change';
+    el.addEventListener(evt, function() {
+      clearTimeout(watkiDebounce);
+      watkiDebounce = setTimeout(loadWatki, 300);
+    });
+  });
+  var clr = document.getElementById('w-clear');
+  if (clr && !clr._wired) {
+    clr._wired = true;
+    clr.addEventListener('click', function() {
+      ['w-q','w-since'].forEach(function(id) { var e = document.getElementById(id); if (e) e.value = ''; });
+      var r = document.getElementById('w-reply'); if (r) r.value = 'all';
+      var s = document.getElementById('w-sort'); if (s) s.value = 'published_desc';
+      loadWatki();
+    });
+  }
+}
+
+function renderWatki(threads, cycles) {
+  var cnt = document.getElementById('watki-count');
+  var list = document.getElementById('watki-list');
+  var cyclesEl = document.getElementById('watki-cycles');
+  var lastEl = document.getElementById('watki-last-cycle');
+  if (!cnt || !list) return;
+
+  cnt.textContent = threads.length + ' wątków';
+  wireWatkiFilters();
+
+  // Cykl info
+  var lastCycle = cycles[0];
+  if (lastCycle && lastEl) {
+    lastEl.textContent = 'Ostatni cykl: ' + (lastCycle.ended_at || 'w toku') +
+      ' (sprawdzono ' + lastCycle.posts_checked + ' postów, ' + lastCycle.proposals_created + ' propozycji)';
+  }
+
+  // Tabela cykli (ostatnie 5)
+  if (cyclesEl) {
+    if (cycles.length === 0) {
+      cyclesEl.innerHTML = '<div style="font-size:12px;color:var(--dim);padding:8px;border:1px dashed var(--brd);border-radius:6px">Brak uruchomień Playwright — uruchom: <code style="background:var(--card);padding:2px 6px;border-radius:3px">node auto-comment-playwright.mjs --once</code></div>';
+    } else {
+      cyclesEl.innerHTML = '<div style="font-size:11px;color:var(--dim);margin-bottom:6px">Ostatnie cykle Playwright:</div>' +
+        '<table style="width:100%;font-size:11px;border-collapse:collapse">' +
+        '<tr style="border-bottom:1px solid var(--brd)"><th style="text-align:left;padding:4px">Start</th><th>Posts</th><th>Propozycje</th><th>Errors</th><th>Notes</th></tr>' +
+        cycles.slice(0, 5).map(function(c) {
+          var color = c.errors > 0 ? 'var(--red)' : 'var(--grn)';
+          return '<tr style="border-bottom:1px solid var(--brd)">' +
+            '<td style="padding:4px">' + (c.started_at||'?').slice(0,16) + '</td>' +
+            '<td style="text-align:center">' + (c.posts_checked||0) + '</td>' +
+            '<td style="text-align:center;color:var(--blu)">' + (c.proposals_created||0) + '</td>' +
+            '<td style="text-align:center;color:' + color + '">' + (c.errors||0) + '</td>' +
+            '<td style="font-size:10px;color:var(--dim)">' + ((c.notes||'').slice(0,50)) + '</td>' +
+            '</tr>';
+        }).join('') + '</table>';
+    }
+  }
+
+  // Lista wątków
+  if (!threads.length) {
+    list.innerHTML = '<p style="color:var(--dim);text-align:center;padding:40px">Brak zeskrapowanych wątków. Playwright daemon zaczyna pracę po pierwszym cyklu.</p>';
+    return;
+  }
+
+  list.innerHTML = threads.map(function(t) {
+    var ourReplies = [];
+    try { ourReplies = JSON.parse(t.our_replies_json || '[]'); } catch {}
+    var thread = [];
+    try { thread = JSON.parse(t.thread_json || '[]'); } catch {}
+
+    return '<div class="watki-card" style="background:var(--card);border:1px solid var(--brd);border-radius:8px;padding:14px;margin-bottom:12px">' +
+      '<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">' +
+      '<span style="font-size:12px;color:var(--dim)">Autor postu:</span>' +
+      '<b>' + esc(t.post_author || '?') + '</b>' +
+      (t.post_published_at
+        ? '<span style="margin-left:auto;font-size:11px;color:var(--txt)" title="Data publikacji posta">📅 ' + esc(t.post_published_at.slice(0,16)) + '</span>'
+        : '<span style="margin-left:auto;font-size:11px;color:var(--yel)" title="Brak prawdziwej daty publikacji — fallback na scrape">⏰ ' + esc((t.last_scraped_at||'').slice(0,16)) + '</span>') +
+      (t.post_published_at && t.last_scraped_at ? '<span style="font-size:10px;color:var(--dim)" title="Ostatni scrape">· ' + esc(t.last_scraped_at.slice(11,16)) + '</span>' : '') +
+      '<span style="background:var(--blu);color:#fff;padding:2px 6px;border-radius:4px;font-size:10px">' + thread.length + ' komentarzy</span>' +
+      '</div>' +
+      '<div style="background:var(--bg);padding:8px;border-radius:4px;font-size:12px;color:var(--dim);margin-bottom:8px;max-height:60px;overflow:hidden">' +
+      esc((t.post_text||'(brak treści posta)').slice(0,250)) + '</div>' +
+      (ourReplies.length > 0
+        ? '<div style="font-size:11px;color:var(--grn);margin-top:6px">✅ Twoje odpowiedzi w wątku: ' + ourReplies.length + '</div>'
+        : '<div style="font-size:11px;color:var(--yel);margin-top:6px">⏳ Brak twoich odpowiedzi</div>') +
+      '<div style="margin-top:8px;display:flex;gap:6px;flex-wrap:wrap;align-items:center">' +
+        '<button class="btn sm watki-tree-btn" data-urn="' + encodeURIComponent(t.post_urn || '') + '" title="Pokaż cały wątek: kto co pisał, kto skomentował, Twój komentarz">📋 Pokaż pełny wątek</button>' +
+        '<button class="btn sm watki-fetch-btn" data-urn="' + encodeURIComponent(t.post_urn || '') + '" title="Pobierz najświeższe komentarze tego postu z LinkedIn (priorytet)">🔄 Pobierz świeże</button>' +
+        (t.post_url ? '<a href="' + t.post_url + '" target="_blank" style="font-size:11px;color:var(--blu);margin-left:auto">→ Otwórz w LinkedIn</a>' : '') +
+      '</div>' +
+      '<div class="post-tree" style="display:none;margin-top:8px;border-top:1px solid var(--brd);padding-top:8px"></div>' +
+      '</div>';
+  }).join('');
+}
+
+// Renderuje pełne drzewko (kto co pisał, nesting, mój komentarz) z /api/posts/:urn/comments-tree
+function renderPostTree(box, data, postUrn) {
+  var tree = (data && data.tree) || [];
+  if (!tree.length) { box.innerHTML = '<div style="font-size:11px;color:var(--dim)">Brak komentarzy w bazie. Kliknij „🔄 Pobierz świeże".</div>'; return; }
+  box.innerHTML = '<div style="font-size:11px;color:var(--dim);margin-bottom:6px">' + tree.length + ' wpisów w wątku (🟢 = Twój):</div>' +
+    tree.map(function(c) {
+      var indent = (c.depth || 0) > 0 ? 22 : 0;
+      var mine = c.is_our_comment ? 1 : 0;
+      var who = mine ? '🟢 Ty' : esc(c.author_name || '?');
+      var when = c.comment_created_at ? '<span style="color:var(--dim);font-size:10px"> · ' + esc(String(c.comment_created_at).slice(0,16)) + '</span>' : '';
+      var hasUrn = c.comment_urn && c.comment_urn.indexOf('urn:') === 0;
+      // Akcja „Odpisz z AI" tylko dla CUDZYCH komentarzy z realnym URN (deterministyczny target)
+      var action = (!mine && hasUrn) ? (
+        '<div style="display:flex;gap:6px;margin-top:6px">' +
+          '<input class="ai-hint" placeholder="opcjonalna wskazówka dla AI…" style="flex:1;font-size:11px;background:var(--card);border:1px solid var(--brd);color:var(--txt);padding:4px 6px;border-radius:4px">' +
+          '<button class="btn sm ai-reply-btn" data-curn="' + esc(c.comment_urn) + '" data-post="' + esc(postUrn || '') + '" data-author="' + esc(c.author_name || '') + '">✍️ Odpisz z AI</button>' +
+        '</div>' +
+        '<div class="ai-result" style="display:none;font-size:11px;margin-top:6px;padding:6px 8px;background:var(--card);border-radius:4px"></div>'
+      ) : '';
+      return '<div style="margin:4px 0 4px ' + indent + 'px;padding:6px 8px;border-left:2px solid ' + (mine ? 'var(--grn)' : (c.depth ? 'var(--dim)' : 'var(--blu)')) + ';background:var(--bg);border-radius:4px">' +
+        '<div style="font-size:11px;font-weight:600;color:' + (mine ? 'var(--grn)' : 'var(--txt)') + '">' + (c.depth ? '↳ ' : '') + who + when + '</div>' +
+        '<div style="font-size:12px;color:var(--txt);white-space:pre-wrap;margin-top:2px">' + esc(c.comment_text || '') + '</div>' +
+        action +
+      '</div>';
+    }).join('');
+}
+
+document.addEventListener('click', function(e) {
+  if (!e.target || !e.target.closest) return;
+  if (e.target.closest('#watki-refresh')) { loadWatki(); return; }
+
+  // 📋 Pokaż pełny wątek — pobiera drzewko z DB i renderuje (kto co pisał, mój komentarz)
+  var treeBtn = e.target.closest('.watki-tree-btn');
+  if (treeBtn) {
+    var urn = treeBtn.getAttribute('data-urn');
+    var card = treeBtn.closest('.watki-card');
+    var box = card && card.querySelector('.post-tree');
+    if (!box) return;
+    if (box.style.display !== 'none') { box.style.display = 'none'; treeBtn.textContent = '📋 Pokaż pełny wątek'; return; }
+    box.style.display = 'block'; box.innerHTML = '<div style="font-size:11px;color:var(--dim)">Ładuję wątek…</div>'; treeBtn.textContent = '📋 Ukryj wątek';
+    fetch('/api/posts/' + urn + '/comments-tree')
+      .then(function(r){ return r.json(); })
+      .then(function(d){ renderPostTree(box, d, decodeURIComponent(urn)); })
+      .catch(function(err){ box.innerHTML = '<div style="color:var(--red);font-size:11px">Błąd: ' + err.message + '</div>'; });
+    return;
+  }
+
+  // ✍️ Odpisz z AI — generuje propozycję dla TEGO komentarza (deterministycznie po URN) → Propozycje → Playwright
+  var aiBtn = e.target.closest('.ai-reply-btn');
+  if (aiBtn) {
+    var hintInput = aiBtn.parentElement && aiBtn.parentElement.querySelector('.ai-hint');
+    var resultBox = aiBtn.parentElement && aiBtn.parentElement.parentElement.querySelector('.ai-result');
+    var payload = {
+      comment_urn: aiBtn.getAttribute('data-curn'),
+      post_urn: aiBtn.getAttribute('data-post'),
+      author: aiBtn.getAttribute('data-author'),
+      hint: hintInput ? hintInput.value : ''
+    };
+    aiBtn.disabled = true; aiBtn.textContent = '⏳ Opus 4.8…';
+    fetch('/api/comments/reply-with-ai', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
+      .then(function(r){ return r.json(); })
+      .then(function(d){
+        if (d.error) { toast('Błąd: ' + d.error); return; }
+        if (resultBox) {
+          resultBox.style.display = 'block';
+          resultBox.innerHTML = '<b>' + (d.status === 'blocked' ? '🚫 ' + (d.validation_notes||[]).join(', ') : '✅ Propozycja gotowa') + ':</b><br>' + esc(d.proposed_reply || '') +
+            '<br><span style="color:var(--dim)">→ zatwierdź w zakładce „Propozycje" (poleci na Playwright pod ten komentarz)</span>';
+        }
+        toast(d.status === 'blocked' ? '⚠️ Wygenerowano, ale fact-check oflagował' : '✅ Odpowiedź wygenerowana → Propozycje', d.status !== 'blocked');
+      })
+      .catch(function(err){ toast('Błąd: ' + err.message); })
+      .finally(function(){ aiBtn.disabled = false; aiBtn.textContent = '✍️ Odpisz z AI'; });
+    return;
+  }
+
+  // 🔄 Pobierz świeże z LinkedIn (priorytet) dla tego konkretnego postu
+  var fetchBtn = e.target.closest('.watki-fetch-btn');
+  if (fetchBtn) {
+    var furn = fetchBtn.getAttribute('data-urn');
+    fetchBtn.disabled = true; fetchBtn.textContent = '⏳ Zlecam…';
+    fetch('/api/posts/' + furn + '/fetch-comments', { method: 'POST' })
+      .then(function(r){ return r.json(); })
+      .then(function(d){ toast(d.error ? ('Błąd: ' + d.error) : (d.info || 'Zlecono'), !d.error); })
+      .catch(function(err){ toast('Błąd: ' + err.message); })
+      .finally(function(){ fetchBtn.disabled = false; fetchBtn.textContent = '🔄 Pobierz świeże'; });
+    return;
+  }
+});
+
+// ── PROPOZYCJE ──────────────────────────────────────────────────────────────
+
+var propFilter = 'pending';
+
+function loadEngineHealth() {
+  var el = document.getElementById('engine-health');
+  if (!el) return;
+  fetch('/api/comment-engine/health').then(function(r){ return r.json(); }).then(function(h) {
+    var dot = h.color === 'green' ? '🟢' : h.color === 'yellow' ? '🟡' : '🔴';
+    var bg = h.color === 'green' ? 'var(--grn)' : h.color === 'yellow' ? 'var(--yel)' : 'var(--red)';
+    el.style.background = bg;
+    el.style.color = h.color === 'yellow' ? '#000' : '#fff';
+    el.textContent = dot + ' silnik · ' + (h.unanswered || 0) + ' bez odp.';
+    var t = 'Silnik komentarzy (Playwright + Opus 4.8)\\n'
+      + 'Ostatni cykl: ' + (h.last_run_at || '?') + '\\n'
+      + 'Ostatni scrape drzewka: ' + (h.last_scrape_at || '?') + '\\n'
+      + 'pending=' + (h.pending||0) + ' blocked=' + (h.blocked||0) + ' nieodpowiedziane=' + (h.unanswered||0) + '\\n'
+      + (h.reasons && h.reasons.length ? '⚠️ ' + h.reasons.join('; ') : 'OK');
+    el.title = t;
+  }).catch(function(){ el.textContent = '⚙️ ?'; });
+}
+
+function loadProposals() {
+  loadEngineHealth();
+  var filter = document.getElementById('prop-filter');
+  if (filter) propFilter = filter.value;
+  var showReplied = document.getElementById('prop-show-replied');
+  var qs = 'status=' + propFilter + (showReplied && showReplied.checked ? '&include_replied=1' : '');
+  fetch('/api/proposals?' + qs)
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      // Backend now returns { rows, total, follow_ups }; tolerate stale array shape.
+      if (Array.isArray(data)) data = { rows: data, total: data.length, follow_ups: 0 };
+      renderProposals(data);
+    })
+    .catch(function(e) { var el = document.getElementById('prop-list'); if (el) el.innerHTML = '<p style="color:var(--red)">Błąd: ' + e.message + '</p>'; });
+}
+
+function renderProposals(payload) {
+  var cnt = document.getElementById('prop-count');
+  var list = document.getElementById('prop-list');
+  if (!cnt || !list) return;
+  var proposals = payload.rows || [];
+  var pending = proposals.filter(function(p) { return p.status === 'pending'; });
+  var followUps = payload.follow_ups || 0;
+  var blocked = payload.blocked || 0;
+  // Iter3: counter rozszerzony o blocked
+  cnt.textContent = pending.length + ' oczekujących'
+    + (followUps > 0 ? ' · ' + followUps + ' follow-up' : '')
+    + (blocked > 0 ? ' · ' + blocked + ' blocked' : '');
+  cnt.style.background = pending.length > 0 ? 'var(--blu)' : 'var(--dim)';
+  if (!proposals.length) {
+    list.innerHTML = '<p style="color:var(--dim);text-align:center;padding:40px">Brak propozycji' + (followUps > 0 ? ' (' + followUps + ' ukryto — to wątki gdzie już odpowiedziałeś. Zaznacz „pokaż follow-upy" wyżej żeby je zobaczyć.)' : '') + '</p>';
+    return;
+  }
+  list.innerHTML = proposals.map(function(p) {
+    var typeIcon = p.type === 'comment' ? '💬' : '✉️';
+    var typeLabel = p.type === 'comment' ? 'Komentarz' : 'DM';
+    var statusColor = p.status === 'pending' ? 'var(--yel)' :
+                      p.status === 'approved' ? 'var(--blu)' :
+                      p.status === 'sent' ? 'var(--grn)' :
+                      p.status === 'rejected' ? 'var(--dim)' : 'var(--red)';
+    var statusLabel = p.status === 'approved' ? '⏳ approved (czeka na Playwright)' :
+                      p.status === 'blocked' ? '🚫 blocked' : p.status;
+    // Iter3: composite_score pasek 0-10 + rozbicie wymiarów w tooltip
+    var cs = p.composite_score != null ? +p.composite_score : 0;
+    var csColor = cs >= 7 ? 'var(--grn)' : cs >= 4 ? 'var(--yel)' : 'var(--red)';
+    var scoreTooltip = 'L' + (p.lead_score||0) + '/T' + (p.troll_risk||0) + '/E' + (p.engagement_value||0) + '/U' + (p.urgency||0) + ' (lead/troll/eng/urgency, 1-5 each)';
+    var scoreBar = ''
+      + '<div style="display:flex;align-items:center;gap:6px;margin:6px 0" title="' + scoreTooltip + '">'
+      + '<div style="flex:0 0 56px;font-family:var(--mono);color:' + csColor + ';font-weight:700;font-size:12px">' + cs.toFixed(1) + '/10</div>'
+      + '<div style="flex:1;height:6px;background:var(--bg);border-radius:3px;overflow:hidden">'
+      + '<div style="width:' + (cs*10) + '%;height:100%;background:' + csColor + '"></div>'
+      + '</div>'
+      + '<div style="flex:0 0 auto;font-size:10px;color:var(--dim);font-family:var(--mono)">L' + (p.lead_score||0) + ' T' + (p.troll_risk||0) + ' E' + (p.engagement_value||0) + (p.urgency ? ' U' + p.urgency : '') + '</div>'
+      + '</div>';
+    // Iter3: blocked badge + validation notes tooltip
+    var blockedBadge = '';
+    if (p.status === 'blocked') {
+      var notesArr = [];
+      try { notesArr = JSON.parse(p.validation_notes || '[]'); } catch (e) {}
+      var notesText = notesArr.join(', ') || 'walidacja failed';
+      blockedBadge = '<span style="font-size:10px;background:var(--red);color:#fff;padding:2px 6px;border-radius:3px;margin-left:6px" title="' + esc(notesText) + '">🚫 ' + esc(notesArr.slice(0, 2).join('+') || 'blocked') + '</span>';
+    }
+    var temp = p.temperature || 0;
+    var tempColor = temp >= 4 ? 'var(--red)' : temp >= 3 ? 'var(--yel)' : temp >= 2 ? 'var(--blu)' : 'var(--dim)';
+    var toneIcon = ({formal:'🎩',casual:'👋',ironic:'😏',empathetic:'💙',technical:'⚙️',provocative:'🔥',neutral:'⚪'})[p.tone] || '';
+    var metaBar = (temp || p.tone || p.reasoning) ? (
+      '<div style="font-size:11px;color:var(--dim);background:var(--bg);padding:6px 8px;border-radius:4px;margin-top:8px;border-left:2px solid ' + tempColor + '">' +
+        (temp ? '<span style="color:' + tempColor + '">🌡️ ' + temp + '/5</span>' : '') +
+        (p.tone ? ' · <span>' + toneIcon + ' ' + esc(p.tone) + '</span>' : '') +
+        (p.reasoning ? '<div style="margin-top:4px;color:var(--txt);font-size:11px">💡 ' + esc(p.reasoning) + '</div>' : '') +
+        (function() {
+          if (!p.context_used) return '';
+          var arr = []; try { arr = JSON.parse(p.context_used); } catch (e) {}
+          if (!Array.isArray(arr) || !arr.length) return '';
+          return '<div style="margin-top:4px;font-size:10px">📚 ' + arr.map(function(x){ return esc(String(x)); }).join(' · ') + '</div>';
+        })() +
+      '</div>'
+    ) : '';
+    var parentBar = p.parent_in_tree && p.parent_in_tree !== p.source_id ? (
+      '<div style="font-size:10px;color:var(--dim);margin-top:4px">↳ parent w drzewku: ' + esc((p.parent_in_tree||'').slice(0,80)) + '</div>'
+    ) : '';
+    var datesBar = (p.comment_created_at || p.post_created_at || p.approved_at) ? (
+      '<div style="font-size:10px;color:var(--dim);margin-bottom:6px;display:flex;gap:12px;flex-wrap:wrap">' +
+        (p.comment_created_at ? '💬 komentarz: ' + esc(p.comment_created_at.slice(0,16)) : '') +
+        (p.post_created_at ? ' · 📅 post: ' + esc(p.post_created_at.slice(0,16)) : '') +
+        (p.approved_at ? ' · ✅ zatwierdzono: ' + esc(p.approved_at.slice(0,16)) : '') +
+        (p.sent_at ? ' · 📤 wysłano: ' + esc(p.sent_at.slice(0,16)) : '') +
+      '</div>'
+    ) : '';
+    var actions = p.status === 'pending' ? (
+      '<div style="display:flex;gap:8px;margin-top:8px">' +
+      '<button class="btn sm primary" onclick="sendProposal(' + p.id + ')">✅ Zatwierdź (Playwright wyśle)</button>' +
+      '<button class="btn sm" onclick="rejectProposal(' + p.id + ')" style="background:var(--red);border-color:var(--red)">✗ Odrzuć</button>' +
+      '</div>'
+    ) : '<div style="margin-top:8px;font-size:11px;color:' + statusColor + '">' + statusLabel + (p.sent_at ? ' · ' + p.sent_at.slice(0,16) : '') + '</div>';
+    var postLink = p.post_urn ? 'https://www.linkedin.com/feed/update/' + encodeURIComponent(p.post_urn) + '/' : null;
+    var linkBar = postLink ? '<a href="' + postLink + '" target="_blank" rel="noopener" style="color:var(--blu);font-size:11px;text-decoration:none;margin-right:8px;display:inline-block;margin-bottom:6px">🔗 Otwórz post w LinkedIn</a>' : '';
+    var refetchBtn = p.post_urn ? '<button class="btn sm prop-refetch-btn" data-post="' + esc(p.post_urn) + '" title="Pobierz ponownie CAŁY wątek tego postu z LinkedIn (priorytet) — odśwież drzewko/flagi" style="font-size:11px;margin-bottom:6px">🔄 Pobierz cały wątek z LinkedIn</button>' : '';
+    var postPreview = p.post_text ? (
+      '<details style="margin-bottom:8px"><summary style="cursor:pointer;font-size:11px;color:var(--dim);background:var(--bg);padding:6px 8px;border-radius:4px;border-left:2px solid var(--blu)"><b>📝 Post</b> — ' + esc((p.post_text||'').slice(0,100)) + (p.post_text.length > 100 ? '…' : '') + '</summary>' +
+      '<div style="font-size:12px;color:var(--txt);background:var(--bg);padding:8px;border-radius:0 0 4px 4px;white-space:pre-wrap;border-left:2px solid var(--blu)">' + esc(p.post_text||'') + '</div></details>'
+    ) : '';
+    var treeBox = '<details style="margin-bottom:8px"><summary style="cursor:pointer;font-size:11px;color:var(--blu);padding:4px 0">🌳 Pokaż drzewko wątku (kto co napisał)</summary><div id="tree-' + p.id + '" style="font-size:11px;color:var(--dim);background:var(--bg);padding:8px;border-radius:4px;margin-top:4px" onclick="loadProposalTree(' + p.id + ')">Kliknij żeby załadować…</div></details>';
+    var edited = p.original_reply && p.original_reply !== p.proposed_reply;
+    var editedBadge = edited ? '<span style="font-size:10px;background:var(--yel);color:#000;padding:2px 6px;border-radius:3px;margin-left:6px">✏️ edytowano</span>' : '';
+    var alreadyBadge = p.already_replied_in_thread ? '<span style="font-size:10px;background:var(--red);color:#fff;padding:2px 6px;border-radius:3px;margin-left:6px" title="W tym wątku jest już Twoja wypowiedź — to byłaby kolejna odpowiedź (follow-up).">⚠️ już odpowiedziałeś</span>' : '';
+    var revertBtn = (edited && p.status === 'pending') ? '<button class="btn sm" onclick="revertProposal(' + p.id + ')" style="background:var(--dim);border-color:var(--dim);font-size:11px">↺ Przywróć oryginał Claude</button>' : '';
+    // „Twoja wskazówka → AI pisze treść" (Opus 4.8 + fact-check) — dla pending i blocked
+    var regenBox = (p.status === 'pending' || p.status === 'blocked') ? (
+      '<div style="margin-top:8px;display:flex;gap:6px;align-items:flex-start">' +
+      '<input id="prop-hint-' + p.id + '" placeholder="💡 Twoja wskazówka / kierunek (opcjonalnie) — np. krócej, bardziej technicznie, dorzuć wątek X" style="flex:1;background:var(--bg);border:1px solid var(--brd);color:var(--txt);padding:7px 8px;border-radius:4px;font-size:12px">' +
+      '<button class="btn sm" id="prop-regen-' + p.id + '" onclick="regenerateProposal(' + p.id + ')" style="white-space:nowrap">✨ Przepisz (Opus 4.8)</button>' +
+      '</div>'
+    ) : '';
+    return '<div style="background:var(--card);border:1px solid var(--brd);border-radius:8px;padding:14px;margin-bottom:12px">' +
+      '<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">' +
+      '<span>' + typeIcon + ' ' + typeLabel + '</span>' +
+      '<span style="color:var(--dim);font-size:11px">od: <b>' + esc(p.source_author||'?') + '</b></span>' +
+      editedBadge +
+      alreadyBadge +
+      blockedBadge +
+      '<span style="margin-left:auto;font-size:11px;color:' + statusColor + '">' + statusLabel + '</span>' +
+      '</div>' +
+      linkBar + refetchBtn +
+      datesBar +
+      postPreview +
+      treeBox +
+      '<div style="background:var(--bg);padding:8px;border-radius:4px;font-size:12px;color:var(--dim);margin-bottom:8px;max-height:60px;overflow:hidden">' + esc((p.source_text||'').slice(0,200)) + '</div>' +
+      scoreBar +
+      parentBar +
+      '<div style="margin-top:8px">' +
+      '<label style="font-size:11px;color:var(--dim)">Propozycja odpowiedzi' + (edited ? ' <span style="color:var(--yel)">(edytowana)</span>' : '') + ':</label>' +
+      '<textarea id="prop-reply-' + p.id + '" style="width:100%;min-height:80px;margin-top:4px;background:var(--bg);border:1px solid var(--brd);color:var(--txt);padding:8px;border-radius:4px;font-size:12px;resize:vertical" ' + (p.status !== 'pending' ? 'readonly' : '') + '>' + esc(p.proposed_reply||'') + '</textarea>' +
+      (revertBtn ? '<div style="margin-top:4px">' + revertBtn + '</div>' : '') +
+      regenBox +
+      '</div>' +
+      metaBar +
+      actions +
+      '</div>';
+  }).join('');
+}
+
+function sendProposal(id) {
+  var textarea = document.getElementById('prop-reply-' + id);
+  var text = textarea ? textarea.value : '';
+  if (!text.trim()) { toast('Treść odpowiedzi jest pusta'); return; }
+  // Najpierw zapisz edycję
+  fetch('/api/proposals/' + id, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ proposed_reply: text })
+  }).then(function() {
+    return fetch('/api/proposals/' + id + '/send', { method: 'POST' });
+  }).then(function(r) { return r.json(); }).then(function(data) {
+    if (data.error) { toast('Błąd: ' + data.error); return; }
+    if (data.manual) {
+      navigator.clipboard.writeText(data.copy_text || '').catch(function(){});
+      toast('DM: Tekst skopiowany! Otwórz LinkedIn Messaging ✅', true);
+      window.open(data.url, '_blank');
+    } else {
+      toast('Wysłano komentarz! ✅', true);
+    }
+    loadProposals();
+  }).catch(function(e) { toast('Błąd: ' + e.message); });
+}
+
+function rejectProposal(id) {
+  if (!confirm('Odrzucić tę propozycję?')) return;
+  fetch('/api/proposals/' + id + '/reject', { method: 'POST' })
+    .then(function(r) { return r.json(); })
+    .then(function() { toast('Odrzucono', true); loadProposals(); })
+    .catch(function(e) { toast('Błąd: ' + e.message); });
+}
+
+function revertProposal(id) {
+  if (!confirm('Przywrócić oryginalną odpowiedź Claude?')) return;
+  fetch('/api/proposals/' + id + '/revert', { method: 'POST' })
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      if (data.error) { toast('Błąd: ' + data.error); return; }
+      var ta = document.getElementById('prop-reply-' + id);
+      if (ta) ta.value = data.proposed_reply || '';
+      toast('Przywrócono oryginał', true);
+      loadProposals();
+    }).catch(function(e) { toast('Błąd: ' + e.message); });
+}
+
+// „Twoja wskazówka → AI pisze treść" (Opus 4.8 + fact-check)
+function regenerateProposal(id) {
+  var hintEl = document.getElementById('prop-hint-' + id);
+  var btn = document.getElementById('prop-regen-' + id);
+  var ta = document.getElementById('prop-reply-' + id);
+  var hint = hintEl ? hintEl.value : '';
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ Opus 4.8 pisze…'; }
+  if (ta) ta.style.opacity = '0.5';
+  fetch('/api/proposals/' + id + '/regenerate', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ hint: hint })
+  }).then(function(r) { return r.json(); })
+    .then(function(d) {
+      if (d.error) { toast('Błąd: ' + d.error); return; }
+      if (ta) ta.value = d.proposed_reply || '';
+      if (d.status === 'blocked') toast('⚠️ Przepisano, ale fact-check oflagował: ' + (d.validation_notes || []).join(', '));
+      else toast('✅ Przepisane przez Opus 4.8' + (d.hint_used ? ' (wg wskazówki)' : ''), true);
+      loadProposals();
+    }).catch(function(e) { toast('Błąd: ' + e.message); })
+    .finally(function() {
+      if (btn) { btn.disabled = false; btn.textContent = '✨ Przepisz (Opus 4.8)'; }
+      if (ta) ta.style.opacity = '1';
+    });
+}
+
+var treeLoaded = {};
+function loadProposalTree(id) {
+  if (treeLoaded[id]) return;
+  treeLoaded[id] = true;
+  var box = document.getElementById('tree-' + id);
+  if (!box) return;
+  box.innerHTML = 'Ładuję...';
+  fetch('/api/proposals/' + id + '/context')
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      if (data.error) { box.innerHTML = '<span style="color:var(--red)">' + esc(data.error) + '</span>'; return; }
+      var html = '';
+      html += '<div style="margin-bottom:8px"><b>Autor postu:</b> ' + esc(data.post_author||'') + '</div>';
+      if (!data.tree || !data.tree.length) {
+        html += '<div style="color:var(--dim)">(brak komentarzy w drzewku — backfill nie zescrapował tego wątku)</div>';
+      } else {
+        data.tree.forEach(function(c) {
+          var indent = c.depth > 0 ? 'margin-left:24px;border-left:2px solid var(--brd);padding-left:8px' : '';
+          var bg = c.is_target ? 'background:rgba(255,200,0,0.15);' : '';
+          var label = c.is_our_comment ? '<span style="color:var(--grn)">[TY] </span>' : (c.is_target ? '<span style="color:var(--yel)">[ODPOWIADASZ] </span>' : '');
+          var when = c.comment_created_at ? '<span style="color:var(--dim);font-size:10px;margin-left:6px">' + esc((c.comment_created_at||'').slice(0,16)) + '</span>' : '';
+          html += '<div style="' + indent + bg + 'padding:6px 8px;margin:4px 0;border-radius:4px">' +
+            '<div>' + label + '<b>' + esc(c.author_name||'?') + '</b>' + when + '</div>' +
+            '<div style="margin-top:2px;color:var(--txt);white-space:pre-wrap;font-size:11px">' + esc(c.comment_text||'') + '</div>' +
+            '</div>';
+        });
+      }
+      box.innerHTML = html;
+    }).catch(function(e) { box.innerHTML = '<span style="color:var(--red)">Błąd: ' + esc(e.message) + '</span>'; });
+}
+
+function esc(s) { return (s||'').replace(/[<>&"]/g, function(c) { return {'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[c]; }); }
 `;
 }
 

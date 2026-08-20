@@ -1,7 +1,26 @@
 {
-  "version": "2.0",
-  "updated": "2025-09-26",
-  "source": "LinkedIn Algorithm Strategy — Bartosz Gaca & AI Assistant",
+  "version": "3.0",
+  "updated": "2026-06-18",
+  "source": "LinkedIn Growth Playbook — Bartosz Gaca. Oparte na realnych danych konta (analytics.db) + przetestowanych wnioskach (post #11). Pełna wersja: guidelines/GROWTH-PLAYBOOK.md",
+
+  "positioning": {
+    "one_liner": "Buduję cyfrowe narzędzia dla polskich firm — od MVP po automatyzacje. Pokazuję jak, na żywym kodzie.",
+    "goal": "Leady B2B (MVP, doradztwo, projekty, strony, automatyzacje). NIE BeeCommerce.",
+    "language_split": "PL 80% (pipeline) / EN 20% (zasięg + social proof)",
+    "niches": [
+      "A — AI automation (boty WhatsApp/FAQ, voicedoc, agent-pack, gacek CLI)",
+      "B — polskie dane publiczne / e-gov (ZUS MCP, KSeF, IRZplus, odpisznapismo)",
+      "C — opinie/doradztwo lead-gen (CRM, MVP, klient vs dane, wycinanie z briefu)"
+    ],
+    "rule": "≥80% postów w nisze A/B/C. Spójność tematyczna > częstotliwość (3 posty/tydz w jednym temacie biją 5 o wszystkim)."
+  },
+
+  "content_pillars": [
+    { "pillar": "Porażka / lekcja", "function": "trust", "cadence": "1x/tydz — zbiera najdłuższe komentarze" },
+    { "pillar": "Gotowe rozwiązanie", "function": "lead magnet", "cadence": "1x/tydz — z realnym screenem" },
+    { "pillar": "Opinia rynkowa", "function": "zasięg/kontrowersja", "cadence": "1x/tydz — magnet wtorkowy" },
+    { "pillar": "Behind the scenes", "function": "pipeline visibility", "cadence": "rotacyjnie" }
+  ],
 
   "algorithm": {
     "ranking_factors": [
@@ -27,26 +46,26 @@
 
   "copywriting": {
     "hook_rules": [
-      "Pierwsze 210 znaków widoczne przed 'zobacz więcej' — to decyduje o kliknięciu",
-      "Używaj statystyk: 'Czy wiesz, że 90% XYZ...'",
-      "Używaj kontrastu: 'Popełniłem błąd, który kosztował mnie 100 tys...'",
-      "Używaj wyobraźni: 'Wyobraź sobie, że...'",
-      "Unikaj clickbaitu — obietnica musi być spełniona w treści"
+      "Hook <100 znaków, w pierwszej linijce. Problem albo PORAŻKA pierwsza, nie sukces.",
+      "Stwierdzenie + zwrot: 'ZUS nie ma publicznego API. Więc je zbudowałem.'",
+      "Konkretna liczba lub fakt, nie ogólnik: '122 grupy. Codzienne podsumowania.'",
+      "NIE clickbait ('Czy wiesz, że 85%...', 'Nie uwierzysz...') — Twoja publika to wyłapuje.",
+      "Obietnica spełniona w treści. Zero baitu."
     ],
-    "structure": "Hook → wartość → rozwinięcie → CTA",
+    "structure": "Hook (problem) → konkret/stack → zwrot/lekcja → pytanie zamknięte",
     "style_rules": [
-      "Krótkie akapity, dużo enterów",
-      "Emotikony jako punktor (👉, ✅, ❌) — ale nie przesadzaj",
-      "Krótkie zdania, bez żargonu",
-      "Konkret — bez lania wody",
-      "90% wartość, 10% autopromocja",
+      "Krótkie zdania, dużo enterów, jedna myśl = jeden akapit",
+      "BEZ emoji jako punktorów. BEZ myślnika-efekciarza. BEZ 'nie tylko... ale i...'. BEZ trójdzielnych wyliczeń na siłę. (reguły humanizera)",
+      "Zero korpo-żargonu. Mów jak człowiek do człowieka.",
+      "Konkret + liczba + realny stack. Bez lania wody.",
+      "Pokazuj porażki — szczerość odróżnia od agencji",
       "Storytelling > sucha informacja"
     ],
-    "tone": "Profesjonalny, ale ludzki. Mów do 'Ty', nie do 'Państwo'",
+    "tone": "Builder z dowodami. Mów do 'Ty'. Pewny, ale nie sprzedażowy.",
     "optimal_length": {
-      "min_chars": 1300,
-      "max_chars": 1600,
-      "note": "Najwyższy engagement rate w tym przedziale"
+      "min_chars": 400,
+      "max_chars": 1400,
+      "note": "Punchy (~400-700) dla opinii/lekcji, dłuższy (~1300) dla build-in-public z opisem stacku. Twój top post był krótki i mocny."
     }
   },
 
@@ -57,9 +76,9 @@
       "tip": "potrzebny mocny hook i formatowanie"
     },
     "image": {
-      "best_for": "ogłoszenia, grafiki, cytaty, podsumowania",
-      "pros": "przyciąga uwagę, 2x więcej komentarzy",
-      "tip": "użyj 2-9 obrazów — multi image = top ER"
+      "best_for": "build-in-public: realny screenshot (terminal, panel, dashboard, rozmowa bota)",
+      "pros": "autentyczny screen buduje wiarygodność i dwell time",
+      "tip": "AUTENTYCZNY SCREEN, nie Canva. Twój test #11: generowane bannery zbijają zasięg jak generykowi. Posty koncepcyjne (opinia/anegdota bez realnej apki) idą CZYSTYM TEKSTEM — nie podstawiaj generowanego stat-cardu ani cudzego screena (fałszywa atrybucja)."
     },
     "pdf_carousel": {
       "best_for": "instrukcje krok-po-kroku, poradniki, checklists",
@@ -119,46 +138,50 @@
 
   "dos_and_donts": {
     "dos": [
-      "Komentuj u innych 10-15 min przed publikacją",
-      "Buduj relacje, nie tylko nadawaj",
-      "Używaj storytellingu, emocji, konkretnych przykładów",
-      "Testuj różne formaty (PDF, wideo, tekst)",
-      "Bądź dostępny w golden hour",
-      "Publikuj regularnie o jednym temacie (autorytet)"
+      "Komentuj u 3-5 innych 10-15 min PRZED publikacją (rozgrzewa zasięg)",
+      "Odpowiadaj na KAŻDY komentarz w golden hour, min. 2 zdania + dopytanie (przedłuża wątek)",
+      "Pokazuj realny screen (terminal/panel), nie generowaną grafikę",
+      "Planuj 1 post o PORAŻCE/tydz — zbiera najdłuższe komentarze",
+      "Trzymaj 2 nisze (AI automation + e-gov) — spójność > częstotliwość",
+      "Pierwszy komentarz autora po 15 min: link/screen + konkret do dyskusji"
     ],
     "donts": [
-      "Nie wrzucaj linków w treść posta",
-      "Nie taguj losowych ludzi",
-      "Nie publikuj 2 postów w ciągu 12h",
-      "Nie ignoruj komentarzy",
-      "Nie edytuj posta tuż po publikacji",
-      "Nie używaj engagement baitu ('Skomentuj TAK')",
-      "Nie używaj >5 hashtagów"
+      "Nie wrzucaj linków w treść posta (link do komentarza po 15-30 min)",
+      "Nie używaj generowanych banerów/Canvy — zbijają zasięg (test #11)",
+      "Nie miksuj 5 różnych CTA — jeden system (lustro/soft-lead/trigger)",
+      "Nie zadawaj pytań otwartych 'Co myślisz?' — konkretne i zamknięte",
+      "Nie skacz po tematach — algorytm karze rozjazd tematyczny",
+      "Nie taguj losowych ludzi, nie używaj engagement baitu, nie publikuj 2x/12h",
+      "Nie używaj >3 hashtagów, nie edytuj w golden hour"
     ]
   },
 
   "hooks": [
-    "Czy wiesz, że 85% XYZ…",
-    "Nie uwierzysz, co zrobił mój klient…",
-    "90% leadów ginie z TEGO powodu…",
-    "Popełniłem błąd — kosztował mnie 30K…",
-    "Wyobraź sobie: dostajesz DM z…",
-    "Czy wiesz, że 90% XYZ…",
-    "Popełniłem błąd, który kosztował mnie 100 tys…",
-    "Wyobraź sobie, że…",
-    "3 lata temu nie wiedziałem, że…",
-    "Wszyscy mówią o X. Ale nikt nie mówi o…"
+    "ZUS nie ma publicznego API. Więc je zbudowałem.",
+    "IRZplus nie ma API. Nikt ci tego nie powie wprost.",
+    "Klient powiedział że nie potrzebuje MVP.",
+    "Spędziłem tydzień na automatyzacji. Klient używał jej 2 razy.",
+    "8 firm zapytałem ostatnio o CRM. Żadna nie korzystała z połowy funkcji.",
+    "Mój WhatsApp odpowiada za mnie od miesięcy.",
+    "Klient: 'Zrobisz mi landing z wideo na dziś?' Odpowiedź: tak.",
+    "Większość polskich firm myśli, że [błędne przekonanie]. To nieprawda.",
+    "[LICZBA] [jednostka] [efekt dla klienta]. Oto jak."
   ],
 
+  "cta_system": {
+    "rule": "JEDEN system, nie miks. Rotacja 3 typów zależnie od filaru.",
+    "types": [
+      { "type": "pytanie-lustro", "when": "każdy post (domyślny)", "goal": "komentarze", "example": "Po jakim czasie wracają u Was briefy z 'dodajmy slider'?", "note": "Konkretne i ZAMKNIĘTE. 'Co myślisz?' = martwe." },
+      { "type": "soft-lead", "when": "1x/tydz, posty 'gotowe rozwiązanie'", "goal": "kwalifikacja", "example": "Robisz integracje X? DM otwarty." },
+      { "type": "trigger-slowo", "when": "max 1x/2 tyg (ociera się o bait)", "goal": "komentarze + DM", "example": "Napisz 'PRZEGLĄD' — zrobię bezpłatną 20-min analizę." }
+    ],
+    "never": ["Zostaw 👍 jeśli pomocne", "Oznacz znajomego", "Skomentuj TAK"]
+  },
+
   "ctas": [
-    "Co o tym myślisz? Komentarz mile widziany.",
-    "Masz podobne doświadczenie? Podziel się.",
-    "Znasz kogoś, komu to się przyda? Oznacz.",
-    "Chcesz PDF? Napisz DM.",
-    "Zostaw 👍 jeśli to pomocne.",
-    "Co o tym sądzisz?",
-    "Masz inne doświadczenie?",
-    "Znasz kogoś, komu to się przyda?"
+    "Pytanie-lustro (konkretne, zamknięte): 'Po jakim czasie wracają u Was briefy z dodajmy slider?'",
+    "Soft-lead: 'Robisz integracje X? DM otwarty.'",
+    "Trigger-słowo (max 1x/2 tyg): 'Napisz PRZEGLĄD — zrobię bezpłatną 20-min analizę.'"
   ],
 
   "checklist": [

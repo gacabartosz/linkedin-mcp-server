@@ -8,7 +8,7 @@
     { "name": "confession", "description": "Opening admission — first 210 chars before 'see more'. E.g. 'I made a mistake that cost me 100K...'", "required": true },
     { "name": "mistake", "description": "What went wrong and why — be honest and specific", "required": true },
     { "name": "lesson", "description": "What you learned from it — the real value for the reader", "required": true },
-    { "name": "advice", "description": "Actionable advice + engagement question. E.g. 'What's the biggest lesson you learned the hard way?'", "required": true },
+    { "name": "advice", "description": "Actionable advice + one closed, take-a-side question, e.g. 'Would you have owned the mistake publicly or fixed it quietly?'.", "required": true },
     { "name": "hashtags", "description": "1-3 precise hashtags. Never more than 3.", "required": false, "default": "" }
   ],
   "tips": [

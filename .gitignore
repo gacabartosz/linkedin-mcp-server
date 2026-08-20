@@ -12,3 +12,22 @@ dist/
 .ralph/.loop_start_sha
 .ralph/.ralph_session*
 .ralph/progress.json
+.ralph/.claude_session_id
+.ralph/.response_analysis
+
+# Lokalny runtime config (prywatne ścieżki/projekty) — w repo jest .example
+guidelines/idea-engine.config.json
+
+# Generowane / artefakty / wewnętrzne (NIE do publicznego repo)
+output/
+skills-cleanup/
+.playwright-mcp/
+*.bak
+*.bak-v1-broken-scrape
+*.bak-v2
+INCIDENT-*.md
+scripts/insert-post-2026-06-08.mjs
+
+# zawiera sekrety OAuth — nigdy do repo (remote publiczny)
+.mcp.json
+.mcp.json.bak*
