@@ -1,0 +1,119 @@
+{
+  "version": "2026.08.1",
+  "updated": "2026-08-10",
+  "purpose": "JEDYNE zrodlo prawdy o grupie docelowej. Wczesniej ICP bylo rozsiane po 8 miejscach (algorithm-2026.json, linkedin-strategy.json, idea-engine.config.json, kolumna media_plan_items.icp, GROWTH-PLAYBOOK, MEDIA-PLAN-CONTENT-2026, content-plan-leadgen-2026-07, brand-voice.json) i w bazie zylo ~20 roznych person. Efekt: silnik nie wiedzial, dla kogo pisze, wiec pisal dla wszystkich, a zasieg lapali deweloperzy zamiast klientow. Te pliki maja czytac stad, nie definiowac wlasnych nisz.",
+  "goal": "KLIENCI I CIEPLE LEADY. Nie zasieg, nie followersi, nie oklaski od peerow.",
+  "metric": "liczba rozmow sprzedazowych z LinkedIna (tabela analytics.db -> conversations)",
+
+  "lanes": {
+    "K": {
+      "name": "Klient MSP",
+      "share": 0.8,
+      "cadence_days": ["wt", "czw"],
+      "source": "content-plan-leadgen-2026-07.md §1 (filtr twardy)",
+      "qualify": {
+        "roles": ["wlasciciel", "wspolnik", "dyrektor operacyjny"],
+        "market": "Polska: produkcja, handel, uslugi, agencja",
+        "must_have": "powtarzalny RECZNY proces (wyceny, reklamacje, raporty, przepisywanie danych, odpowiedzi na maile)",
+        "budget_min_monthly_pln": 3000,
+        "budget_min_oneoff_pln": 15000,
+        "decision_makers_max": 2
+      },
+      "disqualify": [
+        "studenci i 'AI enthusiasts', pytania 'jakiego kursu uzyc'",
+        "rekruterzy i agencje HR",
+        "korporacje z procesem zakupowym na 6 miesiecy",
+        "znajomi i rodzina (twarda regula: zadnych projektow zaleznych od znajomych)"
+      ],
+      "qualifying_signal": "ktos w komentarzu opisuje WLASNY proces ('u nas wyceny robi Pani Ania w excelu'). To cieply lead. Wszystko inne to publika.",
+      "lead_handling": {
+        "response_sla_hours": 24,
+        "first_reply": "2 zdania + dopytanie o skale: 'Ile takich [wycen/reklamacji/raportow] robicie miesiecznie? Bo ponizej ~20/mies automat rzadko sie spina, powyzej prawie zawsze.'",
+        "followups_max": 2
+      },
+      "personas": [
+        { "key": "firma-lokalna-uslugowa", "label": "wlasciciel firmy lokalnej lub uslugowej", "article": "a1-strona-dla-firm" },
+        { "key": "zamowienia-w-arkuszu", "label": "wlasciciel firmy z zamowieniami w arkuszu lub zeszycie", "article": "a2-crm-czy-potrzebny" },
+        { "key": "obsluga-reklamacji", "label": "sklep, e-commerce, producent obslugujacy reklamacje", "article": "a3-reklamacje-ai" },
+        { "key": "planuje-strone", "label": "firma planujaca strone, porownujaca oferty", "article": "a4-ile-kosztuje-strona" },
+        { "key": "dane-osobowe", "label": "firma pracujaca z danymi osobowymi klientow", "article": "a5-anonimizacja-przed-ai" },
+        { "key": "magazyn", "label": "e-commerce, hurtownia, firma z magazynem", "article": "a6-wms-magazyn" },
+        { "key": "po-nieudanej-cyfryzacji", "label": "firma po nieudanej cyfryzacji", "article": "a7-automatyzacja-ktorej-nikt-nie-uzywa" }
+      ],
+      "banned_jargon": [
+        "MCP", "LLM", "RAG", "pipeline", "stack", "deploy", "endpoint", "API",
+        "webhook", "repo", "commit", "framework", "backend", "frontend",
+        "prompt injection", "fine-tuning", "embedding", "vector", "self-hosted",
+        "open source", "SaaS", "CI/CD", "Docker", "launchd", "cron"
+      ],
+      "banned_jargon_note": "Na torze K wolno uzywac WYLACZNIE narzedzi, ktore klient zna z wlasnego biurka: Excel, WhatsApp, Google, e-mail, telefon, PDF. Nazwa techniczna w poscie dla wlasciciela tartaku = sygnal 'to nie do mnie'. Jesli termin jest niezbedny, opisz go po ludzku ('program, ktory czyta faktury') zamiast nazywac.",
+      "proof_types": [
+        "zanonimizowany zrzut dzialajacej strony lub panelu",
+        "liczba godzin przed i po",
+        "kwota w zlotowkach",
+        "liczba sztuk miesiecznie"
+      ],
+      "cta_patterns": [
+        "pytanie-lustro: zamkniete, konkretne pytanie, na ktore wlasciciel firmy ma wlasna odpowiedz z zycia (kazdy post)",
+        "soft-lead: 'Masz podobny proces u siebie? DM otwarty.' (1x/tydzien, w postach case-story)",
+        "trigger-slowo: 'Napisz PRZEGLAD w komentarzu, zrobie bezplatna 20-minutowa analize jednego procesu.' (max 1x/2 tygodnie, ociera sie o bait)"
+      ]
+    },
+
+    "P": {
+      "name": "Partner / podwykonawstwo",
+      "share": 0.2,
+      "cadence_days": ["pt"],
+      "qualify": {
+        "roles": ["wlasciciel agencji", "software house", "tech lead", "CTO"],
+        "must_have": "zapchany backlog albo brak kompetencji AI w zespole",
+        "engagement": "podwykonawstwo projektowe lub godzinowe"
+      },
+      "personas": [
+        { "key": "agencja-podwykonawstwo", "label": "agencja lub software house szukajacy podwykonawcy od AI" }
+      ],
+      "banned_jargon": [],
+      "proof_types": ["architektura rozwiazania", "repo", "case z liczbami", "czas wdrozenia"],
+      "cta_patterns": ["'Mam wolne moce od [miesiac]. Odezwij sie, jesli macie temat AI, ktorego nie ma kto wziac.'"]
+    }
+  },
+
+  "tie_breaker": "Gdy post pasuje do obu torow, wybieramy K. Tor P ma jeden slot tygodniowo i ani jednego wiecej.",
+
+  "hard_gates": {
+    "jargon_on_lane_K": {
+      "hold": true,
+      "reason": "Zargon na torze K odsiewa wlasnie tych, ktorych chcemy zlapac. Slowo z banned_jargon w poscie lane=K -> HOLD."
+    },
+    "peer_flex": {
+      "hold": true,
+      "patterns": [
+        "opis TEGO, CO ZBUDOWALEM, bez odpowiedzi CO KLIENT Z TEGO MA",
+        "liczenie wlasnych systemow, botow, repo, linijek kodu",
+        "war story o wlasnym narzedziu, w ktorym klient nie wystepuje"
+      ],
+      "reason": "Peer-flex buduje publicznosc, ktora nic nie kupi. Dwa najwieksze zasiegi w historii profilu (31151 i 13633 wyswietlen) byly dla deweloperow i nie przynioslly ani jednego klienta."
+    },
+    "media_required": {
+      "hold": true,
+      "reason": "Kazdy post i kazdy artykul musi miec obraz, karuzele albo wideo. Historycznie 5 na 99 opublikowanych postow mialo realnie wgrane medium. Wyjatek tylko przez swiadome text_only_ok=1."
+    }
+  },
+
+  "banned_topics": [
+    { "topic": "AplikantAI", "reason": "off-limits biznesowo" },
+    { "topic": "MCP do ZUS", "reason": "nie istnieje, byla halucynacja" },
+    { "topic": "IRZplus bez API / reverse engineering", "reason": "nieprawda, IRZplus MA API" },
+    { "topic": "zero telefonow z fb-hala-poster", "reason": "nieprawda, telefony byly" },
+    { "topic": "Gacek (polski CLI z Bielikiem)", "reason": "juz opublikowane" },
+    { "topic": "Jupiter, tartak-pilarski", "reason": "projekty poufne" },
+    { "topic": "repozytoria i dane klientow", "reason": "ryzyko wycieku tozsamosci klienta" }
+  ],
+
+  "link_policy": {
+    "in_post": false,
+    "in_first_comment": false,
+    "in_article_body": true,
+    "note": "Link w pierwszym komentarzu jest ZAKAZANY (~80% kary, sanitizeComment go wycina). Uwaga na konflikt zrodel: content-plan-leadgen-2026-07.md §2 mowi 'link zawsze w 1. komentarzu' — to STARSZA regula, uniewazniona przez CHECKLIST-SPRAWDZANIA-POSTOW.md z 2026-07-21. Link do oferty wolno wstawic w tresci artykulu."
+  }
+}

@@ -11,7 +11,7 @@
  *   WERDYKT        — approved (tekst podmieniony, oryginał w text_original, score w qa_scores)
  *                    albo hold (niekompletny / halucynacja / za mało przeżycia → NIE publikuje)
  *
- * Mechanika AI = `claude` CLI headless (Opus 4.8 + WebSearch) — bez ANTHROPIC_API_KEY.
+ * Mechanika AI = `claude` CLI headless (Sonnet + WebSearch) — bez ANTHROPIC_API_KEY.
  * Wzorzec z content-quality-agent.
  *
  * Reguły jakości: guidelines/algorithm-2026.json (+ ~/.linkedin-mcp/brand-voice.json).
@@ -35,6 +35,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const DB_PATH = join(homedir(), '.linkedin-mcp', 'scheduler.db');
 const BRAND_VOICE_PATH = join(homedir(), '.linkedin-mcp', 'brand-voice.json');
 const ALGO_PATH = join(__dirname, 'guidelines', 'algorithm-2026.json');
+const ICP_PATH = join(__dirname, 'guidelines', 'icp.json');
 const CLAUDE = '/Users/gaca/.local/bin/claude';
 
 const args = process.argv.slice(2);
@@ -53,6 +54,29 @@ function notify(title, body) {
 
 const brand = JSON.parse(readFileSync(BRAND_VOICE_PATH, 'utf8'));
 const algo = JSON.parse(readFileSync(ALGO_PATH, 'utf8'));
+// guidelines/icp.json — JEDYNE źródło prawdy o grupie docelowej (patrz jego pole "purpose").
+const icp = JSON.parse(readFileSync(ICP_PATH, 'utf8'));
+
+// Tor posta: kolumna scheduled_posts.lane. Brak wartości = K, bo tor klienta jest
+// domyślny (80%) i ostrzejszy — lepiej zatrzymać post do przeglądu niż wypuścić żargon.
+function laneOf(post) {
+  const l = String(post.lane || '').toUpperCase();
+  return l === 'P' ? 'P' : 'K';
+}
+
+// Deterministyczny wykrywacz żargonu (bez LLM, jak lib/humanize.mjs).
+// Granice słowa \b nie działają na polskie znaki w JS, więc rozdzielamy ręcznie.
+function jargonHits(text, lane) {
+  const banned = icp.lanes?.[lane]?.banned_jargon || [];
+  if (!banned.length) return [];
+  const hits = [];
+  for (const w of banned) {
+    const esc = w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const re = new RegExp(`(^|[^\\p{L}\\p{N}])${esc}($|[^\\p{L}\\p{N}])`, 'iu');
+    if (re.test(text)) hits.push(w);
+  }
+  return hits;
+}
 
 // Rozpoznaj format posta z kolumn DB (media_kind / banner_preset / media_preview_path).
 function detectFormat(post) {
@@ -66,8 +90,10 @@ function detectFormat(post) {
   return { kind, isGenBanner };
 }
 
-function buildPrompt(text, fmt) {
+function buildPrompt(text, fmt, lane = 'K') {
   const T = algo.scoring.thresholds;
+  const laneCfg = icp.lanes?.[lane] || {};
+  const peerFlex = icp.hard_gates?.peer_flex?.patterns || [];
   const fmtRules = (algo.formats[fmt.kind]?.requires) || [];
   const fit = algo.audience_fit || {};
   const targetLang = fit.language?.target || 'pl';
@@ -127,6 +153,13 @@ a) JĘZYK: wykryj język TREŚCI i zwróć go w polu language jako 2-literowy ko
 b) NISZA: czy temat mieści się w niszy konta? W niszy: ${nicheTopics.join(' | ')}. Poza niszą (ustaw onNiche=false): ${offNiche.join(' | ')}. Zwróć onNiche (true/false) oraz topic (1-3 słowa: o czym jest post). Jeśli off-niche temat jest realnie powiązany z własną robotą AI/automatyzacją autora — onNiche=true.
 c) BAIT: ustaw bait=true i wypisz konkretne frazy w baitIssues, jeśli post zawiera engagement-bait / lead-magnet / odsyłanie po link do komentarza: ${baitPatterns.join(' | ')}.
 
+ZADANIE 8 — TOR ODBIORCY (guidelines/icp.json). Ten post jest na torze ${lane}: ${laneCfg.name || lane}.
+Odbiorca: ${JSON.stringify(laneCfg.qualify || {})}
+Dowód, jaki ten odbiorca uznaje: ${(laneCfg.proof_types || []).join(' | ')}
+PEER-FLEX (ustaw peerFlex=true i wypisz frazy w peerFlexIssues): post opisuje, CO AUTOR ZBUDOWAŁ, ale nie odpowiada, CO Z TEGO MA KLIENT. Wzorce: ${peerFlex.join(' | ')}.
+Peer-flex buduje publiczność, która nic nie kupi — dwa największe zasięgi w historii tego profilu były dla deweloperów i nie przyniosły ani jednego klienta.
+UWAGA: post o własnym narzędziu NIE jest peer-flexem, jeśli pokazuje problem klienta i efekt u klienta. Rozstrzyga obecność klienta w historii, nie temat.
+
 ═══ WERDYKT (oblicz uczciwie) ═══
 - approved=false jeśli complete=false (niekompletny/wadliwy).
 - approved=false jeśli jest realna type="hallucination".
@@ -134,11 +167,12 @@ c) BAIT: ustaw bait=true i wypisz konkretne frazy w baitIssues, jeśli post zawi
 - approved=false jeśli język treści ≠ ${targetLang} (profil polskojęzyczny — post w innym języku zakopuje zasięg).
 - approved=false jeśli post jest poza niszą konta (onNiche=false).
 - approved=false jeśli bait=true (engagement-bait / lead-magnet / odsyłanie po link do komentarza — LinkedIn to zakopuje).
+- approved=false jeśli peerFlex=true (post dla peerów, nie dla klienta).
 - W przeciwnym razie approved=true.
 - type="private"/"ok" nie blokują. type="unverifiable" nie blokuje, ale dopisz ostrzeżenie w summary.
 
 Na końcu wypisz WYŁĄCZNIE surowy JSON (bez markdown, bez \`\`\`), dokładnie wg schematu:
-{"complete": true|false, "completenessIssues": ["..."], "humanizedText": "<przepisany tekst>", "factIssues": [{"claim":"...","type":"ok|hallucination|unverifiable|private","evidence":"...","sourceUrl":"..."}], "scores": {"experience": 0, "emotion": 0, "specificity": 0, "commentability": 0, "saveability": 0}, "formatOk": true|false, "formatNotes": ["..."], "linkJustified": true|false, "language": "pl", "onNiche": true|false, "topic": "<1-3 słowa>", "bait": true|false, "baitIssues": ["..."], "approved": true|false, "holdReason": "<konkretny feedback po polsku albo pusty string>", "summary": "<1 zdanie po polsku>"}
+{"complete": true|false, "completenessIssues": ["..."], "humanizedText": "<przepisany tekst>", "factIssues": [{"claim":"...","type":"ok|hallucination|unverifiable|private","evidence":"...","sourceUrl":"..."}], "scores": {"experience": 0, "emotion": 0, "specificity": 0, "commentability": 0, "saveability": 0}, "formatOk": true|false, "formatNotes": ["..."], "linkJustified": true|false, "language": "pl", "onNiche": true|false, "topic": "<1-3 słowa>", "bait": true|false, "baitIssues": ["..."], "peerFlex": true|false, "peerFlexIssues": ["..."], "approved": true|false, "holdReason": "<konkretny feedback po polsku albo pusty string>", "summary": "<1 zdanie po polsku>"}
 
 TEKST POSTA DO OBRÓBKI:
 <<<POST
@@ -149,6 +183,7 @@ POST>>>`;
 function runClaude(prompt) {
   const r = spawnSync(CLAUDE, [
     '-p', prompt,
+    '--model', 'sonnet',
     '--output-format', 'json',
     '--allowedTools', 'WebSearch', 'WebFetch',
     '--permission-mode', 'acceptEdits',
@@ -173,7 +208,7 @@ function runClaude(prompt) {
 function processPost(db, post) {
   const fmt = detectFormat(post);
   log(`QA → ${post.id} (${post.text.length} zn., format=${fmt.kind}${fmt.isGenBanner ? '/gen-banner' : ''})`);
-  const verdict = runClaude(buildPrompt(post.text, fmt));
+  const verdict = runClaude(buildPrompt(post.text, fmt, laneOf(post)));
 
   // Deterministyczny humanizer NA WYJŚCIU modelu — gwarancja, że myślniki i
   // artefakty AI znikną niezależnie od tego, czy LLM posłuchał promptu. URL-e i
@@ -181,6 +216,20 @@ function processPost(db, post) {
   // na tekście realnie idącym do publikacji. Wyłączalne flagą brand-voice.humanize.
   if (typeof verdict.humanizedText === 'string') {
     verdict.humanizedText = humanizeText(verdict.humanizedText, { enabled: brand.humanize !== false });
+  }
+
+  // Bezpiecznik anty-fabrykacja (incydent 13.07.2026: rewriter dopisał zmyśloną
+  // scenę "zadzwonił telefon" mimo zakazu w prompcie). Jeśli przepisany tekst
+  // zawiera liczby, których nie ma w oryginale — LLM coś dorobił. Wtedy do bazy
+  // idzie ORYGINAŁ (po humanizerze), a różnica ląduje w logu do ręcznej oceny.
+  if (typeof verdict.humanizedText === 'string' && verdict.humanizedText.trim()) {
+    const nums = (s) => new Set((s.match(/\d+(?:[.,]\d+)?/g) || []).map(n => n.replace(',', '.')));
+    const orig = nums(post.text);
+    const added = [...nums(verdict.humanizedText)].filter(n => !orig.has(n));
+    if (added.length) {
+      log(`   ⚠ rewriter dopisał liczby spoza oryginału (${added.join(', ')}) — odrzucam przeróbkę, zapisuję oryginał`);
+      verdict.humanizedText = humanizeText(post.text, { enabled: brand.humanize !== false });
+    }
   }
 
   // --- Zbierz sygnały ---
@@ -240,9 +289,22 @@ function processPost(db, post) {
   const isBait = verdict.bait === true || baitIssues.length > 0;
   const baitOk = fit.bait?.hold_on_bait !== true ? true : !isBait;
 
+  // --- Bramki ICP (guidelines/icp.json): żargon i peer-flex ---
+  // Żargon liczymy deterministycznie na tekście PO przepisaniu (to on pójdzie w świat),
+  // bo model potrafi wpisać "MCP" z powrotem podczas humanizacji.
+  const lane = laneOf(post);
+  const textForGate = (verdict.humanizedText || '').trim() || post.text;
+  const jargon = jargonHits(textForGate, lane);
+  const jargonOk = icp.hard_gates?.jargon_on_lane_K?.hold !== true ? true : jargon.length === 0;
+
+  const peerFlexIssues = Array.isArray(verdict.peerFlexIssues) ? verdict.peerFlexIssues : [];
+  const isPeerFlex = verdict.peerFlex === true || peerFlexIssues.length > 0;
+  // Peer-flex blokuje tylko tor K. Na torze P mówienie o własnych systemach jest sednem.
+  const peerFlexOk = (icp.hard_gates?.peer_flex?.hold !== true || lane !== 'K') ? true : !isPeerFlex;
+
   // --- Autorytatywny werdykt liczony w kodzie (nie ufamy ślepo modelowi) ---
   const approved = complete && completenessIssues.length === 0 && halluc.length === 0
-    && viralOk && !formatHardFail && languageOk && nicheOk && baitOk;
+    && viralOk && !formatHardFail && languageOk && nicheOk && baitOk && jargonOk && peerFlexOk;
   const humanized = (verdict.humanizedText || '').trim();
 
   // Powód HOLD (konkretny, żeby user wiedział co poprawić zamiast usuwać)
@@ -251,6 +313,8 @@ function processPost(db, post) {
   else if (!languageOk) holdReason = `Język treści ≠ ${targetLang.toUpperCase()} (wykryto: ${detLang || '?'}). Profil jest polskojęzyczny — post w innym języku zakopuje zasięg (dane z konta: posty EN = 0-4 kom. mimo 3k+ wyświetleń). Przepisz po polsku albo opublikuj ręcznie świadomie.`;
   else if (!nicheOk) holdReason = `Poza niszą konta${verdict.topic ? ` (temat: ${verdict.topic})` : ''}. ${fit.niche?.reason || 'Off-niche = rozjazd z tym, po co ludzie obserwują konto.'} Powiąż z własną robotą AI/automatyzacją albo nie publikuj.`;
   else if (!baitOk) holdReason = `Engagement-bait / lead-magnet: ${baitIssues.join('; ') || 'patrz summary'}. LinkedIn to zakopuje. Usuń wezwanie do komentarza/DM po magnet i nie odsyłaj po link do komentarza.`;
+  else if (!jargonOk) holdReason = `Żargon na torze K (klient MŚP): ${jargon.join(', ')}. ${icp.lanes.K.banned_jargon_note} Przepisz tak, żeby zrozumiał właściciel firmy bez działu IT, albo ustaw lane='P'.`;
+  else if (!peerFlexOk) holdReason = `Peer-flex: ${peerFlexIssues.join('; ') || 'post mówi, co zbudowałeś, ale nie mówi, co z tego ma klient'}. ${icp.hard_gates.peer_flex.reason} Dopisz konkretnego klienta, jego problem i efekt, albo ustaw lane='P'.`;
   else if (halluc.length) holdReason = `Fakt sprzeczny ze źródłem: ${halluc.map(h => h.claim).join('; ')}`;
   else if (!viralOk) holdReason = (verdict.holdReason && verdict.holdReason.trim())
     || `Za słaby pod algorytm (exp ${exp}/5, emo ${emo}/5, spec ${spec}/5, komentarzogenność ${comm}/5). Dopisz własną przeżytą scenę, konkretne liczby i jedno zamknięte pytanie-spór.`;
@@ -262,17 +326,20 @@ function processPost(db, post) {
     language: detLang || null, languageOk,
     onNiche, nicheOk, topic: verdict.topic || null,
     bait: isBait, baitIssues, baitOk,
+    lane, jargon, jargonOk, peerFlex: isPeerFlex, peerFlexIssues, peerFlexOk,
     format: fmt.kind, isGenBanner: fmt.isGenBanner, formatOk: verdict.formatOk !== false, formatNotes,
     linkJustified: verdict.linkJustified !== false,
     unverifiable: unver.map(u => u.claim),
     holdReason, at: new Date().toISOString(),
   };
 
-  log(`   verdict: ${approved ? 'APPROVED ✅' : 'HOLD ⛔'} | exp ${exp} emo ${emo} spec ${spec} comm ${comm} save ${save} (Σ${sum}) | lang=${detLang || '?'} niche=${onNiche ? 'ok' : 'OFF'} bait=${isBait ? 'YES' : 'no'} | complete=${complete} halluc=${halluc.length} | ${verdict.summary || ''}`);
+  log(`   verdict: ${approved ? 'APPROVED ✅' : 'HOLD ⛔'} | exp ${exp} emo ${emo} spec ${spec} comm ${comm} save ${save} (Σ${sum}) | tor=${lane} lang=${detLang || '?'} niche=${onNiche ? 'ok' : 'OFF'} bait=${isBait ? 'YES' : 'no'} zargon=${jargon.length} peerflex=${isPeerFlex ? 'YES' : 'no'} | complete=${complete} halluc=${halluc.length} | ${verdict.summary || ''}`);
   if (completenessIssues.length) for (const c of completenessIssues) log(`   ⚠ kompletność: ${String(c).slice(0, 90)}`);
   if (!languageOk) log(`   ✗ [język] treść ≠ ${targetLang.toUpperCase()} (wykryto ${detLang || '?'})`);
   if (!nicheOk) log(`   ✗ [nisza] off-niche: ${verdict.topic || '?'}`);
   if (isBait) for (const b of baitIssues) log(`   ✗ [bait] ${String(b).slice(0, 90)}`);
+  if (!jargonOk) log(`   ✗ [żargon/tor ${lane}] ${jargon.join(', ')}`);
+  if (!peerFlexOk) for (const p of peerFlexIssues) log(`   ✗ [peer-flex] ${String(p).slice(0, 90)}`);
   if (halluc.length) for (const h of halluc) log(`   ✗ [halucynacja] ${String(h.claim).slice(0, 90)}`);
   if (!approved && holdReason) log(`   → HOLD: ${holdReason.slice(0, 140)}`);
 

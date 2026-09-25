@@ -11,7 +11,7 @@
 import { createServer } from 'node:http';
 import { spawn, execSync } from 'node:child_process';
 import { readFileSync, existsSync, writeFileSync, statSync, readdirSync, mkdirSync, unlinkSync } from 'node:fs';
-import { join, extname, dirname } from 'node:path';
+import { join, extname, dirname, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 // Load .env from project root (for LINKEDIN_CLIENT_ID etc. when run via launchd)
@@ -522,7 +522,7 @@ function enrichPost(p) {
   return p;
 }
 
-const MIME = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.webp': 'image/webp', '.mp4': 'video/mp4', '.webm': 'video/webm', '.mov': 'video/quicktime' };
+const MIME = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.webp': 'image/webp', '.mp4': 'video/mp4', '.webm': 'video/webm', '.mov': 'video/quicktime', '.pdf': 'application/pdf' };
 
 // Iter2: katalog na uploaded/generated media per scheduled post
 const POSTS_MEDIA_DIR = join(IMG_DIR, 'posts');
@@ -603,6 +603,117 @@ async function handleRequest(req, res) {
       const data = readFileSync(filePath);
       res.writeHead(200, { 'Content-Type': mime, 'Cache-Control': 'public, max-age=3600' });
       res.end(data);
+      return;
+    }
+
+    // GET /api/articles/copy — gotowe artykuły .md (do wklejenia) jako JSON dla zakładki Artykuły
+    if (method === 'GET' && path === '/api/articles/copy') {
+      const ARTICLES_DIR = join(DATA_DIR, 'articles');
+      let out = [];
+      try {
+        for (const f of readdirSync(ARTICLES_DIR).filter(x => x.endsWith('.md')).sort()) {
+          const raw = readFileSync(join(ARTICLES_DIR, f), 'utf-8');
+          const [artPart, postsPart = ''] = raw.split(/\n===POSTY===\n/);
+          const body = artPart.trim();
+          const title = body.split('\n')[0].trim();
+          const posts = postsPart.trim() ? postsPart.trim().split(/\n(?=Post \d)/).map(s => s.trim()).filter(Boolean) : [];
+          out.push({ file: f, title, body, posts });
+        }
+      } catch {}
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify(out));
+      return;
+    }
+
+    // GET /publikacje — lista gotowych publikacji (folder na artykuł: index.html, artykul.html, okładka).
+    // Foldery buduje scripts/build-publikacja.mjs z pliku artykułu (jedno źródło prawdy).
+    if (method === 'GET' && (path === '/publikacje' || path === '/publikacje/')) {
+      const PUB_DIR = join(MCP_DIR, 'publikacje');
+      const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      let slugs = [];
+      try {
+        slugs = readdirSync(PUB_DIR, { withFileTypes: true })
+          .filter((d) => d.isDirectory() && existsSync(join(PUB_DIR, d.name, 'index.html')))
+          .map((d) => d.name)
+          .sort()
+          .reverse();
+      } catch {}
+      const cards = slugs.map((s) => {
+        let tytul = s;
+        try {
+          const m = readFileSync(join(PUB_DIR, s, 'index.html'), 'utf-8').match(/<h1>([\s\S]*?)<\/h1>/);
+          if (m) tytul = m[1].replace(/<[^>]*>/g, '').trim();
+        } catch {}
+        const hasCover = existsSync(join(PUB_DIR, s, 'okladka.png'));
+        return `<a class="pub" href="/publikacje/${encodeURIComponent(s)}/index.html">
+          ${hasCover ? `<img src="/publikacje/${encodeURIComponent(s)}/okladka.png" alt="">` : '<div class="noimg"></div>'}
+          <div class="t"><b>${esc(tytul)}</b><span>${esc(s)}</span></div></a>`;
+      }).join('');
+      const html = `<!doctype html><html lang="pl"><head><meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1"><title>Publikacje</title><style>
+      body{font-family:system-ui,Arial;max-width:1000px;margin:0 auto;padding:24px;background:#0d1b2a;color:#eaf1f8}
+      h1{margin:0 0 4px}a{color:#4db8ff}.hint{color:#8fa6bd;font-size:13px;margin-bottom:18px}
+      .pub{display:flex;gap:16px;align-items:center;background:#13233a;border:1px solid #24405c;
+        border-radius:14px;padding:14px;margin:12px 0;text-decoration:none;color:inherit}
+      .pub:hover{border-color:#3d6d99}.pub img,.noimg{width:200px;height:112px;object-fit:cover;
+        border-radius:9px;background:#0b1626;flex:none}
+      .t b{display:block;font-size:16px;line-height:1.35;margin-bottom:5px}
+      .t span{color:#8fa6bd;font-size:12px;font-family:ui-monospace,Menlo,monospace}
+      </style></head><body><h1>Publikacje</h1>
+      <p class="hint">Każda publikacja ma własny folder: artykuł do wklejenia z formatowaniem, posty z przyciskami Kopiuj i okładkę. &nbsp;<a href="/">powrót do dashboardu</a></p>
+      ${cards || '<p>Brak publikacji. Zbuduj: <code>node scripts/build-publikacja.mjs &lt;slug&gt;</code></p>'}
+      </body></html>`;
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(html);
+      return;
+    }
+
+    // GET /publikacje/<slug>/<plik> — serwuje pliki folderu publikacji
+    if (method === 'GET' && path.startsWith('/publikacje/')) {
+      const parts = path.slice('/publikacje/'.length).split('/').map(decodeURIComponent);
+      if (parts.length !== 2 || parts.some((p) => !p || p.includes('..') || p.includes('/'))) {
+        res.writeHead(403); res.end('Forbidden'); return;
+      }
+      const file = join(MCP_DIR, 'publikacje', parts[0], parts[1]);
+      if (!existsSync(file)) { res.writeHead(404); res.end('Not found'); return; }
+      const ext = extname(file).toLowerCase();
+      const mime = ext === '.html' ? 'text/html; charset=utf-8' : (MIME[ext] || 'application/octet-stream');
+      res.writeHead(200, { 'Content-Type': mime, 'Cache-Control': 'no-cache' });
+      res.end(readFileSync(file));
+      return;
+    }
+
+    // GET /artykuly — kopiowalne artykuły + propozycje postów (do ręcznego wklejenia na LinkedIn)
+    if (method === 'GET' && path === '/artykuly') {
+      const ARTICLES_DIR = join(DATA_DIR, 'articles');
+      const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      let files = [];
+      try { files = readdirSync(ARTICLES_DIR).filter(f => f.endsWith('.md')).sort(); } catch {}
+      const cards = files.map(f => {
+        const raw = readFileSync(join(ARTICLES_DIR, f), 'utf-8');
+        const [artPart, postsPart = ''] = raw.split(/\n===POSTY===\n/);
+        const body = artPart.trim();
+        const title = body.split('\n')[0].trim();
+        let posts = [];
+        if (postsPart.trim()) posts = postsPart.trim().split(/\n(?=Post \d)/).map(s => s.trim()).filter(Boolean);
+        const postsHtml = posts.map((p, i) =>
+          `<div class="post"><div class="ph">Propozycja postu ${i + 1}</div><textarea readonly>${esc(p)}</textarea><button onclick="cp(this)">Kopiuj post</button></div>`
+        ).join('') || '<i>brak propozycji</i>';
+        return `<div class="card"><h2>${esc(title)}</h2>
+          <div class="row"><b>Cały artykuł (wklej jako LinkedIn Article: 1. linia = tytuł)</b><button onclick="cp(this)">Kopiuj artykuł</button></div>
+          <textarea readonly class="art">${esc(body)}</textarea>
+          <h3>Propozycje postów-odprysków</h3>${postsHtml}
+          <div class="hint">Plik: ${esc(f)}</div></div>`;
+      }).join('');
+      const html = `<!doctype html><html lang="pl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Artykuly LinkedIn</title>
+      <style>body{font-family:system-ui,Arial;max-width:920px;margin:0 auto;padding:24px;background:#0d1b2a;color:#eaf1f8}h1{margin:0 0 4px}h2{font-size:20px;margin:.2em 0}h3{color:#9fb2c6;font-size:15px;margin:16px 0 6px}a{color:#4db8ff}.card{background:#13233a;border:1px solid #24405c;border-radius:14px;padding:18px;margin:18px 0}textarea{width:100%;min-height:120px;background:#0b1626;color:#dfe9f5;border:1px solid #2b405c;border-radius:10px;padding:10px;font:13px/1.55 ui-monospace,Menlo,monospace;box-sizing:border-box}textarea.art{min-height:360px}button{background:#2f5a3d;color:#e9f8ee;border:0;border-radius:8px;padding:8px 14px;cursor:pointer;font-weight:700}.row{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:6px}.post{margin:12px 0;border-top:1px solid #223a52;padding-top:8px}.ph{color:#4db8ff;font-weight:700;margin-bottom:4px}.hint{color:#7f93a6;font-size:12px;margin-top:8px}</style></head>
+      <body><h1>Artykuly LinkedIn</h1>
+      <p class="hint">Kliknij Kopiuj i wklej w LinkedIn. Artykul: New article, pierwsza linia = tytul, reszta = tresc, dodaj okladke (realny screen). Posty osobno. Instrukcja: guidelines/ARTYKULY-LINKEDIN-HOWTO.md &nbsp; <a href="/">powrot do dashboardu</a></p>
+      ${cards || '<p>Brak artykulow w ~/.linkedin-mcp/articles/</p>'}
+      <script>function cp(b){const c=b.closest('.post')||b.closest('.card');const t=c.querySelector('textarea');navigator.clipboard.writeText(t.value).then(function(){const o=b.textContent;b.textContent='Skopiowano';setTimeout(function(){b.textContent=o},1200)})}</script>
+      </body></html>`;
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(html);
       return;
     }
 
@@ -1120,14 +1231,31 @@ async function handleRequest(req, res) {
       if (parts.length !== 2 || parts[0].includes('..') || parts[1].includes('..') || parts[1].includes('/')) {
         res.writeHead(403); res.end('Forbidden'); return;
       }
+      try { parts[1] = decodeURIComponent(parts[1]); } catch {}
+      if (parts[1].includes('..') || parts[1].includes('/')) { res.writeHead(403); res.end('Forbidden'); return; }
       let filePath = join(POSTS_MEDIA_DIR, parts[0], parts[1]);
       if (!existsSync(filePath)) {
-        // Fallback: spróbuj ~/.linkedin-mcp/images/posts/<filename>
+        // Fallback 1: ~/.linkedin-mcp/images/posts/<filename>
         const altPath = join(homedir(), '.linkedin-mcp', 'images', 'posts', parts[1]);
         if (existsSync(altPath)) {
           filePath = altPath;
         } else {
-          res.writeHead(404); res.end('Not found'); return;
+          // Fallback 2 (fix 2026-07-04): media_preview_path z DB posta — pokrywa
+          // absolutne ścieżki typu images/posts/screens/… (dotąd 404 → puste preview).
+          // Serwuj tylko gdy basename z URL zgadza się z basename z bazy.
+          let dbPath = null;
+          try {
+            const db = getDb();
+            const row = db.prepare("SELECT media_preview_path FROM scheduled_posts WHERE id = ?").get(parts[0]);
+            db.close();
+            if (row && row.media_preview_path) {
+              const mp = String(row.media_preview_path);
+              const abs = mp.startsWith('/') ? mp : join(homedir(), mp);
+              if (basename(abs) === parts[1] && existsSync(abs)) dbPath = abs;
+            }
+          } catch {}
+          if (!dbPath) { res.writeHead(404); res.end('Not found'); return; }
+          filePath = dbPath;
         }
       }
       const ext = extname(parts[1]).toLowerCase();
@@ -1181,6 +1309,20 @@ async function handleRequest(req, res) {
       db.prepare("UPDATE scheduled_posts SET media_preview_path = NULL, media_kind = NULL, updated_at = datetime('now') WHERE id = ?").run(id);
       db.close();
       return json(res, { ok: true });
+    }
+
+    // POST /api/posts/:id/media-alt — zapisz ALT/opis obrazka (dostępność + GEO/AI)
+    if (method === 'POST' && path.match(/^\/api\/posts\/[^/]+\/media-alt$/)) {
+      const id = path.split('/')[3];
+      const body = await parseBody(req).catch(() => ({}));
+      const alt = String(body.alt || '').trim().slice(0, 300);
+      const db = getDb(false);
+      const post = db.prepare("SELECT id FROM scheduled_posts WHERE id = ?").get(id);
+      if (!post) { db.close(); return json(res, { error: 'Not found' }, 404); }
+      db.prepare("UPDATE scheduled_posts SET media_alt = ?, updated_at = datetime('now') WHERE id = ?")
+        .run(alt || null, id);
+      db.close();
+      return json(res, { ok: true, alt, len: alt.length });
     }
 
     // POST /api/posts/:id/banner — wygeneruj banner z preset, zapisz jako media_preview_path
@@ -1377,10 +1519,14 @@ async function handleRequest(req, res) {
       const auto_comment_override = body.auto_comment_override !== undefined
         ? (body.auto_comment_override || null)
         : post.auto_comment_override;
-      db.prepare("UPDATE scheduled_posts SET text = ?, publish_at = ?, visibility = ?, language = ?, text_alt = ?, auto_comment_override = ?, updated_at = datetime('now') WHERE id = ?")
-        .run(text, publish_at, visibility, language, text_alt, auto_comment_override, id);
+      // Zmiana statusu (drafty: propozycja → scheduled / archived) — tylko bezpieczne przejścia
+      const ALLOWED_STATUS = ['draft', 'scheduled', 'archived', 'cancelled'];
+      const status = (body.status && ALLOWED_STATUS.includes(body.status) && post.status !== 'published')
+        ? body.status : post.status;
+      db.prepare("UPDATE scheduled_posts SET text = ?, publish_at = ?, visibility = ?, language = ?, text_alt = ?, auto_comment_override = ?, status = ?, updated_at = datetime('now') WHERE id = ?")
+        .run(text, publish_at, visibility, language, text_alt, auto_comment_override, status, id);
       db.close();
-      return json(res, enrichPost({ ...post, text, publish_at, visibility, language, text_alt, auto_comment_override }));
+      return json(res, enrichPost({ ...post, text, publish_at, visibility, language, text_alt, auto_comment_override, status }));
     }
 
     // DELETE /api/posts/:id
@@ -1470,6 +1616,115 @@ ${tableRows}
 Po zakończeniu wypisz raport: które zaproszenia wysłane, które nie (np. już połączeni).`;
 
       return json(res, { cli_prompt: MCP_PROMPT, chrome_prompt: dynamicChromePrompt, count: sorted.length, priority_count: priorityLeads.length });
+    }
+
+    // GET /api/week — jedyny ekran na dzień roboczy: artykuł + posty tego tygodnia
+    // z lampkami gotowości (tekst / medium / ALT / QA / termin) + licznik rozmów.
+    if (method === 'GET' && path === '/api/week') {
+      const db = getDb();
+      try {
+        // poniedziałek-niedziela bieżącego tygodnia
+        const now = new Date();
+        const dow = (now.getDay() + 6) % 7; // 0 = poniedziałek
+        const monday = new Date(now); monday.setDate(now.getDate() - dow);
+        const sunday = new Date(monday); sunday.setDate(monday.getDate() + 6);
+        const from = monday.toISOString().slice(0, 10);
+        const to = sunday.toISOString().slice(0, 10);
+
+        // Pozycje planu, ktore maja juz swoj wiersz w kolejce postow, pomijamy —
+        // inaczej ta sama tresc pokazuje sie na ekranie dwa razy (raz jako post,
+        // raz jako odprysk) i tydzien wyglada na dwa razy pelniejszy niz jest.
+        const items = db.prepare(
+          `SELECT id, slug, title, status, lane, icp, publish_at, format,
+                  parent_article_slug, post_text, visual_asset_path, scheduled_post_id
+           FROM media_plan_items
+           WHERE date(publish_at) BETWEEN ? AND ?
+             AND status NOT IN ('cancelled','archived')
+             AND (scheduled_post_id IS NULL OR scheduled_post_id = '')
+           ORDER BY publish_at`
+        ).all(from, to);
+
+        const posts = db.prepare(
+          `SELECT id, publish_at, status, qa_status, media_ids, media_kind, media_alt,
+                  text_only_ok, lane, substr(replace(text, char(10), ' '), 1, 90) AS preview
+           FROM scheduled_posts
+           WHERE date(publish_at) BETWEEN ? AND ?
+             AND status NOT IN ('cancelled','archived')
+           ORDER BY publish_at`
+        ).all(from, to);
+
+        // Lampki: co blokuje wyjście tego posta.
+        const withLamps = posts.map((p) => {
+          let hasMedia = false;
+          try { hasMedia = !!p.media_ids && JSON.parse(p.media_ids).length > 0; } catch {}
+          const needsAlt = hasMedia && ['IMAGE', 'VIDEO'].includes(String(p.media_kind || '').toUpperCase());
+          return {
+            ...p,
+            lamps: {
+              tekst: !!(p.preview && p.preview.trim()),
+              medium: hasMedia || Number(p.text_only_ok) === 1,
+              alt: !needsAlt || (p.media_alt || '').trim().length >= 15,
+              qa: p.qa_status === 'approved',
+              termin: p.status === 'scheduled',
+            },
+          };
+        });
+
+        // Rozmowy sprzedażowe — metryka, na której rozliczamy cały kanał.
+        let conversations = { month: 0, total: 0 };
+        try {
+          const adb = new Database(join(homedir(), '.linkedin-mcp', 'analytics.db'), { readonly: true });
+          conversations = {
+            month: adb.prepare("SELECT COUNT(*) c FROM conversations WHERE date >= date('now','start of month')").get().c,
+            total: adb.prepare('SELECT COUNT(*) c FROM conversations').get().c,
+          };
+          adb.close();
+        } catch { /* tabela może jeszcze nie istnieć */ }
+
+        const inFlight = db.prepare(
+          "SELECT COUNT(*) c FROM media_plan_items WHERE status IN ('plan','napisane','drafted')"
+        ).get().c;
+
+        // Artykuły pokazujemy NIEZALEŻNIE od bieżącego tygodnia. Artykuł jest
+        // jednostką pracy i wymaga wyprzedzenia (tekst + okładka), więc ukrycie
+        // go do poniedziałku publikacji jest bezużyteczne.
+        const articles = db.prepare(
+          `SELECT slug, title, status, publish_at, icp, visual_asset_path,
+                  CASE WHEN post_text IS NULL OR post_text = '' THEN 0 ELSE length(post_text) END AS chars
+           FROM media_plan_items
+           WHERE format = 'artykul' AND status NOT IN ('cancelled','archived')
+             AND date(publish_at) >= date('now', '-7 day')
+           ORDER BY publish_at LIMIT 6`
+        ).all().map((a) => {
+          // Próg z guidelines/ARTYKULY-LINKEDIN-HOWTO.md: 800-1200 słów.
+          const words = a.chars ? Math.round(a.chars / 6.2) : 0;
+          return {
+            ...a, words,
+            hasText: a.chars > 0,
+            lengthOk: words >= 800 && words <= 1200,
+            hasCover: !!(a.visual_asset_path && a.visual_asset_path.trim()),
+          };
+        });
+
+        return json(res, { from, to, items, posts: withLamps, articles, conversations, queue: { inFlight, cap: 20 } });
+      } finally { db.close(); }
+    }
+
+    // POST /api/conversations — ręczny wpis rozmowy (5 sekund).
+    // Świadomie bez automatycznego wykrywania z DM: silniki DM są wyłączone
+    // po restrykcji konta z 24.06.2026 i mają takie zostać.
+    if (method === 'POST' && path === '/api/conversations') {
+      const body = await parseBody(req).catch(() => ({}));
+      const adb = new Database(join(homedir(), '.linkedin-mcp', 'analytics.db'));
+      try {
+        adb.prepare(
+          `INSERT INTO conversations (date, source_post_urn, lane, channel, stage, note)
+           VALUES (COALESCE(?, date('now')), ?, ?, ?, ?, ?)`
+        ).run(body.date || null, body.source_post_urn || null, body.lane || 'K',
+              body.channel || 'dm', body.stage || 'rozmowa', body.note || null);
+        const month = adb.prepare("SELECT COUNT(*) c FROM conversations WHERE date >= date('now','start of month')").get().c;
+        return json(res, { ok: true, month });
+      } finally { adb.close(); }
     }
 
     // GET /api/data-health
@@ -1574,6 +1829,11 @@ Po zakończeniu wypisz raport: które zaproszenia wysłane, które nie (np. już
           id: 'cookie-refresh', label: 'Cookie Refresh (Voyager auth)', plist: 'com.gaca.linkedin-cookie-refresh.plist',
           schedule: 'Cron: co 4h (6,10,14,18,22)', logFile: join(MCP_OUT, 'cookie-refresh.log'), type: 'cron',
           nextHours: [6, 10, 14, 18, 22],
+        },
+        {
+          id: 'api-analytics', label: 'API-Analytics (oficjalne API)', plist: 'com.gaca.linkedin-api-analytics.plist',
+          schedule: 'Cron: 21:00 codziennie', logFile: join(MCP_OUT, 'api-analytics.log'), type: 'cron',
+          nextHours: [21],
         },
       ];
 
@@ -3735,57 +3995,12 @@ const SEARCH_QUERIES = [
   'founder e-commerce Polska',
 ];
 
-const PROPOSED_POSTS = [
-  // NOWE — framing: problem klienta → rozwiązanie → CTA
-  // ZASADA: TYLKO wt/śr/czw (07:30 lub 08:00), min 18h gap
-  { date: '2026-04-14T07:30:00', day: 'wt', title: 'MVP w tydzień — ile kosztuje i co dostajesz', category: 'service',
-    image: null, screenshot: 'terminal deploy + case study metrics',
-    text: 'Klient napisał: "Mam pomysł na aplikację, ile kosztuje MVP?"\n\n15-30K PLN. 1-2 tygodnie. Działający produkt.\n\nCo dostajesz:\n→ Backend + frontend + deploy\n→ Baza danych + panel admin\n→ Domena + SSL + hosting\n→ Kod źródłowy jest Twój\n\nCo NIE dostajesz:\n→ Slajdów\n→ "Strategii transformacji"\n→ Spotkań bez efektu\n\n3 ostatnie MVP:\n1. CRM dla hodowców — 10K+ użytkowników\n2. Generator reklamacji z AI — 1247 spraw\n3. System zamówień dla 3 salonów — 64+ zamówień/mies\n\nMasz pomysł? DM otwarty.\n\n#mvp #buildinpublic #automatyzacja' },
-  { date: '2026-04-15T08:00:00', day: 'śr', title: 'Klient: "Mój sklep nie gadał z magazynem"', category: 'service',
-    image: null, screenshot: 'diagram integracji Shopify ↔ WMS',
-    text: 'Zadzwonił właściciel hurtowni kwiatów.\n\nProblem: sklep internetowy (Shopify) i magazyn (WMS) to dwa osobne światy. Zamówienia przepisywane ręcznie. 3 osoby na to.\n\nCo zrobiłem:\n→ Integracja API Shopify ↔ WMS\n→ Auto-sync stanów magazynowych co 5 min\n→ Dashboard zamówień w jednym miejscu\n→ Alerty na Telegramie gdy stan < 10 szt\n\nCzas wdrożenia: 8 dni.\n3 osoby zwolnione z przepisywania.\nAbonament: 5K/mies.\n\nMasz dwa systemy które nie gadają ze sobą?\nDM otwarty.\n\n#integracja #api #automatyzacja' },
-  { date: '2026-04-16T07:30:00', day: 'czw', title: 'Google Ads — AI optymalizuje kampanie', category: 'build-log',
-    image: null, screenshot: 'dashboard Google Ads MCP — CPA/ROAS metrics',
-    text: 'Klient wydawał 3000 zł/mies na Google Ads. CPA: 47 zł. ROAS: 2.1x.\n\nProblem: zmieniał stawki ręcznie, 2h tygodniowo.\n\nZbudowałem MCP server który:\n→ Analizuje kampanie co godzinę\n→ Sugeruje zmiany budżetu na podstawie konwersji\n→ Generuje nowe reklamy z AI\n→ Raportuje na Slacku\n\nPo miesiącu: CPA spadło do 31 zł. ROAS: 3.4x.\nCzas klienta na Ads: 0h/tydzień.\n\nMasz Google Ads i nie wiesz czy działają optymalnie?\nDM otwarty.\n\n#googleads #automatyzacja #mcp' },
-  { date: '2026-04-22T08:00:00', day: 'śr', title: '91 narzędzi AI do obsługi dokumentów w urzędach', category: 'e-gov',
-    image: null, screenshot: 'terminal z listą 91 MCP tools EZD PUW',
-    text: 'Urzędnik rejestruje pismo w EZD. Ręcznie. Każde pole osobno. 20 minut na dokument.\n\nZbudowałem MCP server z 91 narzędziami:\n→ Rejestracja pism (przychodzące/wychodzące)\n→ Zakładanie spraw\n→ Korespondencja ePUAP/eDoręczenia\n→ Zarządzanie teczkami\n→ Blockchain (tak, urzędy mają blockchain)\n\nTeraz AI agent robi to samo w 30 sekund.\n\nOpen source. MIT license.\n\nUrząd który chce to wdrożyć? DM otwarty.\n\n#ezd #egov #mcp' },
-  // Week 3 (28 kwi - 1 maj) — build-log + e-gov
-  { date: '2026-04-28T07:30:00', day: 'wt', title: '7 autonomicznych system\u00f3w AI', category: 'build-log',
-    image: 'post1-clean.png', screenshot: 'terminal z pm2 status — 7 procesow online',
-    text: 'Zbudowa\u0142em 7 autonomicznych system\u00f3w AI.\n\nDzia\u0142aj\u0105 24/7 na produkcji. Bez nadzoru.\n\nLista:\n\u2192 SEO Machine \u2014 79 artyku\u0142\u00f3w opublikowanych, 500 w kolejce\n\u2192 Product Creator \u2014 generuje opisy produkt\u00f3w z samych zdj\u0119\u0107 (Gemma 3 27B)\n\u2192 AI Trader \u2014 autonomiczny trading BTC/ETH na Binance\n\u2192 Job Hunter \u2014 monitoruje rynek, wysy\u0142a alerty na Telegram\n\u2192 Domain Checker \u2014 AI generuje nazwy domen i sprawdza dost\u0119pno\u015b\u0107\n\u2192 Article Hunter \u2014 skanuje 25+ RSS feed\u00f3w, ocenia i publikuje\n\u2192 Token Hunter \u2014 analizuje nowe projekty crypto\n\nKa\u017cdy system ma auto-failover przez 34 modele AI.\nJeden padnie \u2014 kolejny przejmuje w <2s.\n\nInfrastruktura: Node.js + PM2 + G.A.C.A. (m\u00f3j multi-provider AI).\n\nKt\u00f3re narz\u0119dzie chcia\u0142by\u015b dostosowa\u0107 do swojej firmy?\n\n#automatyzacja #ai #mcp' },
-  { date: '2026-04-29T08:00:00', day: '\u015br', title: 'KSeF korekta w EUR \u2014 pu\u0142apka', category: 'e-gov',
-    image: 'post18-banner.png', screenshot: 'terminal z odpowiedzia KSeF — blad walidacji XML',
-    text: 'KSeF zablokowa\u0142 mi korekt\u0119 faktury w EUR.\n\nKlient zagraniczny. Faktura w EUR. Korekta \u2014 te\u017c w EUR.\nKSeF zwr\u00f3ci\u0142 b\u0142\u0105d: "Nieprawid\u0142owa waluta przeliczenia."\n\nProblem: KSeF wymaga kursu NBP z dnia poprzedniego.\nAle dla korekt \u2014 bierze kurs z daty faktury oryginalnej, nie z daty korekty.\n\nNigdzie tego nie dokumentuj\u0105.\nZnalaz\u0142em to po 3h debugowania XML-a.\n\nNapisa\u0142em MCP server do KSeF, kt\u00f3ry:\n\u2192 Automatycznie pobiera kurs NBP z w\u0142a\u015bciwej daty\n\u2192 Waliduje XML przed wys\u0142aniem\n\u2192 Obs\u0142uguje korekty zeruj\u0105ce (bo tak \u2014 to osobny typ)\n\nOd 2026 KSeF b\u0119dzie obowi\u0105zkowy.\nIle firm dowie si\u0119 o tych pu\u0142apkach dopiero w produkcji?\n\n#ksef #automatyzacja #efaktury' },
-  { date: '2026-04-30T07:30:00', day: 'czw', title: 'Dashboard zarz\u0105dza LinkedIn', category: 'build-log',
-    image: 'fb-calendar-panel.png', screenshot: 'dashboard localhost:6767 — tab Posty',
-    text: 'M\u00f3j dashboard zarz\u0105dza ca\u0142ym LinkedIn.\n\nPosty. Prospekci. Zaproszenia. Kalendarz. Rutyna.\nWszystko w jednym widoku na localhost:6767.\n\nCo robi:\n\u2192 Planuje posty na 4 tygodnie do przodu\n\u2192 Pokazuje kto jest do zaproszenia (z filtrem po bran\u017cy)\n\u2192 Generuje prompty do wysy\u0142ania zaprosze\u0144\n\u2192 Automatycznie publikuje o zaplanowanej godzinie\n\u2192 Monitoruje 11 firm konkurencji\n\nZbudowa\u0142em to w Node.js + SQLite.\nZero zewn\u0119trznych SaaS-\u00f3w. Zero miesi\u0119cznych op\u0142at.\n\nKoszt: m\u00f3j czas + $0/mies.\nAlternatywa: Hootsuite $99/mies + Shield $25/mies + PhantomBuster $69/mies.\n\nWolisz p\u0142aci\u0107 czy budowa\u0107?\n\n#linkedin #automatyzacja #buildinpublic' },
-  // Week 2 (21-24 kwi 2026)
-  { date: '2026-05-05T07:30:00', day: 'wt', title: 'Product Creator \u2014 opisy z zdj\u0119\u0107', category: 'build-log',
-    image: 'post7-banner.png', screenshot: 'Product Creator — zdjecie -> wygenerowany opis',
-    text: 'Moje opisy produkt\u00f3w pisze AI. Z samych zdj\u0119\u0107.\n\nKlient ma sklep na PrestaShop. 200 produkt\u00f3w. Opisy? Puste albo z 2018.\n\nZbudowa\u0142em pipeline:\n1. Upload zdj\u0119cia produktu\n2. Gemma 3 27B analizuje: materia\u0142, wymiary, kolor, jako\u015b\u0107\n3. G.A.C.A. (6 modeli AI z failoverem) generuje opis\n4. Walidacja Zod \u2014 sprawdza czy opis pasuje do kategorii\n\nKategorie: maty wiklinowe, p\u0142oty, materace, \u0142\u00f3\u017cka, poduszki.\nKa\u017cda ma inne wymagane pola.\n\nCzas na 1 produkt: 12 sekund.\nR\u0119cznie: 15-20 minut.\n\n200 produkt\u00f3w \u00d7 15 min = 50h pracy.\n200 produkt\u00f3w \u00d7 12s = 40 minut.\n\nIle produkt\u00f3w w Twoim sklepie czeka na porz\u0105dne opisy?\n\n#ecommerce #ai #prestashop' },
-  { date: '2026-05-06T08:00:00', day: '\u015br', title: 'prisma --force-reset na produkcji', category: 'failure',
-    image: 'post5-banner.png', screenshot: 'terminal z proba recovery WAL + logi Subiekta',
-    text: 'Straci\u0142em 11 dni danych produkcyjnych.\n\nJedna komenda. prisma db push --force-reset.\nNa produkcji. Przez pomy\u0142k\u0119.\n\nBaza wyczyszczona. 11 dni zam\u00f3wie\u0144, klient\u00f3w, log\u00f3w.\nZero backup\u00f3w (tak, wiem).\n\nCo zrobi\u0142em:\n\u2192 Odzyska\u0142em cz\u0119\u015b\u0107 danych z WAL (Write-Ahead Log) PostgreSQL\n\u2192 Zaimportowa\u0142em faktury z Subiekta GT\n\u2192 Napisa\u0142em parser do odtworzenia relacji\n\nCzego si\u0119 nauczy\u0142em:\n\u2192 NIGDY --force-reset na produkcji (teraz mam alias zablokowany)\n\u2192 Backup co 6h na S3 (pg_dump + cron)\n\u2192 Osobne .env.production z readonly credentials\n\nJeden b\u0142\u0105d. Trzy tygodnie naprawiania.\nJaki by\u0142 Tw\u00f3j najdro\u017cszy b\u0142\u0105d w produkcji?\n\n#devops #postgresql #postmortem' },
-  { date: '2026-05-07T07:30:00', day: 'czw', title: 'SEO Machine \u2014 25 RSS + AI', category: 'build-log',
-    image: 'post13-banner.png', screenshot: 'dashboard SEO Machine — lista artykulow z AI scoring',
-    text: 'Monitoruj\u0119 25 \u017ar\u00f3de\u0142 RSS. AI decyduje co opublikowa\u0107.\n\nMoja SEO Machine dzia\u0142a tak:\n\u2192 Skanuje 25+ feed\u00f3w RSS (bran\u017cowe blogi, newsy, raporty)\n\u2192 AI ocenia ka\u017cdy artyku\u0142 (relevance, quality, uniqueness)\n\u2192 Generuje SEO-optimized wersj\u0119 PL + EN\n\u2192 Tworzy cover image przez Flux AI\n\u2192 Publikuje na blogu z pe\u0142nym E-E-A-T\n\n79 artyku\u0142\u00f3w opublikowanych. 500 w kolejce.\nBez mojego udzia\u0142u.\n\nStack: Node.js + Prisma + G.A.C.A. (multi-provider AI).\nFailover: je\u015bli Groq padnie \u2192 Cerebras \u2192 Mistral \u2192 DeepSeek.\n\nKoszt: $0 (darmowe API). Alternatywa: copywriter $500/mies.\n\nCzy Tw\u00f3j content marketing dzia\u0142a gdy \u015bpisz?\n\n#seo #contentmarketing #ai' },
-  // Week 3 (28 kwi - 1 maj 2026)
-  { date: '2026-05-12T07:30:00', day: 'wt', title: 'Domain Checker \u2014 500 domen/dzie\u0144', category: 'build-log',
-    image: 'post8-banner.png', screenshot: 'terminal Domain Checker — wyniki bulk check',
-    text: 'AI sprawdza za mnie 500 domen dziennie.\n\nKlient szuka nazwy dla nowego SaaS-a.\nWymy\u015blanie nazw to jedno. Sprawdzanie dost\u0119pno\u015bci \u2014 drugie.\n\nM\u00f3j Domain Checker:\n\u2192 AI generuje nazwy na podstawie bran\u017cy i wzorc\u00f3w\n\u2192 Kategorie: WMS, SaaS, Operations, Warehouse\n\u2192 Sprawdza .com, .io, .app, .ai, .pl jednocze\u015bnie\n\u2192 Eksport do CSV \u2014 gotowy do rejestracji\n\nWzorce: operacja + sufiks, magazyn + przymiotnik, abstrakcja + kategoria.\n\nW 10 minut masz 200 unikalnych nazw z informacj\u0105 o dost\u0119pno\u015bci.\nR\u0119cznie? Jeden po drugim na whois? Powodzenia.\n\nJakie narz\u0119dzie zaoszcz\u0119dzi\u0142o Ci najwi\u0119cej czasu w tym miesi\u0105cu?\n\n#saas #naming #automatyzacja' },
-  // SprawdzNotariusza + AI Trader usunięte — nie generują klientów na MVP/MCP/API
-  // Week 4 (5-8 maj 2026)
-  { date: '2026-05-13T08:00:00', day: '\u015br', title: '5 case studies \u2014 jedno pytanie', category: 'build-log',
-    image: 'post12-banner.png', screenshot: 'strona case-studies z bartoszgaca.pl',
-    text: '5 case studies. Ka\u017cdy zacz\u0105\u0142 si\u0119 od jednego pytania klienta.\n\n"Czy da si\u0119 zautomatyzowa\u0107 reklamacje?"\n\u2192 reklamacje24.pl \u2014 AI analizuje zdj\u0119cie produktu, generuje pismo reklamacyjne\n\u2192 1 247 spraw zako\u0144czonych\n\n"Ile kosztuje raportowanie kampanii?"\n\u2192 System automatycznie zbiera dane, generuje PDF, wysy\u0142a mailem\n\u2192 Z 6h/tydzie\u0144 na 0\n\n"Czy CRM mo\u017ce obs\u0142u\u017cy\u0107 3 oddzia\u0142y?"\n\u2192 CRM z workflow per rola \u2014 od zam\u00f3wienia po monta\u017c\n\u2192 18 u\u017cytkownik\u00f3w, 64+ zlece\u0144\n\nKa\u017cde z tych narz\u0119dzi powsta\u0142o w 2-4 tygodnie.\nKa\u017cde rozwi\u0105zuje JEDEN konkretny problem.\n\nNie buduj\u0119 platform. Buduj\u0119 rozwi\u0105zania.\n\nJaki problem w Twojej firmie rozwi\u0105zujesz r\u0119cznie, cho\u0107 m\u00f3g\u0142by\u015b zautomatyzowa\u0107?\n\n#automatyzacja #casestudy #mvp' },
-  { date: '2026-05-14T07:30:00', day: 'czw', title: 'Auto-engage vs troll', category: 'failure',
-    image: 'post9-banner.png', screenshot: 'logi auto-engage — klasyfikacja Gemini + odpowiedz bota',
-    text: 'M\u00f3j auto-engage odpowiedzia\u0142 trollowi powa\u017cn\u0105 analiz\u0105.\n\nBot do automatycznych odpowiedzi na komentarze LinkedIn.\nGemini klasyfikuje: reply / like_only / skip_troll / skip_spam.\n\nKto\u015b napisa\u0142 pod postem: "AI zabierze Ci robot\u0119 bro \ud83d\ude02"\nGemini sklasyfikowa\u0142 jako: reply (sentiment: neutral).\n\nBot odpowiedzia\u0142 150-s\u0142owow\u0105 analiz\u0105 rynku AI z danymi McKinsey.\nPod trollowym komentarzem. O 3 w nocy.\n\nFix:\n\u2192 Doda\u0142em filtr na emoji density (>30% = skip)\n\u2192 Komentarze <5 s\u0142\u00f3w = like_only\n\u2192 Godziny ciszy: 23:00-06:00\n\nAutomatyzacja bez edge case\u2019\u00f3w to bomba zegarowa.\nJaki Tw\u00f3j automat zrobi\u0142 co\u015b niespodziewanego?\n\n#ai #automatyzacja #fail' },
-  { date: '2026-05-19T07:30:00', day: 'wt', title: 'Narz\u0119dzia na Tw\u00f3j serwer', category: 'build-log',
-    image: 'post11-banner.png', screenshot: 'bartoszgaca.pl/automations — 7 systemow online',
-    text: 'Ka\u017cde z moich narz\u0119dzi mo\u017cna dostosowa\u0107 do Twojej firmy.\n\nZbudowa\u0142em:\n\u2192 SEO Machine \u2014 autonomiczne artyku\u0142y z RSS (Twoje \u017ar\u00f3d\u0142a, Twoja domena)\n\u2192 Product Creator \u2014 opisy z zdj\u0119\u0107 (Twoje kategorie, Tw\u00f3j sklep)\n\u2192 LinkedIn Automation \u2014 posty, prospekci, engage (Twoja strategia)\n\u2192 Domain Checker \u2014 nazwy domen dla Twojego SaaS-a\n\u2192 AI Trader \u2014 Twoje pary walutowe, Twoje limity ryzyka\n\u2192 KSeF MCP \u2014 Twoje faktury, Twoja integracja\n\nKa\u017cde narz\u0119dzie: Node.js + SQLite + G.A.C.A. (multi-provider AI).\nKa\u017cde dzia\u0142a na Twoim serwerze. Zero vendor lock-in.\n\nNie sprzedaj\u0119 SaaS-a z planem Enterprise.\nBuduj\u0119 narz\u0119dzia, oddaj\u0119 kod \u017ar\u00f3d\u0142owy, i pomagam wdro\u017cy\u0107.\n\nModel: retainer lub projekt.\nNapisz DM je\u015bli chcesz pogada\u0107 o automatyzacji w Twojej firmie.\n\n#automatyzacja #consulting #ai' },
-];
+// PROPOSED_POSTS: przeniesione do bazy 2026-07-26 przez
+// scripts/migrate-hardcoded-proposals.mjs (media_plan_items #149-162 + drafty).
+// Tablica zostaje PUSTA, a nie usunięta, bo 8 miejsc w UI robi na niej
+// .filter/.findIndex/[idx] — puste = brak duchów z kwietnia w kolejce.
+const PROPOSED_POSTS = [];
+
 
 const ROUTINE = [
   { time: '07:00', desc: 'Sprawd\u017a notyfikacje LinkedIn (komentarze, zaproszenia)' },
@@ -3877,6 +4092,7 @@ function buildHtml() {
 '.badge{padding:2px 7px;border-radius:9px;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.5px}',
 '.b-scheduled{background:rgba(56,139,253,.15);color:var(--blu)}.b-published{background:rgba(46,160,67,.15);color:var(--grn)}',
 '.b-failed{background:rgba(218,54,51,.15);color:var(--red)}.b-cancelled{background:var(--brd);color:var(--dim)}',
+'.b-draft{background:rgba(210,153,34,.18);color:var(--yel)}.card-draft{border-left:3px solid var(--yel)}',
 '.b-en{background:rgba(56,139,253,.15);color:var(--blu);font-weight:700}.b-pl{background:rgba(218,54,51,.15);color:var(--red);font-weight:700}',
 '.b-bi{background:rgba(210,153,34,.15);color:var(--yel);font-size:9px}',
 '.card-img{margin:6px 0;border-radius:6px;overflow:hidden}.card-img img{width:100%;max-height:180px;object-fit:cover;display:block;border-radius:6px}',
@@ -4036,15 +4252,20 @@ function buildHtml() {
 '<div class="nav-overlay" id="nav-overlay"></div>',
 '<nav class="tabnav" id="tabnav">',
 '<div class="nav-header">Menu</div>',
-'<details class="nav-group" data-group="operacje" open>',
-'<summary>📅 Operacje</summary>',
-'<button class="tnb active" data-tab="posty">Kolejka postów</button>',
-'<button class="tnb" data-tab="rutyna">Automatyzacje</button>',
+'<details class="nav-group" data-group="tydzien" open>',
+'<summary>🎯 Ten tydzień</summary>',
+'<button class="tnb active" data-tab="tydzien">Co idzie w tym tygodniu</button>',
 '</details>',
-'<details class="nav-group" data-group="tresc">',
+'<details class="nav-group" data-group="tresc" open>',
 '<summary>✍️ Treść</summary>',
 '<button class="tnb" data-tab="artykuly">Artykuły</button>',
+'<a class="tnb" href="/publikacje" style="display:block;text-decoration:none">Publikacje</a>',
 '<button class="tnb" data-tab="kontenty">Insights</button>',
+'</details>',
+'<details class="nav-group" data-group="operacje">',
+'<summary>📅 Operacje</summary>',
+'<button class="tnb" data-tab="posty">Kolejka postów</button>',
+'<button class="tnb" data-tab="rutyna">Automatyzacje</button>',
 '</details>',
 '<details class="nav-group" data-group="crm">',
 '<summary>👥 CRM</summary>',
@@ -4068,8 +4289,12 @@ function buildHtml() {
 '</nav>',
 '<div class="sbar" id="sbar">...</div>',
 '</div>',
+// ── Tab: Ten tydzień ────────────────────────────────────────────────────
+// Jedyny ekran do otwierania w dzień roboczy. Zastępuje przeglądanie całej
+// kolejki: artykuł + posty z bieżącego tygodnia, każdy z lampkami gotowości.
+'<div class="tab-panel active" id="tab-tydzien"><div class="wrap" id="week-root"></div></div>',
 // ── Tab: Posty (Scheduler) ──────────────────────────────────────────────
-'<div class="tab-panel active" id="tab-posty">',
+'<div class="tab-panel" id="tab-posty">',
 '<div class="wrap">',
 '<div class="post-stats" id="post-stats"></div>',
 // Iter2: toggle widok\u00f3w
@@ -4088,6 +4313,10 @@ function buildHtml() {
 '<button class="btn primary" id="btnNew" style="margin-left:auto">+ New Post</button>',
 '</div>',
 // View: Lista (default)
+// Drafty \u2014 ZAWSZE widoczne, nad prze\u0142\u0105cznikiem widok\u00f3w Lista/Tydzie\u0144
+'<div class="toolbar"><span style="font-size:14px;font-weight:700;color:var(--yel)">\ud83d\udcdd Propozycje \u2014 drafty (<span id="draftCount">0</span>)</span>',
+'<span style="font-size:11px;color:var(--dim);margin-left:8px">bez dat \u2014 tematyka wg media planu; publikujesz dopiero po \u201eZaplanuj\u201d. S\u0142abe \u2192 ARCHIWUM.</span></div>',
+'<div id="posts-drafts" style="margin-bottom:20px"></div>',
 '<div id="posts-view-list">',
 '<div class="toolbar"><span style="font-size:14px;font-weight:700">Nadchodz\u0105ce</span></div>',
 '<div id="posts-upcoming"></div>',
@@ -4223,7 +4452,13 @@ function buildHtml() {
 '<button type="button" class="btn sm" id="media-banner-btn">🎨 Generuj banner</button>',
 '<button type="button" class="btn sm" id="media-ai-image-btn" style="background:rgba(56,139,253,.15);color:var(--blu);border-color:var(--blu)">🤖 AI Image (Imagen 4)</button>',
 '<button type="button" class="btn sm" id="media-remove-btn" style="background:var(--red);border-color:var(--red);color:#fff">🗑️ Usuń media</button>',
-'</div></div></div>',
+'</div>',
+'<div id="media-alt-wrap" style="margin-top:12px">',
+'<label style="font-size:12px;color:var(--dim)">ALT / opis obrazka <span style="color:var(--red)">— wymagany dla obrazów</span> (dostępność + widoczność w AI/Google)</label>',
+'<textarea id="media-alt" rows="2" maxlength="300" placeholder="Opisz obraz słowami kluczem, np. Strona internetowa dla firmy w trzech stylach na telefonach..." style="width:100%;font-size:12px;padding:8px;border-radius:6px;border:1px solid var(--brd);background:var(--bg);color:var(--fg);resize:vertical;box-sizing:border-box"></textarea>',
+'<div style="display:flex;justify-content:space-between;align-items:center;margin-top:4px"><span id="media-alt-count" style="font-size:11px;color:var(--dim)">0/300</span><button type="button" class="btn sm" id="media-alt-save">💾 Zapisz ALT</button></div>',
+'</div>',
+'</div></div>',
 '<div class="mact"><button class="btn" id="mcancel">Cancel</button><button class="btn primary" id="msave">Save</button></div>',
 '</div>',
 '</div>',
@@ -4390,6 +4625,10 @@ function renderCard(p) {
   var pd = p.published_at ? new Date(p.published_at).toLocaleString('pl-PL') : '';
   var isSch = p.status === 'scheduled';
   var isFail = p.status === 'failed';
+  var isDraft = p.status === 'draft';
+  if (isDraft) dt = p.publish_at
+    ? 'propozycja na: ' + new Date(p.publish_at).toLocaleString('pl-PL', { weekday: 'short', day: 'numeric', month: 'numeric', hour: '2-digit', minute: '2-digit' }) + ' (publikacja dopiero po „Zaplanuj")'
+    : 'propozycja — bez daty';
   var lang = (p.language || 'en').toUpperCase();
   var lc = 'b-' + (p.language || 'en');
   var bi = p.text_alt ? '<span class="badge b-bi">PL+EN</span>' : '';
@@ -4408,11 +4647,17 @@ function renderCard(p) {
     // PRIORYTET 1: NVIDIA FLUX z media_plan_items.visual_asset_path (przez /media-image/<slug>)
     img = '<div class="card-img"><img src="' + esc(unifiedMatch.media_url) + '" alt="' + esc(unifiedMatch.mp_title || unifiedMatch.mp_slug || '') + '" loading="lazy"></div>';
   } else if (p.media_preview_path) {
-    var mediaSrc = '/post-media/' + p.id + '/' + p.media_preview_path.split('/').pop();
-    var isVideo = p.media_kind === 'video' || /\.(mp4|webm|mov)$/i.test(p.media_preview_path);
-    img = isVideo
-      ? '<div class="card-img"><video src="' + esc(mediaSrc) + '" muted preload="metadata" style="width:100%;max-height:280px;object-fit:cover"></video></div>'
-      : '<div class="card-img"><img src="' + esc(mediaSrc) + '" alt="Post media"></div>';
+    var mediaFile = p.media_preview_path.split('/').pop();
+    var mediaSrc = '/post-media/' + p.id + '/' + encodeURIComponent(mediaFile);
+    var isVideo = p.media_kind === 'video' || /\.(mp4|webm|mov)$/i.test(mediaFile);
+    var isPdf = /\.pdf$/i.test(mediaFile);
+    if (isPdf) {
+      img = '<div class="card-img" style="background:var(--bg);padding:14px;border:1px dashed var(--brd);border-radius:6px;font-size:12px;color:var(--dim)">📄 karuzela PDF: <a href="' + esc(mediaSrc) + '" target="_blank" style="color:var(--yel)">' + esc(mediaFile) + '</a></div>';
+    } else {
+      img = isVideo
+        ? '<div class="card-img"><video src="' + esc(mediaSrc) + '" muted preload="metadata" style="width:100%;max-height:280px;object-fit:cover"></video></div>'
+        : '<div class="card-img"><img src="' + esc(mediaSrc) + '" alt="Post media"></div>';
+    }
   } else if (p.image_file) {
     img = '<div class="card-img"><img src="/img/' + esc(p.image_file) + '" alt="Post image"></div>';
   } else if (p.media_ids) {
@@ -4465,9 +4710,11 @@ function renderCard(p) {
     h += '</details>';
   }
   h += '<div class="actions">';
-  if (isSch || isFail) h += '<button class="btn sm" data-act="edit" data-id="' + p.id + '">Edit</button>';
+  if (isSch || isFail || isDraft) h += '<button class="btn sm" data-act="edit" data-id="' + p.id + '">Edit</button>';
   if (isSch) h += '<button class="btn sm primary" data-act="publish" data-id="' + p.id + '">Publish Now</button>';
   if (isSch) h += '<button class="btn sm danger" data-act="cancel" data-id="' + p.id + '">Cancel</button>';
+  if (isDraft) h += '<button class="btn sm primary" data-act="draft-schedule" data-id="' + p.id + '">Zaplanuj</button>';
+  if (isDraft) h += '<button class="btn sm danger" data-act="draft-archive" data-id="' + p.id + '">ARCHIWUM</button>';
   h += '</div></div>';
   return h;
 }
@@ -4628,6 +4875,9 @@ document.addEventListener('click', function(e) {
 function render() {
   var period = getPostsPeriod();
   var filtered = filterByPeriod(posts, period, 'publish_at');
+  // Drafty = propozycje: ZAWSZE wszystkie (bez filtra okresu — stare z kwietnia też), bez dat, na górze
+  var drafts = posts.filter(function(p) { return p.status === 'draft'; })
+    .sort(function(a, b) { return new Date(a.publish_at || '2099') - new Date(b.publish_at || '2099'); });
   var upcoming = filtered.filter(function(p) { return p.status === 'scheduled'; })
     .sort(function(a, b) { return new Date(a.publish_at) - new Date(b.publish_at); });
   var history = filtered.filter(function(p) { return p.status === 'published' || p.status === 'cancelled' || p.status === 'failed'; })
@@ -4647,10 +4897,24 @@ function render() {
   var nextPost = upcoming.length > 0 ? new Date(upcoming[0].publish_at).toLocaleString('pl-PL', {day:'numeric',month:'short',hour:'2-digit',minute:'2-digit'}) : '-';
 
   var stats = $$('post-stats');
-  stats.innerHTML = '<div class="stat">Zaplanowanych: <b>' + upcoming.length + '</b></div>'
+  stats.innerHTML = '<div class="stat">Drafty: <b>' + drafts.length + '</b></div>'
+    + '<div class="stat">Zaplanowanych: <b>' + upcoming.length + '</b></div>'
     + '<div class="stat">Proponowanych: <b>' + proposed.length + '</b></div>'
     + '<div class="stat">Opublikowanych w tym miesiacu: <b>' + pubThisMonth + '</b></div>'
     + '<div class="stat">Nastepny: <b>' + nextPost + '</b></div>';
+
+  var dc = $$('posts-drafts');
+  var draftCnt = $$('draftCount');
+  if (draftCnt) draftCnt.textContent = drafts.length;
+  if (dc) {
+    if (drafts.length === 0) {
+      dc.innerHTML = '<div class="empty"><p>Brak draftów — propozycje pojawią się tutaj</p></div>';
+    } else {
+      var dh = '';
+      drafts.forEach(function(p) { dh += renderCard(p); });
+      dc.innerHTML = dh;
+    }
+  }
 
   var uc = $$('posts-upcoming');
   if (upcoming.length === 0) {
@@ -4748,6 +5012,23 @@ document.addEventListener('click', function(e) {
 
   // Cancel
   if (t.dataset.act === 'cancel') { cancelPost(t.dataset.id); return; }
+
+  // Drafty: ARCHIWUM (słabe → znikają z propozycji) i Zaplanuj (draft → scheduled)
+  if (t.dataset.act === 'draft-archive') {
+    api('/api/posts/' + t.dataset.id, { method: 'PUT', body: JSON.stringify({ status: 'archived' }) })
+      .then(function() { toast('Draft w archiwum', true); loadPosts(); });
+    return;
+  }
+  if (t.dataset.act === 'draft-schedule') {
+    var dp = posts.find(function(pp) { return pp.id === t.dataset.id; });
+    var def = dp && dp.publish_at ? String(dp.publish_at).replace(' ', 'T').slice(0, 16) : '';
+    var when = prompt('Kiedy opublikować? (YYYY-MM-DDTHH:MM)', def);
+    if (!when) return;
+    var pa = when.replace('T', ' ') + (when.length === 16 ? ':00' : '');
+    api('/api/posts/' + t.dataset.id, { method: 'PUT', body: JSON.stringify({ status: 'scheduled', publish_at: pa }) })
+      .then(function() { toast('Zaplanowany na ' + pa, true); loadPosts(); });
+    return;
+  }
 
   // Edit — Iter6: klik w child element klikalnego <tr data-act="edit"> (drill-down wiersza).
   // Fallback PO przyciskach, żeby nie przechwytywał klików w Publish/Cancel.
@@ -4857,20 +5138,35 @@ function renderMediaPreview(p) {
   var box = document.getElementById('media-preview');
   if (!box) return;
   if (p.media_preview_path) {
-    var src = '/post-media/' + p.id + '/' + p.media_preview_path.split('/').pop();
-    var isVideo = p.media_kind === 'video' || /\.(mp4|webm|mov)$/i.test(p.media_preview_path);
-    if (isVideo) {
+    var fname = p.media_preview_path.split('/').pop();
+    var src = '/post-media/' + p.id + '/' + encodeURIComponent(fname);
+    var isVideo = p.media_kind === 'video' || /\.(mp4|webm|mov)$/i.test(fname);
+    var isPdf = /\.pdf$/i.test(fname);
+    if (isPdf) {
+      box.innerHTML = '<a href="' + src + '" target="_blank" style="display:inline-block;padding:10px 14px;border:1px dashed var(--brd);border-radius:6px;color:var(--yel);font-size:12px;text-decoration:none">📄 ' + fname + ' — otwórz PDF</a>'
+        + '<span style="font-size:11px;color:var(--dim)">📑 ' + (p.media_kind || 'carousel') + '</span>';
+    } else if (isVideo) {
       box.innerHTML = '<video src="' + src + '" controls style="max-width:280px;max-height:160px;border-radius:6px;border:1px solid var(--brd)"></video>'
         + '<span style="font-size:11px;color:var(--dim)">🎬 ' + (p.media_kind || 'video') + '</span>';
     } else {
-      box.innerHTML = '<img src="' + src + '" alt="preview" style="max-width:280px;max-height:160px;border-radius:6px;border:1px solid var(--brd)">'
-        + '<span style="font-size:11px;color:var(--dim)">🖼️ ' + (p.media_kind || 'image') + '</span>';
+      box.innerHTML = '<a href="' + src + '" target="_blank" title="Kliknij, aby otworzyć pełny rozmiar"><img src="' + src + '" alt="preview" style="max-width:280px;max-height:160px;border-radius:6px;border:1px solid var(--brd);cursor:zoom-in"></a>'
+        + '<span style="font-size:11px;color:var(--dim)">🖼️ ' + (p.media_kind || 'image') + ' · kliknij, by powiększyć</span>';
     }
   } else if (p.image_file) {
     box.innerHTML = '<img src="/img/' + p.image_file + '" alt="legacy" style="max-width:280px;max-height:160px;border-radius:6px;border:1px solid var(--brd);opacity:.7">'
       + '<span style="font-size:11px;color:var(--dim)">📁 legacy (hardcoded mapping)</span>';
   } else {
     box.innerHTML = '<span style="font-size:12px;color:var(--dim);font-style:italic">Brak media. Wybierz plik lub wygeneruj banner.</span>';
+  }
+  // ALT sync: wypełnij pole i licznik z danych posta; pokaż tylko gdy jest media obraz
+  var altEl = document.getElementById('media-alt');
+  var altWrap = document.getElementById('media-alt-wrap');
+  var altCount = document.getElementById('media-alt-count');
+  if (altEl) {
+    altEl.value = p.media_alt || '';
+    if (altCount) altCount.textContent = (altEl.value.length) + '/300';
+    var hasImage = !!(p.media_preview_path && !/\.pdf$/i.test(p.media_preview_path));
+    if (altWrap) altWrap.style.display = hasImage ? 'block' : 'none';
   }
 }
 
@@ -5021,6 +5317,24 @@ function generatePostAiImage(id) {
     });
 }
 
+function savePostAlt(id) {
+  var el = document.getElementById('media-alt');
+  if (!el) return;
+  var alt = el.value.trim();
+  fetch('/api/posts/' + id + '/media-alt', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ alt: alt })
+  })
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      if (d.error) { toast('Błąd ALT: ' + d.error, false); return; }
+      toast('ALT zapisany ✓', true);
+      loadPosts();
+    })
+    .catch(function(e){ toast('Błąd sieci ALT: ' + e.message, false); });
+}
+
 function removePostMedia(id) {
   if (!confirm('Usunąć media z tego posta?')) return;
   fetch('/api/posts/' + id + '/media', { method: 'DELETE' })
@@ -5044,6 +5358,16 @@ function removePostMedia(id) {
   var acom = document.getElementById('auto-comment');
   var acomReset = document.getElementById('acom-reset');
   if (uploadBtn) uploadBtn.addEventListener('click', function() { if (fileInput) fileInput.click(); });
+  // ALT: licznik + zapis
+  var altEl = document.getElementById('media-alt');
+  var altSaveBtn = document.getElementById('media-alt-save');
+  var altCount = document.getElementById('media-alt-count');
+  if (altEl && altCount) altEl.addEventListener('input', function() { altCount.textContent = altEl.value.length + '/300'; });
+  if (altSaveBtn) altSaveBtn.addEventListener('click', function() {
+    var id = getCurrentEditPostId();
+    if (!id) { toast('Najpierw zapisz post żeby dodać ALT', false); return; }
+    savePostAlt(id);
+  });
   if (fileInput) fileInput.addEventListener('change', function(e) {
     var id = getCurrentEditPostId();
     if (!id) { toast('Najpierw zapisz post żeby załączyć media', false); fileInput.value=''; return; }
@@ -5099,7 +5423,7 @@ function cancelPost(id) {
 
 // ── TABS ──────────────────────────────────────────────────────────────────────
 
-var activeTab = localStorage.getItem('li_tab') || 'posty';
+var activeTab = localStorage.getItem('li_tab') || 'tydzien';
 
 function switchTab(id) {
   activeTab = id;
@@ -5151,6 +5475,7 @@ document.addEventListener('keydown', function(e) {
 document.querySelectorAll('.tnb').forEach(function(b) {
   b.addEventListener('click', function() {
     switchTab(b.dataset.tab);
+    if (b.dataset.tab === 'tydzien') renderTydzien(true);
     if (b.dataset.tab === 'prospekci') loadProspekci();
     if (b.dataset.tab === 'analytics') renderAnalytics();
     if (b.dataset.tab === 'siec') renderSiec();
@@ -7448,6 +7773,7 @@ loadStatus();
 loadPosts();
 switchTab(activeTab);
 // Lazy-load active tab on startup
+if (activeTab === 'tydzien') renderTydzien(true);
 if (activeTab === 'siec') renderSiec();
 if (activeTab === 'leady') renderLeady();
 if (activeTab === 'kontenty') renderKontenty();
@@ -7485,6 +7811,118 @@ document.addEventListener('change', function(e) {
   if (e.target.id === 'prop-show-replied') loadProposals();
 });
 
+// ── TEN TYDZIEN ────────────────────────────────────────────────────────
+// Zastepuje przegladanie calej kolejki. Pokazuje wylacznie to, co idzie
+// w tym tygodniu, i co konkretnie blokuje kazda pozycje przed wyjsciem.
+function lampHtml(ok, label) {
+  return '<span title="' + label + '" style="display:inline-block;padding:2px 7px;margin-right:4px;border-radius:10px;font-size:11px;' +
+    (ok ? 'background:#12351f;color:#5fd18a' : 'background:#3a1620;color:#ff7a90') + '">' +
+    (ok ? '✓' : '✗') + ' ' + label + '</span>';
+}
+
+function renderTydzien(force) {
+  var root = document.getElementById('week-root');
+  if (!root) return;
+  if (root.dataset.rendered === '1' && !force) return;
+  root.dataset.rendered = '1';
+  root.innerHTML = '<p style="color:var(--dim)">Ladowanie...</p>';
+
+  fetch('/api/week').then(function(r) { return r.json(); }).then(function(d) {
+    var h = '';
+
+    h += '<div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:20px">';
+    h += '<div style="flex:1;min-width:180px;padding:14px;border:1px solid var(--border);border-radius:8px">' +
+         '<div style="font-size:12px;color:var(--dim)">Rozmowy sprzedazowe w tym miesiacu</div>' +
+         '<div style="font-size:30px;font-weight:700">' + d.conversations.month + '</div>' +
+         '<div style="font-size:11px;color:var(--dim)">cel do 30.09: 8 &middot; lacznie ' + d.conversations.total + '</div>' +
+         '<button class="btn sm" id="conv-add" style="margin-top:8px">+ rozmowa</button>' +
+         '</div>';
+    h += '<div style="flex:1;min-width:180px;padding:14px;border:1px solid var(--border);border-radius:8px">' +
+         '<div style="font-size:12px;color:var(--dim)">Kolejka pomyslow</div>' +
+         '<div style="font-size:30px;font-weight:700' + (d.queue.inFlight >= d.queue.cap ? ';color:#ff7a90' : '') + '">' +
+         d.queue.inFlight + ' / ' + d.queue.cap + '</div>' +
+         '<div style="font-size:11px;color:var(--dim)">' +
+         (d.queue.inFlight >= d.queue.cap ? 'pelna, generator nic nie dosypie' : 'bufor na ~2 tygodnie') + '</div>' +
+         '</div>';
+    h += '</div>';
+
+    // Artykuly na wierzchu: to one sa jednostka pracy, posty sa odpryskiem.
+    if (d.articles && d.articles.length) {
+      h += '<h2 style="margin:0 0 8px">Artykuly</h2>';
+      d.articles.forEach(function(a) {
+        var blocked = !a.hasText || !a.hasCover;
+        h += '<div style="padding:12px;margin-bottom:8px;border:1px solid ' + (blocked ? '#5a2230' : 'var(--border)') + ';border-radius:8px">';
+        h += '<div style="font-size:12px;color:var(--dim)">' + String(a.publish_at).slice(0, 10) + ' &middot; ' + a.status + '</div>';
+        h += '<div style="margin:6px 0;font-weight:700">' + (a.title || a.slug) + '</div>';
+        if (a.icp) h += '<div style="font-size:12px;color:var(--dim);margin-bottom:6px">dla: ' + a.icp + '</div>';
+        h += '<div>' + lampHtml(a.hasText, 'tekst') +
+             lampHtml(a.lengthOk, a.words ? a.words + ' slow' : 'dlugosc') +
+             lampHtml(a.hasCover, 'okladka') + '</div>';
+        if (!a.hasText) h += '<div style="margin-top:6px;font-size:12px;color:#ffb45f">Brak tresci &mdash; artykul do napisania.</div>';
+        else if (!a.lengthOk) h += '<div style="margin-top:6px;font-size:12px;color:#ffb45f">' + a.words + ' slow, cel to 800-1200. Za krotki artykul nie kotwiczy tematu.</div>';
+        if (!a.hasCover) h += '<div style="margin-top:6px;font-size:12px;color:#ff7a90">BRAK OKLADKI &mdash; artykul nie moze wyjsc bez realnego zdjecia, filmu albo zrzutu. Generowane banery zakazane.</div>';
+        h += '</div>';
+      });
+    }
+
+    h += '<h2 style="margin:18px 0 4px">Tydzien ' + d.from + ' do ' + d.to + '</h2>';
+
+    if (!d.posts.length && !d.items.length) {
+      h += '<p style="color:var(--dim)">Nic nie jest zaplanowane na ten tydzien.</p>';
+    }
+
+    if (d.posts.length) {
+      h += '<h3 style="margin:18px 0 8px">Posty w kolejce (' + d.posts.length + ')</h3>';
+      d.posts.forEach(function(p) {
+        var L = p.lamps;
+        var blocked = !L.medium || !L.alt || !L.qa;
+        h += '<div style="padding:12px;margin-bottom:8px;border:1px solid ' + (blocked ? '#5a2230' : 'var(--border)') + ';border-radius:8px">';
+        h += '<div style="font-size:12px;color:var(--dim)">' + String(p.publish_at).slice(0, 16) +
+             ' &middot; tor ' + (p.lane || 'K') + ' &middot; ' + p.status + '</div>';
+        h += '<div style="margin:6px 0">' + (p.preview || '') + '...</div>';
+        h += '<div>' + lampHtml(L.tekst, 'tekst') + lampHtml(L.medium, 'medium') +
+             lampHtml(L.alt, 'ALT') + lampHtml(L.qa, 'QA') + lampHtml(L.termin, 'termin') + '</div>';
+        if (!L.medium) {
+          h += '<div style="margin-top:6px;font-size:12px;color:#ff7a90">BRAK MEDIUM &mdash; ten post nie wyjdzie. ' +
+               'Podepnij realny zrzut z biblioteki (~/.linkedin-mcp/images/lib) albo ustaw text_only_ok=1 swiadomie.</div>';
+        }
+        h += '</div>';
+      });
+    }
+
+    if (d.items.length) {
+      h += '<h3 style="margin:18px 0 8px">Media plan w tym tygodniu (' + d.items.length + ')</h3>';
+      d.items.forEach(function(it) {
+        var isArticle = it.slug && /^a[1-7]-[a-z]/.test(it.slug) && !/-p[0-9]+$/.test(it.slug);
+        h += '<div style="padding:10px;margin-bottom:6px;border:1px solid var(--border);border-radius:8px">';
+        h += '<div style="font-size:12px;color:var(--dim)">' + String(it.publish_at).slice(0, 10) +
+             ' &middot; ' + it.status + ' &middot; tor ' + (it.lane || 'K') +
+             (isArticle ? ' &middot; ARTYKUL' : '') + '</div>';
+        h += '<div style="margin-top:4px;font-weight:' + (isArticle ? '700' : '400') + '">' + (it.title || it.slug) + '</div>';
+        if (it.icp) h += '<div style="font-size:12px;color:var(--dim)">dla: ' + it.icp + '</div>';
+        if (!it.post_text) h += '<div style="font-size:12px;color:#ffb45f">brak tresci &mdash; do napisania</div>';
+        if (!it.visual_asset_path) h += '<div style="font-size:12px;color:#ff7a90">brak medium &mdash; potrzebny zrzut' + (isArticle ? ' (okladka)' : '') + '</div>';
+        h += '</div>';
+      });
+    }
+
+    root.innerHTML = h;
+
+    var add = document.getElementById('conv-add');
+    if (add) add.addEventListener('click', function() {
+      var note = prompt('Z kim i o czym? (krotka notatka)');
+      if (note === null) return;
+      fetch('/api/conversations', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ stage: 'rozmowa', note: note, lane: 'K' })
+      }).then(function(r) { return r.json(); }).then(function() { renderTydzien(true); });
+    });
+  }).catch(function(e) {
+    root.innerHTML = '<p style="color:#ff7a90">Blad ladowania: ' + e.message + '</p>';
+  });
+}
+
 // ── ARTYKULY (Wariant G-A: article drafter UI) ──────────────────────────
 var artTopics = null;
 
@@ -7494,7 +7932,9 @@ function renderArtykuly() {
   if (root.dataset.rendered === '1') return;
   root.dataset.rendered = '1';
   root.innerHTML =
-    '<div style="max-width:780px">' +
+    '<div style="max-width:900px">' +
+    '<div id="art-copy"></div>' +
+    '<hr style="border:none;border-top:1px solid var(--border);margin:30px 0">' +
     '<h2 style="margin-top:0">Generator artykułów</h2>' +
     '<p style="color:var(--dim);font-size:14px">Sonnet 4.6 + adaptive thinking + prompt cache. Generuje pełny artykuł PL (~3500 słów) + EN hub-spoke. Output: 2 pliki .ts gotowe do bartoszgaca.pl/data/articles/.</p>' +
     '<form id="art-form" style="display:grid;gap:14px;margin-top:20px">' +
@@ -7555,6 +7995,27 @@ function renderArtykuly() {
     });
   }
   loadDrafts();
+
+  // ── Gotowe artykuły .md (do wklejenia) — na górze zakładki Artykuły ──
+  window.cpArtBtn = window.cpArtBtn || function(b) {
+    var c = b.closest('.acopy-post') || b.closest('.acopy-card');
+    var t = c.querySelector('textarea');
+    navigator.clipboard.writeText(t.value).then(function() { var o = b.textContent; b.textContent = 'Skopiowano'; setTimeout(function() { b.textContent = o; }, 1200); });
+  };
+  function escArt(s) { return String(s).replace(/[<>&]/g, function(c) { return { '<': '&lt;', '>': '&gt;', '&': '&amp;' }[c]; }); }
+  function loadCopyArticles() {
+    var box = document.getElementById('art-copy'); if (!box) return;
+    fetch('/api/articles/copy').then(function(r) { return r.json(); }).then(function(arr) {
+      if (!Array.isArray(arr) || !arr.length) { box.innerHTML = '<p style="color:var(--dim);font-size:13px">Brak gotowych artykułów w ~/.linkedin-mcp/articles/</p>'; return; }
+      box.innerHTML = '<h2 style="margin-top:0">Gotowe artykuły (do wklejenia na LinkedIn)</h2>' + arr.map(function(a) {
+        var posts = (a.posts || []).map(function(p, i) {
+          return '<div class="acopy-post" style="border-top:1px solid var(--border);padding-top:8px;margin-top:10px"><div style="color:#4db8ff;font-weight:600;font-size:13px;margin-bottom:4px">Propozycja postu ' + (i + 1) + '</div><textarea readonly style="width:100%;min-height:110px;background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:6px;padding:8px;font:12px/1.5 ui-monospace,Menlo,monospace">' + escArt(p) + '</textarea><button class="btn" style="margin-top:6px" onclick="cpArtBtn(this)">Kopiuj post</button></div>';
+        }).join('') || '<i style="color:var(--dim)">brak propozycji</i>';
+        return '<div class="acopy-card" style="border:1px solid var(--border);border-radius:8px;padding:16px;margin-bottom:18px"><div style="display:flex;justify-content:space-between;align-items:center;gap:10px"><h3 style="margin:0">' + escArt(a.title) + '</h3><button class="btn primary" onclick="cpArtBtn(this)">Kopiuj artykuł</button></div><textarea readonly style="width:100%;min-height:300px;margin-top:10px;background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:6px;padding:10px;font:12px/1.55 ui-monospace,Menlo,monospace">' + escArt(a.body) + '</textarea><h4 style="margin:16px 0 4px;color:var(--dim)">Propozycje postów-odprysków</h4>' + posts + '<div style="color:var(--dim);font-size:11px;margin-top:8px">plik: ' + escArt(a.file) + '</div></div>';
+      }).join('');
+    }).catch(function(e) { box.innerHTML = '<p style="color:#f55">Błąd: ' + e.message + '</p>'; });
+  }
+  loadCopyArticles();
 
   form.addEventListener('submit', function(e) {
     e.preventDefault();

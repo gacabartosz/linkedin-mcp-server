@@ -5,7 +5,7 @@
  * Runs as a standalone daemon that:
  * 1. Monitors scheduled posts in SQLite
  * 2. Uploads images/videos directly via LinkedIn API
- * 3. Publishes with random jitter (0-7 min past scheduled time)
+ * 3. Publishes with random jitter (0-3 min past scheduled time)
  * 4. Verifies each post is live before queuing comment
  * 5. Adds educational comment 12-22 min after each post (randomized)
  *
@@ -18,12 +18,17 @@ import { homedir } from 'node:os';
 import { execSync } from 'node:child_process';
 import Database from 'better-sqlite3';
 import { humanizeText } from './lib/humanize.mjs';
+import { assertPublishable as gateAssertPublishable } from './lib/publish-gate.mjs';
 
 const DB_PATH = join(homedir(), '.linkedin-mcp', 'scheduler.db');
 const AUTH_PATH = join(homedir(), '.linkedin-mcp', 'auth.json');
 const IMG_DIR = '/Users/gaca/output/personal/linkedin-mcp';
 
 const LINKEDIN_API_BASE = 'https://api.linkedin.com/v2';
+// Dokumenty/karuzele idą przez nowe API /rest (NIE /v2) i WYMAGAJĄ nagłówka
+// LinkedIn-Version — bez niego /rest zwraca 404 "No virtual resource found".
+const LINKEDIN_REST_BASE = 'https://api.linkedin.com/rest';
+const LINKEDIN_VERSION = process.env.LINKEDIN_API_VERSION || '202503';
 
 // ── MIME type mapping ───────────────────────────────────────────────────────
 
@@ -134,22 +139,16 @@ function escapeLinkedInText(text) {
   return String(text).replace(LI_RESERVED, (c) => '\\' + c);
 }
 
-// Czy post DEKLARUJE media (gdy tak — publikacja bez zdjęcia to BŁĄD, nie "ok").
-function postDeclaresMedia(post, postKey) {
-  try { if (post.media_ids && JSON.parse(post.media_ids).length > 0) return true; } catch {}
-  if (post.media_preview_path && existsSync(post.media_preview_path)) return true;
-  if (postKey && POST_IMAGES[postKey] && existsSync(POST_IMAGES[postKey])) return true;
-  if (postKey && POST_CAROUSELS[postKey] && existsSync(POST_CAROUSELS[postKey])) return true;
-  return false;
+// Bramki pre-publish żyją w lib/publish-gate.mjs (testowalne bez startowania daemona).
+// POST_IMAGES/POST_CAROUSELS są zdefiniowane niżej w tym pliku, więc wstrzykujemy je
+// przy wywołaniu zamiast domykać w module.
+function gateMaps() {
+  return { images: POST_IMAGES, carousels: POST_CAROUSELS };
 }
-
-// Bramka pre-publish: albo komplet poprawny, albo throw (→ retry/failed + alert).
-// Gwarancja: nigdy nie wychodzi post z pustą treścią ani media-post bez zdjęcia.
-function assertPublishable({ post, postKey, text, mediaUrns, mediaCategory }) {
-  if (!text || !text.trim()) throw new Error('GATE: pusta treść posta');
-  if (postDeclaresMedia(post, postKey) && (mediaUrns.length === 0 || mediaCategory === 'NONE')) {
-    throw new Error('GATE: post deklaruje media, ale upload nie dał URN — NIE publikuję bez zdjęcia');
-  }
+function assertPublishable({ post, postKey, text, mediaUrns, mediaCategory, textOnlyUsedLast7Days }) {
+  return gateAssertPublishable({
+    post, postKey, text, mediaUrns, mediaCategory, maps: gateMaps(), textOnlyUsedLast7Days,
+  });
 }
 
 // ── Media Upload (direct API) ───────────────────────────────────────────────
@@ -248,10 +247,112 @@ async function uploadMedia(filePath, mediaType) {
   return assetUrn;
 }
 
+function isPdfFile(p) {
+  return !!p && /\.pdf$/i.test(p);
+}
+
+// ── Document (carousel PDF) Upload ──────────────────────────────────────────
+// PDF-y NIE przechodzą przez v2/assets (feedshare-image odrzuca dokument →
+// upload nie daje URN → post pada). Nowy /rest/documents przyjmuje PDF i zwraca
+// urn:li:document:XXX, który publikujemy przez /rest/posts (patrz createDocumentPost).
+// Zweryfikowane po API 2026-07-14: init 200 → PUT 201 → status AVAILABLE.
+async function uploadDocument(filePath) {
+  const token = getAccessToken();
+  const personUrn = getPersonUrn();
+
+  log(`  Registering DOCUMENT upload (/rest/documents)...`);
+  const initRes = await linkedinFetch(`${LINKEDIN_REST_BASE}/documents?action=initializeUpload`, {
+    method: 'POST',
+    headers: { 'LinkedIn-Version': LINKEDIN_VERSION },
+    body: JSON.stringify({ initializeUploadRequest: { owner: personUrn } }),
+  });
+  if (!initRes.ok) {
+    const t = await initRes.text();
+    throw new Error(`Document init failed (${initRes.status}): ${t}`);
+  }
+  const initData = await initRes.json();
+  const uploadUrl = initData.value?.uploadUrl;
+  const documentUrn = initData.value?.document;
+  if (!uploadUrl || !documentUrn) throw new Error('Missing uploadUrl/document URN in /rest/documents response');
+  log(`  Document registered: ${documentUrn}`);
+
+  const fileBuffer = readFileSync(filePath);
+  const uploadRes = await fetch(uploadUrl, {
+    method: 'PUT',
+    headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/octet-stream' },
+    body: fileBuffer,
+  });
+  if (!uploadRes.ok && uploadRes.status !== 201) {
+    const t = await uploadRes.text();
+    throw new Error(`Document binary upload failed (${uploadRes.status}): ${t}`);
+  }
+  log(`  Document uploaded (${Math.round(fileBuffer.length / 1024)} KB)`);
+
+  // Poll aż AVAILABLE (jak przy obrazach: attach niegotowego = post bez pliku)
+  log(`  Waiting for document to become AVAILABLE...`);
+  let ready = false, noScope = 0;
+  for (let i = 0; i < 20; i++) {
+    await sleep(3000);
+    const chk = await linkedinFetch(`${LINKEDIN_REST_BASE}/documents/${encodeURIComponent(documentUrn)}`, {
+      headers: { 'LinkedIn-Version': LINKEDIN_VERSION },
+    });
+    if (!chk.ok) {
+      noScope++;
+      if (noScope >= 4) { ready = true; break; }
+      continue;
+    }
+    const d = await chk.json();
+    const status = d.status || 'UNKNOWN';
+    log(`  Document status: ${status}`);
+    if (/AVAILABLE|PROCESSED|READY/i.test(status)) { ready = true; break; }
+    if (/FAILED|ERROR/i.test(status)) throw new Error(`Document processing failed: ${status}`);
+  }
+  if (!ready) throw new Error('Document nie osiągnął AVAILABLE w limicie — nie publikuję');
+  return documentUrn;
+}
+
+// ── Document Post Creation (via /rest/posts — ugcPosts nie publikuje dokumentów) ──
+// Zweryfikowane po API 2026-07-14: 201 z lifecycleState PUBLISHED + content.media.
+async function createDocumentPost(text, documentUrn, title) {
+  const personUrn = getPersonUrn();
+  const humanText = humanizeText(text);
+  // /rest/posts sam obsługuje encje w commentary — NIE escapujemy jak w ugcPosts.
+  const body = {
+    author: personUrn,
+    commentary: humanText,
+    visibility: 'PUBLIC',
+    distribution: { feedDistribution: 'MAIN_FEED', targetEntities: [], thirdPartyDistributionChannels: [] },
+    content: { media: { title: (title || 'Dokument').slice(0, 100), id: documentUrn } },
+    lifecycleState: 'PUBLISHED',
+    isReshareDisabledByAuthor: false,
+  };
+  log(`  Creating DOCUMENT post via /rest/posts (${text.length} chars, doc=${documentUrn})...`);
+  const res = await linkedinFetch(`${LINKEDIN_REST_BASE}/posts`, {
+    method: 'POST',
+    headers: { 'LinkedIn-Version': LINKEDIN_VERSION },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const t = await res.text();
+    throw new Error(`Document post creation failed (${res.status}): ${t}`);
+  }
+  const finalUrn = res.headers.get('x-restli-id') || res.headers.get('X-RestLi-Id');
+  if (!finalUrn) throw new Error('No post URN returned from /rest/posts');
+  log(`  Post created: ${finalUrn}`);
+  const numericId = finalUrn.split(':').pop();
+  const shareUrn = finalUrn.startsWith('urn:li:share:') ? finalUrn : `urn:li:share:${numericId}`;
+  return { postUrn: finalUrn, shareUrn };
+}
+
 // ── Post Creation (direct API via v2/ugcPosts) ─────────────────────────────
 
-async function createPost(text, mediaUrns = [], mediaCategory = 'NONE') {
+async function createPost(text, mediaUrns = [], mediaCategory = 'NONE', documentTitle = null, altText = null) {
   const personUrn = getPersonUrn();
+
+  // Karuzela/PDF = dokument → osobny endpoint /rest/posts (ugcPosts go nie publikuje).
+  if (mediaCategory === 'DOCUMENT' && mediaUrns.length > 0) {
+    return createDocumentPost(text, mediaUrns[0], documentTitle);
+  }
 
   // Humanizer (deterministyczny, niezależny od LLM) PRZED escapowaniem — łapie też
   // posty wpisane ręcznie / spoza qa-gate. Kolejność: humanize → escape (nie odwrotnie,
@@ -265,10 +366,15 @@ async function createPost(text, mediaUrns = [], mediaCategory = 'NONE') {
   };
 
   if (mediaUrns.length > 0 && mediaCategory !== 'NONE') {
-    shareContent.media = mediaUrns.map(urn => ({
-      status: 'READY',
-      media: urn,
-    }));
+    // ALT/opis obrazka (dostępność + GEO/AI). ugcPosts czyta media.description.text.
+    // Limit LinkedIn na alt ~ kilkaset znaków — przycinamy defensywnie do 300.
+    const altClean = altText ? String(altText).trim().slice(0, 300) : null;
+    shareContent.media = mediaUrns.map(urn => {
+      const m = { status: 'READY', media: urn };
+      if (altClean) m.description = { text: altClean };
+      return m;
+    });
+    if (altClean) log(`  ALT text attached (${altClean.length} chars)`);
   }
 
   const body = {
@@ -602,7 +708,7 @@ const POST_CAROUSELS = {
   'post18': join(IMG_DIR, 'post18-carousel.pdf'),
 };
 
-// Per-post publish jitter (0-7 min, stable per daemon run)
+// Per-post publish jitter (0-3 min, stable per daemon run)
 const publishJitters = {};
 
 function identifyPost(text) {
@@ -630,20 +736,34 @@ async function checkAndPublish() {
     // BRAMKA QA: publikujemy WYŁĄCZNIE posty z qa_status='approved'
     // (humanizer + Opus 4.8 fact-check w qa-gate.mjs). Brak QA / hold / error = nie wychodzi.
     const allScheduled = db.prepare(
-      "SELECT id, text, media_ids, publish_at, status, media_preview_path, media_kind, auto_comment_override FROM scheduled_posts WHERE status = 'scheduled' AND qa_status = 'approved'"
+      "SELECT id, text, media_ids, publish_at, status, media_preview_path, media_kind, media_alt, auto_comment_override, text_only_ok FROM scheduled_posts WHERE status = 'scheduled' AND qa_status = 'approved'"
     ).all();
     // Log diagnostyczny: ile due-postów czeka na QA (żeby nie wyglądało na 'zawieszone')
     const awaitingQA = db.prepare(
       "SELECT COUNT(*) c FROM scheduled_posts WHERE status='scheduled' AND (qa_status IS NULL OR qa_status NOT IN ('approved')) AND publish_at <= ?"
     ).get(now.toISOString())?.c || 0;
     if (awaitingQA > 0) log(`  ${awaitingQA} due-post(ów) czeka na QA (qa-gate.mjs) — nie publikuję bez approved`);
+    // Ile postow BEZ medium wyszlo w ostatnich 7 dniach. Bramka ma na to limit
+    // (TEXT_ONLY_WEEKLY_LIMIT), zeby "swiadome odstepstwo" nie stalo sie norma.
+    // Daty filtrujemy w JS, bo published_at wystepuje w dwoch formatach
+    // (ISO z Z oraz 'YYYY-MM-DD HH:MM:SS') i porownanie stringow by klamalo.
+    const weekAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
+    let textOnlyUsedLast7Days = db.prepare(
+      "SELECT COALESCE(published_at, publish_at) AS at FROM scheduled_posts WHERE status = 'published' AND text_only_ok = 1"
+    ).all().filter((r) => {
+      const t = new Date(String(r.at || '').replace(' ', 'T')).getTime();
+      return Number.isFinite(t) && t >= weekAgo;
+    }).length;
+    if (textOnlyUsedLast7Days > 0) log(`  Posty bez medium w ostatnich 7 dniach: ${textOnlyUsedLast7Days}/${TEXT_ONLY_WEEKLY_LIMIT}`);
     db.close();
     const candidates = allScheduled.filter(p => new Date(p.publish_at).getTime() <= now.getTime());
 
-    // Apply publish jitter: delay 0-7 min past publish_at (stable per post)
+    // Apply publish jitter: delay 0-3 min past publish_at (stable per post).
+    // Kept small so a 08:10 target lands ~08:10-08:13 ("około 08:10") while
+    // still avoiding a robotic exact-second signature.
     const posts = candidates.filter(post => {
       if (!publishJitters[post.id]) {
-        publishJitters[post.id] = randomMinutes(0, 7);
+        publishJitters[post.id] = randomMinutes(0, 3);
         log(`  Jitter for ${post.id}: +${Math.round(publishJitters[post.id] / 60000)} min`);
       }
       const publishTime = new Date(post.publish_at).getTime();
@@ -659,9 +779,26 @@ async function checkAndPublish() {
         // Determine media URNs — either from DB or by uploading
         let mediaUrns = post.media_ids ? JSON.parse(post.media_ids) : [];
         let mediaCategory = 'NONE';
+        let documentTitle = null;
+
+        // ── Karuzela/PDF (media_kind='carousel' lub plik .pdf) → dokument /rest/documents ──
+        const isCarouselDoc = String(post.media_kind || '').toLowerCase() === 'carousel' || isPdfFile(post.media_preview_path);
+        if (mediaUrns.length === 0 && post.media_preview_path && existsSync(post.media_preview_path) && isCarouselDoc) {
+          log(`  Uploading DOCUMENT (carousel PDF) from media_preview_path: ${post.media_preview_path}`);
+          try {
+            const urn = await uploadDocument(post.media_preview_path);
+            mediaUrns = [urn];
+            mediaCategory = 'DOCUMENT';
+            // Tytuł dokumentu = pierwsza linia posta (LinkedIn pokazuje go nad karuzelą)
+            documentTitle = (post.text || '').split('\n')[0].slice(0, 100) || 'Instrukcja';
+            log(`  DOCUMENT uploaded: ${urn}`);
+          } catch (err) {
+            logError(`  Document upload failed: ${err.message} — NIE degraduję do obrazka (karuzela wymagana)`);
+          }
+        }
 
         // ── Iter12: scheduled_posts.media_preview_path = direct path (NVIDIA FLUX z gen-image-nvidia) ──
-        if (mediaUrns.length === 0 && post.media_preview_path && existsSync(post.media_preview_path)) {
+        if (mediaUrns.length === 0 && !isCarouselDoc && post.media_preview_path && existsSync(post.media_preview_path)) {
           const mediaType = (post.media_kind === 'VIDEO' || isVideoFile(post.media_preview_path)) ? 'VIDEO' : 'IMAGE';
           log(`  Uploading ${mediaType} from scheduled_posts.media_preview_path: ${post.media_preview_path}`);
           try {
@@ -675,7 +812,8 @@ async function checkAndPublish() {
         }
 
         // ── Fallback: try media_plan_items.banner_path or visual_asset_path via text match ──
-        if (mediaUrns.length === 0) {
+        // (pomijamy dla karuzeli-dokumentu — nie degradujemy do przypadkowego obrazka)
+        if (mediaUrns.length === 0 && !isCarouselDoc) {
           try {
             const mpDb = new Database(DB_PATH, { readonly: true });
             const mpRow = mpDb.prepare(`SELECT banner_path, visual_asset_path
@@ -708,7 +846,7 @@ async function checkAndPublish() {
           }
         }
 
-        if (mediaUrns.length === 0 && postKey) {
+        if (mediaUrns.length === 0 && !isCarouselDoc && postKey) {
           // Try carousel/video from POST_CAROUSELS first
           if (POST_CAROUSELS[postKey] && existsSync(POST_CAROUSELS[postKey])) {
             const carouselPath = POST_CAROUSELS[postKey];
@@ -772,20 +910,33 @@ async function checkAndPublish() {
         }
 
         // Bramka determinizmu: albo komplet poprawny, albo throw (→ retry/failed + alert).
-        assertPublishable({ post, postKey, text: post.text, mediaUrns, mediaCategory });
+        assertPublishable({ post, postKey, text: post.text, mediaUrns, mediaCategory, textOnlyUsedLast7Days });
+        if (mediaUrns.length === 0) textOnlyUsedLast7Days++;
 
         // Create post (with or without media)
-        const { postUrn, shareUrn } = await createPost(post.text, mediaUrns, mediaCategory);
+        const { postUrn, shareUrn } = await createPost(post.text, mediaUrns, mediaCategory, documentTitle, post.media_alt || null);
 
-        // Verify post is live before proceeding
-        await verifyPostLive(postUrn);
-
-        // Update DB
+        // ── POINT OF NO RETURN ──────────────────────────────────────────────
+        // The post is now LIVE on LinkedIn and cannot be un-published. Mark the
+        // row 'published' IMMEDIATELY, before any further step can throw. If we
+        // verify/comment-watch first (as before) and that throws, control drops
+        // to catch(), the row stays status='scheduled', and the next 60s cycle
+        // re-runs createPost → a DUPLICATE post. That is exactly what happened
+        // on 2026-07-14: the presidio post went out 4× (verifyPostLive's
+        // read-back fetch threw transiently on attempts 1-3). Write first.
         const dbw = new Database(DB_PATH);
         dbw.prepare(
           "UPDATE scheduled_posts SET status = 'published', post_urn = ?, published_at = ?, updated_at = datetime('now') WHERE id = ?"
         ).run(postUrn, new Date().toISOString(), post.id);
         dbw.close();
+
+        // Verify post is live (best-effort only — the row is already 'published'
+        // so a throw here can no longer cause a re-publish).
+        try {
+          await verifyPostLive(postUrn);
+        } catch (verifyErr) {
+          logError(`  Post-publish verify failed (ignored, already recorded): ${verifyErr.message}`);
+        }
 
         // macOS notification
         notify('LinkedIn ✅ Post opublikowany', post.text.slice(0, 80).replace(/\n/g, ' '));
@@ -819,6 +970,10 @@ async function checkAndPublish() {
           : (postKey ? (AUTO_COMMENTS[postKey] || AUTO_COMMENTS.default) : AUTO_COMMENTS.default);
         if (override === '__NONE__') {
           log(`  Auto-comment disabled for this post (override __NONE__)`);
+        } else if (!commentText || !String(commentText).trim()) {
+          // Safeguard: brak dopasowania w AUTO_COMMENTS i brak override → NIE
+          // publikuj pustego/undefined komentarza. Lepiej brak niż zepsuty link.
+          logError(`  ⚠️ Brak treści pierwszego komentarza (postKey=${postKey || 'null'}, brak override) — pomijam komentarz zamiast publikować pusty. Ustaw auto_comment_override.`);
         } else {
           const commentDelay = randomMinutes(12, 22);
           const commentDelayMin = Math.round(commentDelay / 60000);
@@ -886,7 +1041,7 @@ async function checkAndPublish() {
 log('LinkedIn Auto-Publisher v4 started');
 log('Mode: Direct API calls (no MCP subprocess)');
 log('Features: media upload, post verification, educational comments, timing randomization');
-log('Comment delay: 12-22 min (random) | Publish jitter: 0-7 min');
+log('Comment delay: 12-22 min (random) | Publish jitter: 0-3 min');
 log('Checking every 60 seconds...');
 log('');
 

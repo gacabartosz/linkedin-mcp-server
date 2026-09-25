@@ -198,14 +198,31 @@ function main() {
   if (ONLY_PROJECT) projects = projects.filter(p => p.name === ONLY_PROJECT);
   if (!projects.length) { log(`Brak projektów (filtr --project ${ONLY_PROJECT}?).`); db.close(); return; }
 
+  // Limit kolejki: kolejka to bufor na ~2 tygodnie, nie magazyn.
+  // Powód: generator produkował szybciej, niż człowiek akceptował — narosło 100 pozycji
+  // "w toku" i panel przestał być czytelny (czystka 2026-08-10 zeszła do 35).
+  const QUEUE_CAP = Number(cfg.defaults?.queue_cap ?? 20);
+  const inFlight = db.prepare(
+    "SELECT COUNT(*) c FROM media_plan_items WHERE status IN ('plan','napisane','drafted')"
+  ).get().c;
+  if (inFlight >= QUEUE_CAP) {
+    log(`Kolejka pełna: ${inFlight}/${QUEUE_CAP} pozycji w toku. Nie generuję nic nowego — najpierw opublikuj albo zarchiwizuj.`);
+    db.close();
+    return;
+  }
+  const roomLeft = QUEUE_CAP - inFlight;
+  log(`Kolejka: ${inFlight}/${QUEUE_CAP} — miejsce na ${roomLeft} nowych pozycji.`);
+
   let nextTopic = (db.prepare('SELECT COALESCE(MAX(topic_number),0) m FROM media_plan_items').get().m) + 1;
   const existing = new Set(db.prepare("SELECT title FROM media_plan_items").all().map(r => norm(r.title)));
 
   log(`Idea Engine — ${projects.length} repo, okno ${DAYS} dni${DRY ? ' (DRY)' : ''} | pre-check exp≥${PRE.exp} spec≥${PRE.spec} comm≥${PRE.comm} lead-fit≥${PRE.lead}`);
+  // Efektywny sufit: mniejsze z --limit i wolnego miejsca w kolejce.
+  const CAP = Math.min(LIMIT, roomLeft);
   let total = 0, skippedDup = 0, droppedWeak = 0;
 
   for (const p of projects) {
-    if (total >= LIMIT) break;
+    if (total >= CAP) break;
     const { digest, count, reason } = gitDigest(p.path);
     if (!digest) { log(`  · ${p.name}: pomijam (${reason})`); continue; }
     log(`  ⛏  ${p.name}: ${count} istotnych commitów → ekstrakcja…`);
@@ -216,7 +233,7 @@ function main() {
 
     let perRepo = 0;
     for (const idea of ideas) {
-      if (total >= LIMIT || perRepo >= MAX_PER_REPO) break;
+      if (total >= CAP || perRepo >= MAX_PER_REPO) break;
       if (!idea.hook || !idea.title) continue;
       const nt = norm(idea.title);
       if (existing.has(nt)) { skippedDup++; continue; }   // dedup vs istniejące + ten przebieg
