@@ -581,6 +581,9 @@ async function handleRequest(req, res) {
   const path = url.pathname;
   const method = req.method;
 
+  // MCP over Streamable HTTP (+ its OAuth routes) — all tools from dist/index.js
+  if (mcpHttp && mcpHttp.isMcpPath(path)) { mcpHttp.app(req, res); return; }
+
   if (method === 'OPTIONS') {
     res.writeHead(204, { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type' });
     res.end();
@@ -8561,8 +8564,18 @@ function esc(s) { return (s||'').replace(/[<>&"]/g, function(c) { return {'<':'&
 
 migrateDb();
 
+// MCP endpoint at /mcp. Needs `npm run build`; the dashboard runs without it.
+let mcpHttp = null;
+try {
+  const m = await import('./dist/http/app.js');
+  mcpHttp = { app: m.createMcpHttpApp(), isMcpPath: m.isMcpPath };
+} catch (e) {
+  console.error('MCP HTTP endpoint disabled (' + e.message + '). Run `npm run build`.');
+}
+
 const server = createServer(handleRequest);
 server.listen(PORT, function() {
   console.log('LinkedIn Scheduler Dashboard v2: http://localhost:' + PORT);
   console.log('Features: bilingual PL/EN, images, auto-comment preview, expand/collapse');
+  if (mcpHttp) console.log('MCP endpoint: http://localhost:' + PORT + '/mcp');
 });

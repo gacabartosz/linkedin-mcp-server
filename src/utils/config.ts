@@ -112,6 +112,13 @@ export const config = {
   // the developer portal + observed response headers. Not a guess at LinkedIn's
   // actual quota — a self-imposed ceiling.
   apiDailyBudget: parseInt(process.env.API_DAILY_BUDGET || "500", 10),
+
+  // Streamable HTTP MCP endpoint served by the dashboard (<mcpPublicUrl>/mcp).
+  // Loopback clients connect without a token; anything else goes through OAuth
+  // 2.1, and remote approval requires MCP_OAUTH_PIN.
+  mcpPublicUrl: process.env.MCP_PUBLIC_URL || `http://localhost:${process.env.PORT || "6767"}`,
+  mcpOAuthPin: process.env.MCP_OAUTH_PIN || "",
+  mcpOAuthDbFile: join(DATA_DIR, "mcp-oauth.db"),
 };
 
 /** Extra databases the dashboard and daemons use, exposed for new API modules. */

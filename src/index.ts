@@ -7,7 +7,10 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
+  type CallToolRequest,
 } from "@modelcontextprotocol/sdk/types.js";
+import { realpathSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { z } from "zod";
 
 import { ensureDataDirs, config, logConfigProblems } from "./utils/config.js";
@@ -369,14 +372,21 @@ const ActivitiesListInput = z.object({
 
 // ─── MCP Server ──────────────────────────────────────────────────────────────
 
-const server = new Server(
-  { name: "linkedin-mcp-server", version: "1.0.0" },
-  { capabilities: { tools: {} } },
-);
+// One Server instance per transport: stdio gets one, and the HTTP endpoint on the
+// dashboard (src/http/app.ts) creates one per session. Handlers are shared.
+export function createMcpServer(): Server {
+  const server = new Server(
+    { name: "linkedin-mcp-server", version: "1.0.0" },
+    { capabilities: { tools: {} } },
+  );
+  server.setRequestHandler(ListToolsRequestSchema, listTools);
+  server.setRequestHandler(CallToolRequestSchema, callTool);
+  return server;
+}
 
 // ─── Tool Definitions ────────────────────────────────────────────────────────
 
-server.setRequestHandler(ListToolsRequestSchema, async () => ({
+const listTools = async () => ({
   tools: [
     // Auth
     {
@@ -1344,11 +1354,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
   ],
-}));
+});
 
 // ─── Tool Execution ──────────────────────────────────────────────────────────
 
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
+const callTool = async (request: CallToolRequest) => {
   const { name, arguments: args = {} } = request.params;
 
   try {
@@ -2316,7 +2326,7 @@ ${input.sentiment === "neutral" ? "Engage if substance, invite discussion." : ""
     log("error", `Tool ${name} failed`, message);
     return toolError(message);
   }
-});
+};
 
 // ─── Startup ─────────────────────────────────────────────────────────────────
 
@@ -2370,11 +2380,24 @@ async function main(): Promise<void> {
 
   // Start MCP server
   const transport = new StdioServerTransport();
-  await server.connect(transport);
+  await createMcpServer().connect(transport);
   log("info", "LinkedIn MCP server started (stdio transport)");
 }
 
-main().catch((err) => {
-  console.error("LinkedIn MCP server failed:", err);
-  process.exit(1);
-});
+// Run stdio only when executed directly (bin symlink included), not when the
+// dashboard imports createMcpServer.
+function isEntrypoint(): boolean {
+  if (!process.argv[1]) return false;
+  try {
+    return realpathSync(process.argv[1]) === fileURLToPath(import.meta.url);
+  } catch {
+    return false;
+  }
+}
+
+if (isEntrypoint()) {
+  main().catch((err) => {
+    console.error("LinkedIn MCP server failed:", err);
+    process.exit(1);
+  });
+}
