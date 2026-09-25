@@ -1,7 +1,7 @@
 /**
  * OAuth 2.1 Server Provider for MCP.
  * Implements OAuthServerProvider interface from @modelcontextprotocol/sdk.
- * Uses SQLite for persistence. Single-user: loopback requests are approved directly, remote ones need MCP_OAUTH_PIN.
+ * Uses SQLite for persistence. Single-user; every authorization needs MCP_OAUTH_PIN.
  */
 
 import type { Response } from "express";
@@ -13,7 +13,6 @@ import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
 import { config } from "../utils/config.js";
 import { log } from "../utils/logger.js";
 import * as store from "./oauth-store.js";
-import { isLoopbackRequest } from "./local.js";
 import { timingSafeEqual } from "node:crypto";
 
 // ── Clients Store ─────────────────────────────────────────────────────────────
@@ -130,17 +129,19 @@ export class LinkedInOAuthProvider implements OAuthServerProvider {
   ): Promise<void> {
     const { state, codeChallenge, redirectUri, scopes, resource } = params;
 
-    const req = res.req;
-    if (!isLoopbackRequest(req)) {
-      if (!config.mcpOAuthPin) {
-        res.status(403).type("text/plain").send("Remote authorization is disabled. Set MCP_OAUTH_PIN to allow it.");
-        return;
-      }
-      const submittedPin = typeof req.query.pin === "string" ? req.query.pin : "";
-      if (!pinMatches(submittedPin)) {
-        res.status(200).type("html").send(approvalPage(client, params));
-        return;
-      }
+    // Always require the PIN, loopback included: a top-level navigation from
+    // any website arrives from 127.0.0.1 with a localhost Host, so the source
+    // address proves nothing here. Local clients use /mcp without OAuth anyway.
+    if (!config.mcpOAuthPin) {
+      res.status(403).type("text/plain").send("OAuth authorization is disabled. Set MCP_OAUTH_PIN to enable it.");
+      return;
+    }
+    const submittedPin = typeof res.req.query.pin === "string" ? res.req.query.pin : "";
+    if (!pinMatches(submittedPin)) {
+      res.setHeader("X-Frame-Options", "DENY");
+      res.setHeader("Content-Security-Policy", "frame-ancestors 'none'");
+      res.status(200).type("html").send(approvalPage(client, params));
+      return;
     }
 
     // Approved — generate auth code

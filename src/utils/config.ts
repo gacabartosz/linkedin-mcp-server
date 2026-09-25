@@ -115,7 +115,7 @@ export const config = {
 
   // Streamable HTTP MCP endpoint served by the dashboard (<mcpPublicUrl>/mcp).
   // Loopback clients connect without a token; anything else goes through OAuth
-  // 2.1, and remote approval requires MCP_OAUTH_PIN.
+  // 2.1, and every OAuth approval requires MCP_OAUTH_PIN (unset = disabled).
   mcpPublicUrl: process.env.MCP_PUBLIC_URL || `http://localhost:${process.env.PORT || "6767"}`,
   mcpOAuthPin: process.env.MCP_OAUTH_PIN || "",
   mcpOAuthDbFile: join(DATA_DIR, "mcp-oauth.db"),

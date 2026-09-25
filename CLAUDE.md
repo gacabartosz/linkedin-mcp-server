@@ -16,7 +16,7 @@ echo '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' | node dist/in
 ## Architecture
 
 - `src/index.ts` — `createMcpServer()` with all tool handlers (single switch statement); runs stdio when executed directly
-- `src/http/` — Streamable HTTP transport + OAuth 2.1, mounted by `dashboard.mjs` at `http://localhost:6767/mcp` (merged from the former linkedin-sales-mcp repo). Loopback clients need no token; remote ones go through OAuth and need `MCP_OAUTH_PIN`. Rebuild (`npm run build`) and restart the dashboard after changing tools
+- `src/http/` — Streamable HTTP transport + OAuth 2.1, mounted by `dashboard.mjs` at `http://localhost:6767/mcp` (merged from the former linkedin-sales-mcp repo). Loopback clients need no token; remote ones go through OAuth, which stays disabled until `MCP_OAUTH_PIN` is set. Rebuild (`npm run build`) and restart the dashboard after changing tools
 - `src/api/` — LinkedIn REST API modules (client, auth, posts, comments, media, profile, reactions)
 - `src/scheduler/` — SQLite-based post scheduler (store, daemon, publisher)
 - `src/content/` — Content templates (12 built-in + custom), brand voice config, and guidelines loader
